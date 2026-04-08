@@ -25,6 +25,7 @@ const (
 	defaultExpireDays    = 30
 	defaultHITLTimeoutH  = 48
 	backfillReviewDelay  = 24 * time.Hour
+	ingestProgressEvery  = 200
 )
 
 type targetRef struct {
@@ -353,7 +354,12 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 }
 
 func (s *Service) IngestBackfillPlayback(ctx context.Context, events []jellyfin.PlaybackEvent) error {
+	total := len(events)
 	for i, e := range events {
+		if total > 0 && ((i+1)%ingestProgressEvery == 0 || i+1 == total) {
+			s.logger.InfoContext(ctx, "backfill playback ingest progress", "processed", i+1, "total", total)
+		}
+
 		key := "backfill:play:" + e.ItemID + ":" + e.Type + ":" + strconv.FormatInt(e.Date.Unix(), 10)
 		if e.Date.IsZero() {
 			key = "backfill:play:" + e.ItemID + ":" + e.Type + ":" + strconv.Itoa(i)
@@ -378,7 +384,12 @@ func (s *Service) IngestBackfillPlayback(ctx context.Context, events []jellyfin.
 
 func (s *Service) IngestBackfillItems(ctx context.Context, items []jellyfin.ItemSnapshot) error {
 	now := s.now().UTC()
+	total := len(items)
 	for i, it := range items {
+		if total > 0 && ((i+1)%ingestProgressEvery == 0 || i+1 == total) {
+			s.logger.InfoContext(ctx, "backfill item ingest progress", "processed", i+1, "total", total)
+		}
+
 		key := "backfill:item:" + it.ItemID + ":" + strconv.Itoa(i)
 		targets := deriveTargets(jellyfin.WebhookEvent{Payload: jellyfin.WebhookPayload{
 			ItemID:          it.ItemID,
