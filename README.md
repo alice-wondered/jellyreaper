@@ -42,9 +42,13 @@ JellyReaper is a Go service that listens to Jellyfin and Discord webhooks, persi
 | `BACKFILL_ENABLED` | no | `true` | enables startup + periodic backfill |
 | `BACKFILL_INTERVAL` | no | `15m` | periodic backfill interval |
 | `BACKFILL_FULL_SWEEP_ON_STARTUP` | no | `true` | on first run (no checkpoint), sweep full Jellyfin history |
+| `BACKFILL_PLAYBACK_ENABLED` | no | `false` | enables activity-log playback backfill; item snapshot user data is used by default |
 | `BACKFILL_LOOKBACK` | no | `24h` | startup lookback if full sweep is disabled and no checkpoint exists |
 | `BACKFILL_OVERLAP` | no | `2m` | overlap from last checkpoint to avoid missing events |
 | `BACKFILL_LIMIT` | no | `500` | page size per Jellyfin backfill request (all pages are fetched) |
+| `BACKFILL_WRITE_BATCH_SIZE` | no | `100` | number of webhook-style backfill writes per storage batch |
+| `BACKFILL_WRITE_BATCH_TIMEOUT` | no | `500ms` | max wait before flushing a partial backfill write batch |
+| `BACKFILL_WRITE_QUEUE_CAPACITY` | no | `2000` | buffered queue capacity feeding batched backfill writes |
 
 ## Run
 ```bash

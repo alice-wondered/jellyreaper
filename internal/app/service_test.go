@@ -39,6 +39,16 @@ func interaction(action, itemID string, version int64, id string) discord.Incomi
 	}
 }
 
+func snowflakeIDFor(t time.Time) string {
+	const discordEpochMs = int64(1420070400000)
+	ms := t.UTC().UnixMilli()
+	if ms < discordEpochMs {
+		ms = discordEpochMs
+	}
+	id := (ms - discordEpochMs) << 22
+	return strconv.FormatInt(id, 10)
+}
+
 func TestHITLArchiveLeavesNoDeletionJob(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)
@@ -46,7 +56,7 @@ func TestHITLArchiveLeavesNoDeletionJob(t *testing.T) {
 	svc.now = func() time.Time { return now }
 
 	targetID := "target:item:item-archive"
-	resp, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction("archive", targetID, 0, "i-archive"))
+	resp, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction("archive", targetID, 0, snowflakeIDFor(now)))
 	if err != nil {
 		t.Fatalf("handle interaction: %v", err)
 	}
@@ -86,7 +96,7 @@ func TestHITLDeleteQueuesImmediateDeleteJob(t *testing.T) {
 	svc.now = func() time.Time { return now }
 
 	targetID := "target:item:item-delete"
-	_, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction("delete", targetID, 0, "i-delete"))
+	_, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction("delete", targetID, 0, snowflakeIDFor(now)))
 	if err != nil {
 		t.Fatalf("handle interaction: %v", err)
 	}
@@ -115,7 +125,7 @@ func TestHITLDelaySchedulesFutureEvaluation(t *testing.T) {
 	svc.now = func() time.Time { return now }
 
 	targetID := "target:item:item-delay"
-	_, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction("delay", targetID, 0, "i-delay"))
+	_, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction("delay", targetID, 0, snowflakeIDFor(now)))
 	if err != nil {
 		t.Fatalf("handle interaction: %v", err)
 	}
@@ -369,6 +379,164 @@ func TestIngestBackfillItemsPreservesHigherPlaybackMetrics(t *testing.T) {
 	}
 }
 
+func TestLiveWebhookUpdatesSameBackfilledItem(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 11, 9, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+		ItemID:   "movie-live-1",
+		ItemType: "Movie",
+		Name:     "Old Title",
+	}}); err != nil {
+		t.Fatalf("seed backfill item: %v", err)
+	}
+
+	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:           "movie-live-1",
+			ItemType:         "Movie",
+			Name:             "Updated Title",
+			NotificationType: "ItemUpdated",
+			EventID:          "evt-live-1",
+		},
+		Raw:       map[string]any{"EventId": "evt-live-1", "ItemId": "movie-live-1"},
+		ItemID:    "movie-live-1",
+		EventID:   "evt-live-1",
+		EventType: "ItemUpdated",
+		DedupeKey: "jellyfin:evt-live-1",
+	})
+	if err != nil {
+		t.Fatalf("handle live webhook: %v", err)
+	}
+
+	media := mustGetMedia(t, store, "movie-live-1")
+	if media.Name != "Updated Title" {
+		t.Fatalf("expected updated media title, got %q", media.Name)
+	}
+	flow := mustGetFlow(t, store, "target:movie:movie-live-1")
+	if flow.DisplayName != "Updated Title" {
+		t.Fatalf("expected updated flow display name, got %q", flow.DisplayName)
+	}
+}
+
+func TestBackfillItemDedupeKeyUsesRevisionNotOrdinalWhenAvailable(t *testing.T) {
+	item := jellyfin.ItemSnapshot{ItemID: "movie-1", DateLastMediaAdded: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)}
+	keyA := backfillItemDedupeKey(item, 1)
+	keyB := backfillItemDedupeKey(item, 999)
+	if keyA != keyB {
+		t.Fatalf("expected stable dedupe key across ordinals when revision exists: %s != %s", keyA, keyB)
+	}
+}
+
+func TestProcessWebhookBatchesFlushesAtBatchSize(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 11, 10, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+	svc.SetBackfillWriteBatching(2, time.Second, 10)
+
+	ch := make(chan backfillWriteOp, 2)
+	evt1 := jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{ItemID: "movie-batch-1", ItemType: "Movie", Name: "Batch One", NotificationType: "ItemUpdated"},
+		Raw:     map[string]any{"source": "test"},
+		ItemID:  "movie-batch-1", EventType: "ItemUpdated", DedupeKey: "test:batch:1",
+	}
+	evt2 := jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{ItemID: "movie-batch-2", ItemType: "Movie", Name: "Batch Two", NotificationType: "ItemUpdated"},
+		Raw:     map[string]any{"source": "test"},
+		ItemID:  "movie-batch-2", EventType: "ItemUpdated", DedupeKey: "test:batch:2",
+	}
+	ch <- backfillWriteOp{event: &evt1}
+	ch <- backfillWriteOp{event: &evt2}
+	close(ch)
+
+	if err := svc.processWebhookBatches(context.Background(), ch, "test_batch"); err != nil {
+		t.Fatalf("process webhook batches: %v", err)
+	}
+
+	m1 := mustGetMedia(t, store, "movie-batch-1")
+	m2 := mustGetMedia(t, store, "movie-batch-2")
+	if m1.Name != "Batch One" || m2.Name != "Batch Two" {
+		t.Fatalf("unexpected media names: m1=%q m2=%q", m1.Name, m2.Name)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		processed1, err := tx.IsProcessed(context.Background(), "test:batch:1")
+		if err != nil {
+			return err
+		}
+		processed2, err := tx.IsProcessed(context.Background(), "test:batch:2")
+		if err != nil {
+			return err
+		}
+		if !processed1 || !processed2 {
+			t.Fatal("expected both batched events marked processed")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify processed keys: %v", err)
+	}
+}
+
+func TestProcessWebhookBatchesFlushesPartialBatchOnClose(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 11, 10, 30, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+	svc.SetBackfillWriteBatching(100, time.Second, 10)
+
+	ch := make(chan backfillWriteOp, 1)
+	evt := jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{ItemID: "movie-batch-close-1", ItemType: "Movie", Name: "Batch Close", NotificationType: "ItemUpdated"},
+		Raw:     map[string]any{"source": "test"},
+		ItemID:  "movie-batch-close-1", EventType: "ItemUpdated", DedupeKey: "test:batch:close:1",
+	}
+	ch <- backfillWriteOp{event: &evt}
+	close(ch)
+
+	if err := svc.processWebhookBatches(context.Background(), ch, "test_batch_close"); err != nil {
+		t.Fatalf("process webhook batches: %v", err)
+	}
+
+	m := mustGetMedia(t, store, "movie-batch-close-1")
+	if m.Name != "Batch Close" {
+		t.Fatalf("unexpected media name: %q", m.Name)
+	}
+}
+
+func TestIngestBackfillItemsWithCursorPersistsCursorMeta(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 11, 11, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	if err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{{
+		ItemID:   "movie-cursor-1",
+		ItemType: "Movie",
+		Name:     "Cursor Movie",
+	}}, "backfill.cursor.v1", `{"phase":"items","items_start_index":1}`); err != nil {
+		t.Fatalf("ingest with cursor: %v", err)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		raw, ok, err := tx.GetMeta(context.Background(), "backfill.cursor.v1")
+		if err != nil {
+			return err
+		}
+		if !ok || raw == "" {
+			t.Fatal("expected cursor meta written by backfill writer")
+		}
+		if raw != `{"phase":"items","items_start_index":1}` {
+			t.Fatalf("unexpected cursor payload: %s", raw)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify cursor meta: %v", err)
+	}
+}
+
 func TestIngestBackfillPlaybackUsesOriginalEventTimestamp(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)
@@ -582,6 +750,148 @@ func TestHandleSeasonRemovalMarksChildrenAndSeasonFlowDeleted(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("verify deletion state: %v", err)
+	}
+}
+
+func TestCatalogStaleEventDoesNotOverwriteNewerMetadata(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 12, 8, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	newer := jellyfin.WebhookEvent{
+		Payload:    jellyfin.WebhookPayload{ItemID: "movie-stale-1", ItemType: "Movie", Name: "Newest Title", NotificationType: "ItemUpdated", EventID: "evt-new"},
+		Raw:        map[string]any{"EventId": "evt-new"},
+		ItemID:     "movie-stale-1",
+		EventID:    "evt-new",
+		EventType:  "ItemUpdated",
+		DedupeKey:  "jellyfin:evt-new",
+		OccurredAt: now,
+	}
+	if err := svc.HandleJellyfinWebhook(context.Background(), newer); err != nil {
+		t.Fatalf("apply newer catalog event: %v", err)
+	}
+	before := mustGetFlow(t, store, "target:movie:movie-stale-1")
+
+	older := jellyfin.WebhookEvent{
+		Payload:    jellyfin.WebhookPayload{ItemID: "movie-stale-1", ItemType: "Movie", Name: "Older Title", NotificationType: "ItemUpdated", EventID: "evt-old"},
+		Raw:        map[string]any{"EventId": "evt-old"},
+		ItemID:     "movie-stale-1",
+		EventID:    "evt-old",
+		EventType:  "ItemUpdated",
+		DedupeKey:  "jellyfin:evt-old",
+		OccurredAt: now.Add(-2 * time.Hour),
+	}
+	if err := svc.HandleJellyfinWebhook(context.Background(), older); err != nil {
+		t.Fatalf("apply older catalog event: %v", err)
+	}
+
+	media := mustGetMedia(t, store, "movie-stale-1")
+	if media.Name != "Newest Title" {
+		t.Fatalf("expected newer media title preserved, got %q", media.Name)
+	}
+	flow := mustGetFlow(t, store, "target:movie:movie-stale-1")
+	if flow.DisplayName != "Newest Title" {
+		t.Fatalf("expected newer flow display preserved, got %q", flow.DisplayName)
+	}
+	if flow.Version != before.Version {
+		t.Fatalf("expected stale event to avoid flow version churn: before=%d after=%d", before.Version, flow.Version)
+	}
+}
+
+func TestPlaybackStaleEventDoesNotIncrementPlayCount(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 12, 9, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID:              "movie-play-stale",
+			Name:                "Play Movie",
+			Title:               "Play Movie",
+			ItemType:            "Movie",
+			LastPlayedAt:        now,
+			LastPlaybackEventAt: now,
+			PlayCountTotal:      7,
+			UpdatedAt:           now,
+		})
+	}); err != nil {
+		t.Fatalf("seed media: %v", err)
+	}
+
+	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload:    jellyfin.WebhookPayload{ItemID: "movie-play-stale", ItemType: "Movie", NotificationType: "PlaybackStart", EventID: "evt-play-old"},
+		Raw:        map[string]any{"EventId": "evt-play-old"},
+		ItemID:     "movie-play-stale",
+		EventID:    "evt-play-old",
+		EventType:  "PlaybackStart",
+		DedupeKey:  "jellyfin:evt-play-old",
+		OccurredAt: now.Add(-time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("apply stale playback event: %v", err)
+	}
+
+	media := mustGetMedia(t, store, "movie-play-stale")
+	if media.PlayCountTotal != 7 {
+		t.Fatalf("expected play count unchanged for stale playback, got %d", media.PlayCountTotal)
+	}
+	if !media.LastPlayedAt.Equal(now) {
+		t.Fatalf("expected last played unchanged, got %s", media.LastPlayedAt)
+	}
+}
+
+func TestCatalogEventUsesPayloadTimestampNotServiceClock(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	svc.now = func() time.Time { return time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC) }
+
+	payloadTS := time.Date(2026, 4, 12, 10, 0, 0, 0, time.UTC)
+	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:             "movie-ts-1",
+			ItemType:           "Movie",
+			Name:               "Timestamped",
+			NotificationType:   "ItemUpdated",
+			DateLastMediaAdded: payloadTS,
+			EventID:            "evt-ts-1",
+		},
+		Raw:       map[string]any{"EventId": "evt-ts-1"},
+		ItemID:    "movie-ts-1",
+		EventID:   "evt-ts-1",
+		EventType: "ItemUpdated",
+		DedupeKey: "jellyfin:evt-ts-1",
+	})
+	if err != nil {
+		t.Fatalf("handle webhook: %v", err)
+	}
+
+	media := mustGetMedia(t, store, "movie-ts-1")
+	if !media.LastCatalogEventAt.Equal(payloadTS) {
+		t.Fatalf("expected catalog event timestamp from payload, got=%s want=%s", media.LastCatalogEventAt, payloadTS)
+	}
+}
+
+func TestDiscordInteractionUsesSnowflakeTimestamp(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	svc.now = func() time.Time { return time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC) }
+
+	id := "175928847299117063"
+	ts, err := discordgo.SnowflakeTimestamp(id)
+	if err != nil {
+		t.Fatalf("snowflake timestamp: %v", err)
+	}
+
+	_, err = svc.HandleDiscordComponentInteraction(context.Background(), interaction("keep", "target:item:item-snowflake", 0, id))
+	if err != nil {
+		t.Fatalf("handle interaction: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, "target:item:item-snowflake")
+	if !flow.UpdatedAt.Equal(ts.UTC()) {
+		t.Fatalf("expected flow updated from discord snowflake timestamp, got=%s want=%s", flow.UpdatedAt, ts.UTC())
 	}
 }
 

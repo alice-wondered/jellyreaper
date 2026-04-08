@@ -50,6 +50,8 @@ type MediaItem struct {
 	SizeBytes           int64     `json:"size_bytes"`
 	CreatedAt           time.Time `json:"created_at"`
 	UpdatedAt           time.Time `json:"updated_at"`
+	LastCatalogEventAt  time.Time `json:"last_catalog_event_at"`
+	LastPlaybackEventAt time.Time `json:"last_playback_event_at"`
 	LastPlayedAt        time.Time `json:"last_played_at"`
 	PlayCountTotal      int64     `json:"play_count_total"`
 	LastUserID          string    `json:"last_user_id"`
@@ -83,6 +85,7 @@ type Flow struct {
 	Discord            DiscordContext `json:"discord"`
 	LastError          string         `json:"last_error"`
 	HITLOutcome        string         `json:"hitl_outcome"`
+	LastCatalogEventAt time.Time      `json:"last_catalog_event_at"`
 	CreatedAt          time.Time      `json:"created_at"`
 	UpdatedAt          time.Time      `json:"updated_at"`
 }
