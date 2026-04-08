@@ -113,8 +113,10 @@ func main() {
 		defer func() { _ = discordService.CloseGateway() }()
 	}
 
+	evaluatePolicyHandler := handlers.NewEvaluatePolicyHandler(store, logger)
+	evaluatePolicyHandler.SetDefaultExpireDays(cfg.DefaultLastPlayedThresholdDays)
 	handlerList := []jobs.JobHandler{
-		handlers.NewEvaluatePolicyHandler(store, logger),
+		evaluatePolicyHandler,
 		handlers.NewSendHITLPromptHandler(store, logger, discordService, cfg.DiscordChannelID, 48*time.Hour),
 		handlers.NewHITLTimeoutHandler(store, discordService, logger),
 		handlers.NewExecuteDeleteHandler(store, jellyfin.NewClient(cfg.JellyfinURL, cfg.JellyfinAPIKey, nil)),
@@ -137,6 +139,7 @@ func main() {
 	}
 	appService := app.NewService(store, logger, wake)
 	appService.SetDiscordService(discordService)
+	appService.SetPolicyDefaults(cfg.DefaultLastPlayedThresholdDays, cfg.DefaultDelayWindow)
 	if assistant != nil {
 		assistant.SetDecisionService(appService)
 	}

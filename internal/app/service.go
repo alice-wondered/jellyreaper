@@ -24,6 +24,8 @@ const (
 	defaultDelayDuration         = 24 * time.Hour
 	defaultExpireDays            = 30
 	defaultHITLTimeoutH          = 48
+	metaReviewDays               = "settings.review_days"
+	metaDeferDays                = "settings.defer_days"
 	backfillReviewDelay          = 24 * time.Hour
 	ingestProgressEvery          = 200
 	defaultBackfillBatchSize     = 100
@@ -45,6 +47,8 @@ type Service struct {
 	discord               *discord.Service
 	wake                  func(time.Time)
 	now                   func() time.Time
+	defaultDelayWindow    time.Duration
+	defaultExpireDays     int
 	backfillBatchSize     int
 	backfillBatchTimeout  time.Duration
 	backfillQueueCapacity int
@@ -62,10 +66,62 @@ func NewService(repository repo.Repository, logger *slog.Logger, wake func(time.
 		logger:                logger,
 		wake:                  wake,
 		now:                   time.Now,
+		defaultDelayWindow:    defaultDelayDuration,
+		defaultExpireDays:     defaultExpireDays,
 		backfillBatchSize:     defaultBackfillBatchSize,
 		backfillBatchTimeout:  defaultBackfillBatchTimeout,
 		backfillQueueCapacity: defaultBackfillQueueCapacity,
 	}
+}
+
+func (s *Service) SetPolicyDefaults(defaultExpireDays int, defaultDelayWindow time.Duration) {
+	if defaultExpireDays > 0 {
+		s.defaultExpireDays = defaultExpireDays
+	}
+	if defaultDelayWindow > 0 {
+		s.defaultDelayWindow = defaultDelayWindow
+	}
+}
+
+func (s *Service) SetGlobalReviewDays(ctx context.Context, days int) error {
+	if days <= 0 || days > 3650 {
+		return fmt.Errorf("review days must be between 1 and 3650")
+	}
+	return s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		return tx.SetMeta(ctx, metaReviewDays, strconv.Itoa(days))
+	})
+}
+
+func (s *Service) SetGlobalDeferDays(ctx context.Context, days int) error {
+	if days <= 0 || days > 3650 {
+		return fmt.Errorf("defer days must be between 1 and 3650")
+	}
+	return s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		return tx.SetMeta(ctx, metaDeferDays, strconv.Itoa(days))
+	})
+}
+
+func (s *Service) currentDefaultsFromMeta(ctx context.Context, tx repo.TxRepository) (int, time.Duration, error) {
+	reviewDays := s.defaultExpireDays
+	deferWindow := s.defaultDelayWindow
+
+	if raw, ok, err := tx.GetMeta(ctx, metaReviewDays); err != nil {
+		return 0, 0, err
+	} else if ok {
+		if parsed, convErr := strconv.Atoi(strings.TrimSpace(raw)); convErr == nil && parsed > 0 {
+			reviewDays = parsed
+		}
+	}
+
+	if raw, ok, err := tx.GetMeta(ctx, metaDeferDays); err != nil {
+		return 0, 0, err
+	} else if ok {
+		if parsed, convErr := strconv.Atoi(strings.TrimSpace(raw)); convErr == nil && parsed > 0 {
+			deferWindow = time.Duration(parsed) * 24 * time.Hour
+		}
+	}
+
+	return reviewDays, deferWindow, nil
 }
 
 func (s *Service) SetBackfillWriteBatching(size int, timeout time.Duration, queueCapacity int) {
@@ -135,6 +191,10 @@ func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.Web
 }
 
 func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxRepository, event jellyfin.WebhookEvent, now, eventAt time.Time, playbackEvent, catalogIndexEvent, removalEvent bool, dedupeKey, itemID string, targets []targetRef) error {
+	defaultReviewDays, _, err := s.currentDefaultsFromMeta(ctx, tx)
+	if err != nil {
+		return err
+	}
 	processed, err := tx.IsProcessed(ctx, dedupeKey)
 	if err != nil {
 		return err
@@ -308,7 +368,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 				State:       domain.FlowStateActive,
 				Version:     0,
 				PolicySnapshot: domain.PolicySnapshot{
-					ExpireAfterDays: defaultExpireDays,
+					ExpireAfterDays: defaultReviewDays,
 					HITLTimeoutHrs:  defaultHITLTimeoutH,
 					TimeoutAction:   "delete",
 				},
@@ -421,6 +481,11 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 	decisionDisplayName := parsed.ItemID
 
 	err = s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		defaultReviewDays, defaultDeferWindow, err := s.currentDefaultsFromMeta(ctx, tx)
+		if err != nil {
+			return err
+		}
+
 		processed, err := tx.IsProcessed(ctx, dedupeKey)
 		if err != nil {
 			return err
@@ -443,7 +508,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 				State:       domain.FlowStateActive,
 				Version:     0,
 				PolicySnapshot: domain.PolicySnapshot{
-					ExpireAfterDays: defaultExpireDays,
+					ExpireAfterDays: defaultReviewDays,
 					HITLTimeoutHrs:  defaultHITLTimeoutH,
 					TimeoutAction:   "delete",
 				},
@@ -473,7 +538,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 			}
 		case "delay":
 			flow.State = domain.FlowStatePendingReview
-			flow.NextActionAt = now.Add(defaultDelayDuration)
+			flow.NextActionAt = now.Add(defaultDeferWindow)
 			if err := enqueueEvaluatePolicy(ctx, tx, flow, now, "discord_delay", flow.NextActionAt); err != nil {
 				return err
 			}
@@ -623,6 +688,77 @@ func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action str
 		content := fmt.Sprintf("Decision: %s for %s (AI).", strings.ToUpper(action), display)
 		if err := s.discord.FinalizeHITLPrompt(ctx, finalizeChannelID, finalizeMessageID, content); err != nil {
 			s.logger.Warn("failed to finalize ai decision HITL message", "item_id", itemID, "error", err)
+		}
+	}
+	s.wake(now)
+	return nil
+}
+
+func (s *Service) ApplyAIDelayDays(ctx context.Context, itemID string, days int) error {
+	itemID = strings.TrimSpace(itemID)
+	if itemID == "" {
+		return fmt.Errorf("item id is required")
+	}
+	if days <= 0 {
+		return fmt.Errorf("days must be > 0")
+	}
+	now := s.now().UTC()
+	delayUntil := now.Add(time.Duration(days) * 24 * time.Hour)
+	finalizeChannelID := ""
+	finalizeMessageID := ""
+	finalizeDisplayName := ""
+	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(ctx, itemID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("flow not found for item %s", itemID)
+		}
+		expectedVersion := flow.Version
+		flow.State = domain.FlowStatePendingReview
+		flow.HITLOutcome = "delay"
+		flow.NextActionAt = delayUntil
+		if flow.PolicySnapshot.ExpireAfterDays <= 0 {
+			flow.PolicySnapshot.ExpireAfterDays = s.defaultExpireDays
+		}
+		flow.PolicySnapshot.ExpireAfterDays = days
+		flow.UpdatedAt = now
+		flow.Version = expectedVersion + 1
+		finalizeChannelID = flow.Discord.ChannelID
+		finalizeMessageID = flow.Discord.MessageID
+		finalizeDisplayName = strings.TrimSpace(flow.DisplayName)
+		if err := tx.UpsertFlowCAS(ctx, flow, expectedVersion); err != nil {
+			return err
+		}
+		if err := enqueueEvaluatePolicy(ctx, tx, flow, now, "ai_delay", delayUntil); err != nil {
+			return err
+		}
+		return tx.AppendEvent(ctx, domain.Event{
+			EventID:        "evt:ai:delay:" + shortHash(itemID+":"+strconv.FormatInt(now.UnixNano(), 10)),
+			FlowID:         flow.FlowID,
+			ItemID:         flow.ItemID,
+			Type:           "ai.decision.delay",
+			Source:         "ai",
+			OccurredAt:     now,
+			IdempotencyKey: "ai:delay:" + itemID + ":" + strconv.Itoa(days) + ":" + strconv.FormatInt(flow.Version, 10),
+			Payload: map[string]any{
+				"days":        days,
+				"delay_until": delayUntil.Format(time.RFC3339),
+			},
+		})
+	})
+	if err != nil {
+		return err
+	}
+	if s.discord != nil && finalizeChannelID != "" && finalizeMessageID != "" {
+		display := finalizeDisplayName
+		if display == "" {
+			display = "item"
+		}
+		content := fmt.Sprintf("Decision: DELAY %d days for %s (AI).", days, display)
+		if err := s.discord.FinalizeHITLPrompt(ctx, finalizeChannelID, finalizeMessageID, content); err != nil {
+			s.logger.Warn("failed to finalize ai delay HITL message", "item_id", itemID, "error", err)
 		}
 	}
 	s.wake(now)

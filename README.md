@@ -35,6 +35,8 @@ JellyReaper is a Go service that listens to Jellyfin and Discord webhooks, persi
 | `DISCORD_PUBLIC_KEY_HEX` | yes | - | Discord app public key (hex) |
 | `DISCORD_BOT_TOKEN` | yes (for sending HITL prompts) | - | bot token |
 | `DISCORD_CHANNEL_ID` | yes (for prompt fallback) | - | default channel for HITL messages |
+| `DEFAULT_DELAY_WINDOW` | no | `15d` | default delay duration for Delay actions |
+| `DEFAULT_LAST_PLAYED_THRESHOLD_DAYS` | no | `60` | default stale threshold in days when flow policy is unset/new |
 | `OPENAI_API_KEY` | no | - | enables @mention AI assistant in Discord |
 | `OPENAI_MODEL` | no | `gpt-4o-mini` | model for mention assistant intent/tool routing |
 | `JELLYFIN_URL` | no | derived from host/port | Jellyfin base URL |

@@ -17,17 +17,25 @@ import (
 )
 
 const minHITLResponseWindow = 24 * time.Hour
+const metaReviewDays = "settings.review_days"
 
 type EvaluatePolicyHandler struct {
-	repository repo.Repository
-	logger     *slog.Logger
+	repository        repo.Repository
+	logger            *slog.Logger
+	defaultExpireDays int
 }
 
 func NewEvaluatePolicyHandler(repository repo.Repository, logger *slog.Logger) *EvaluatePolicyHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &EvaluatePolicyHandler{repository: repository, logger: logger}
+	return &EvaluatePolicyHandler{repository: repository, logger: logger, defaultExpireDays: 30}
+}
+
+func (h *EvaluatePolicyHandler) SetDefaultExpireDays(days int) {
+	if days > 0 {
+		h.defaultExpireDays = days
+	}
 }
 
 func (h *EvaluatePolicyHandler) Kind() domain.JobKind { return domain.JobKindEvaluatePolicy }
@@ -60,8 +68,15 @@ func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord
 		}
 
 		expireDays := flow.PolicySnapshot.ExpireAfterDays
+		if raw, ok, err := tx.GetMeta(ctx, metaReviewDays); err != nil {
+			return err
+		} else if ok {
+			if parsed, convErr := strconv.Atoi(strings.TrimSpace(raw)); convErr == nil && parsed > 0 {
+				expireDays = parsed
+			}
+		}
 		if expireDays <= 0 {
-			expireDays = 30
+			expireDays = h.defaultExpireDays
 		}
 
 		lastPlayed, known, err := mostRecentPlayForFlow(ctx, tx, flow)

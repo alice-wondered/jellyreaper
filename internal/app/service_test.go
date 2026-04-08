@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -292,6 +293,197 @@ func TestApplyAIDecisionUnarchiveEnqueuesEvaluateNow(t *testing.T) {
 	}
 	if !foundEval {
 		t.Fatal("expected evaluate_policy job to be queued after unarchive")
+	}
+}
+
+func TestApplyAIDelayDaysSetsPolicyAndSchedulesEval(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 7, 15, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	itemID := "target:season:season-ai-delay"
+	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:" + itemID,
+			ItemID:      itemID,
+			SubjectType: "season",
+			DisplayName: "AI Delay Season",
+			State:       domain.FlowStatePendingReview,
+			Version:     0,
+			PolicySnapshot: domain.PolicySnapshot{
+				ExpireAfterDays: 30,
+				HITLTimeoutHrs:  48,
+				TimeoutAction:   "delete",
+			},
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0)
+	})
+	if err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	if err := svc.ApplyAIDelayDays(context.Background(), itemID, 12); err != nil {
+		t.Fatalf("apply ai delay days: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, itemID)
+	if flow.PolicySnapshot.ExpireAfterDays != 12 {
+		t.Fatalf("expected policy expire days 12, got %d", flow.PolicySnapshot.ExpireAfterDays)
+	}
+	if flow.NextActionAt.Before(now.Add(11 * 24 * time.Hour)) {
+		t.Fatalf("expected next action ~12 days out, got %s", flow.NextActionAt)
+	}
+
+	jobs, err := store.LeaseDueJobs(context.Background(), now.Add(13*24*time.Hour), 20, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease jobs: %v", err)
+	}
+	foundEval := false
+	for _, job := range jobs {
+		if job.ItemID == itemID && job.Kind == domain.JobKindEvaluatePolicy {
+			foundEval = true
+			break
+		}
+	}
+	if !foundEval {
+		t.Fatal("expected scheduled evaluate_policy job after ai delay")
+	}
+}
+
+func TestApplyAIDelayDaysDefersLazilyAndFinalizesHITLPrompt(t *testing.T) {
+	store := newTestStore(t)
+	discordSvc, err := discord.NewService("", nil)
+	if err != nil {
+		t.Fatalf("new discord service: %v", err)
+	}
+
+	svc := NewService(store, nil, nil)
+	svc.SetDiscordService(discordSvc)
+	now := time.Date(2026, 4, 7, 15, 30, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	itemID := "target:season:season-ai-delay-prompt"
+	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:         "flow:" + itemID,
+			ItemID:         itemID,
+			SubjectType:    "season",
+			DisplayName:    "Season Delay Prompt",
+			State:          domain.FlowStatePendingReview,
+			Version:        0,
+			PolicySnapshot: domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 48, TimeoutAction: "delete"},
+			Discord:        domain.DiscordContext{ChannelID: "ch-delay", MessageID: "msg-delay"},
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}, 0)
+	})
+	if err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	finalized := false
+	discordSvc.SetEditPromptHookForTest(func(ctx context.Context, channelID, messageID, content string) error {
+		if channelID != "ch-delay" || messageID != "msg-delay" {
+			t.Fatalf("unexpected finalize target: %s/%s", channelID, messageID)
+		}
+		if !strings.Contains(content, "Decision: DELAY 7 days for Season Delay Prompt (AI).") {
+			t.Fatalf("unexpected finalize content: %s", content)
+		}
+		finalized = true
+		return nil
+	})
+
+	if err := svc.ApplyAIDelayDays(context.Background(), itemID, 7); err != nil {
+		t.Fatalf("apply ai delay days: %v", err)
+	}
+	if !finalized {
+		t.Fatal("expected HITL message to be finalized on ai delay")
+	}
+
+	jobsEarly, err := store.LeaseDueJobs(context.Background(), now.Add(6*24*time.Hour), 20, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease early jobs: %v", err)
+	}
+	for _, job := range jobsEarly {
+		if job.ItemID == itemID && job.Kind == domain.JobKindEvaluatePolicy {
+			t.Fatalf("expected no evaluate job before delay window, got %#v", job)
+		}
+	}
+
+	jobsLate, err := store.LeaseDueJobs(context.Background(), now.Add(8*24*time.Hour), 20, "test2", time.Minute)
+	if err != nil {
+		t.Fatalf("lease late jobs: %v", err)
+	}
+	foundEval := false
+	for _, job := range jobsLate {
+		if job.ItemID == itemID && job.Kind == domain.JobKindEvaluatePolicy {
+			foundEval = true
+			break
+		}
+	}
+	if !foundEval {
+		t.Fatal("expected evaluate job to become due after delay window")
+	}
+}
+
+func TestSetGlobalPolicyDefaultsUpdateMetaOnly(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 7, 16, 0, 0, 0, time.UTC)
+
+	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{FlowID: "flow:target:season:s-g1", ItemID: "target:season:s-g1", SubjectType: "season", DisplayName: "Season G1", State: domain.FlowStateActive, Version: 0, PolicySnapshot: domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 48, TimeoutAction: "delete"}, CreatedAt: now, UpdatedAt: now}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{FlowID: "flow:target:movie:m-g2", ItemID: "target:movie:m-g2", SubjectType: "movie", DisplayName: "Movie G2", State: domain.FlowStatePendingReview, Version: 0, PolicySnapshot: domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 48, TimeoutAction: "delete"}, CreatedAt: now, UpdatedAt: now}, 0)
+	})
+	if err != nil {
+		t.Fatalf("seed flows: %v", err)
+	}
+
+	if err := svc.SetGlobalReviewDays(context.Background(), 60); err != nil {
+		t.Fatalf("set global review days: %v", err)
+	}
+	if err := svc.SetGlobalDeferDays(context.Background(), 15); err != nil {
+		t.Fatalf("set global defer days: %v", err)
+	}
+
+	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		raw, ok, err := tx.GetMeta(context.Background(), metaReviewDays)
+		if err != nil {
+			return err
+		}
+		if !ok || raw != "60" {
+			return fmt.Errorf("unexpected review meta value: ok=%v raw=%q", ok, raw)
+		}
+		raw, ok, err = tx.GetMeta(context.Background(), metaDeferDays)
+		if err != nil {
+			return err
+		}
+		if !ok || raw != "15" {
+			return fmt.Errorf("unexpected defer meta value: ok=%v raw=%q", ok, raw)
+		}
+
+		flowA, found, err := tx.GetFlow(context.Background(), "target:season:s-g1")
+		if err != nil || !found {
+			return fmt.Errorf("flow A missing after global settings: found=%v err=%w", found, err)
+		}
+		if flowA.Version != 0 || flowA.PolicySnapshot.ExpireAfterDays != 30 {
+			return fmt.Errorf("flow A should remain unchanged, got version=%d review=%d", flowA.Version, flowA.PolicySnapshot.ExpireAfterDays)
+		}
+		flowB, found, err := tx.GetFlow(context.Background(), "target:movie:m-g2")
+		if err != nil || !found {
+			return fmt.Errorf("flow B missing after global settings: found=%v err=%w", found, err)
+		}
+		if flowB.Version != 0 || flowB.PolicySnapshot.ExpireAfterDays != 30 {
+			return fmt.Errorf("flow B should remain unchanged, got version=%d review=%d", flowB.Version, flowB.PolicySnapshot.ExpireAfterDays)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("verify global defaults update: %v", err)
 	}
 }
 

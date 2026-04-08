@@ -28,6 +28,8 @@ const (
 	defaultBackfillWriteBatchSize     = 100
 	defaultBackfillWriteBatchTimeout  = 500 * time.Millisecond
 	defaultBackfillWriteQueueCapacity = 2000
+	defaultDelayWindow                = 15 * 24 * time.Hour
+	defaultLastPlayedThresholdDays    = 60
 )
 
 type Config struct {
@@ -59,6 +61,9 @@ type Config struct {
 	BackfillWriteBatchSize     int
 	BackfillWriteBatchTimeout  time.Duration
 	BackfillWriteQueueCapacity int
+
+	DefaultDelayWindow             time.Duration
+	DefaultLastPlayedThresholdDays int
 }
 
 func LoadFromEnv() (Config, error) {
@@ -159,6 +164,20 @@ func LoadFromEnv() (Config, error) {
 		backfillWriteQueueCapacity = parsed
 	}
 
+	defaultDelayWindow, err := parseDurationEnv("DEFAULT_DELAY_WINDOW", defaultDelayWindow)
+	if err != nil {
+		return Config{}, err
+	}
+
+	defaultLastPlayedThresholdDays := defaultLastPlayedThresholdDays
+	if raw := strings.TrimSpace(os.Getenv("DEFAULT_LAST_PLAYED_THRESHOLD_DAYS")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			return Config{}, fmt.Errorf("parse DEFAULT_LAST_PLAYED_THRESHOLD_DAYS: must be a positive integer")
+		}
+		defaultLastPlayedThresholdDays = parsed
+	}
+
 	cfg := Config{
 		HTTPAddr: httpAddr,
 		HTTPPort: httpPort,
@@ -186,6 +205,9 @@ func LoadFromEnv() (Config, error) {
 		BackfillWriteBatchSize:     backfillWriteBatchSize,
 		BackfillWriteBatchTimeout:  backfillWriteBatchTimeout,
 		BackfillWriteQueueCapacity: backfillWriteQueueCapacity,
+
+		DefaultDelayWindow:             defaultDelayWindow,
+		DefaultLastPlayedThresholdDays: defaultLastPlayedThresholdDays,
 	}
 
 	if raw := os.Getenv("DISCORD_PUBLIC_KEY_HEX"); raw != "" {
@@ -203,6 +225,14 @@ func parseDurationEnv(key string, fallback time.Duration) (time.Duration, error)
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
 		return fallback, nil
+	}
+	if strings.HasSuffix(value, "d") || strings.HasSuffix(value, "D") {
+		rawDays := strings.TrimSpace(value[:len(value)-1])
+		days, err := strconv.Atoi(rawDays)
+		if err != nil || days <= 0 {
+			return 0, fmt.Errorf("parse %s: invalid day duration", key)
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
 	}
 	parsed, err := time.ParseDuration(value)
 	if err != nil {
