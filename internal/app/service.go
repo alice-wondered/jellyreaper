@@ -538,7 +538,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 	decisionDisplayName := parsed.ItemID
 
 	err = s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
-		defaultReviewDays, defaultDeferWindow, err := s.currentDefaultsFromMeta(ctx, tx)
+		_, defaultDeferWindow, err := s.currentDefaultsFromMeta(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -557,20 +557,8 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 			return err
 		}
 		if !found {
-			flow = domain.Flow{
-				FlowID:      flowIDFromItem(parsed.ItemID),
-				ItemID:      parsed.ItemID,
-				SubjectType: inferSubjectType(parsed.ItemID),
-				DisplayName: parsed.ItemID,
-				State:       domain.FlowStateActive,
-				Version:     0,
-				PolicySnapshot: domain.PolicySnapshot{
-					ExpireAfterDays: defaultReviewDays,
-					HITLTimeoutHrs:  defaultHITLTimeoutH,
-					TimeoutAction:   "delete",
-				},
-				CreatedAt: now,
-			}
+			staleVersion = true
+			return nil
 		}
 
 		expectedVersion := flow.Version
@@ -748,6 +736,30 @@ func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action str
 		}
 	}
 	s.wake(now)
+	return nil
+}
+
+func (s *Service) ApplyAIDecisionBatch(ctx context.Context, itemIDs []string, action string) error {
+	if len(itemIDs) == 0 {
+		return fmt.Errorf("item ids are required")
+	}
+	seen := map[string]struct{}{}
+	for _, id := range itemIDs {
+		trimmed := strings.TrimSpace(id)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		if err := s.ApplyAIDecision(ctx, trimmed, action); err != nil {
+			return err
+		}
+	}
+	if len(seen) == 0 {
+		return fmt.Errorf("item ids are required")
+	}
 	return nil
 }
 

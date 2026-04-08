@@ -51,6 +51,26 @@ func snowflakeIDFor(t time.Time) string {
 	return strconv.FormatInt(id, 10)
 }
 
+func seedFlowForInteraction(t *testing.T, store *bboltrepo.Store, itemID string, now time.Time) {
+	t.Helper()
+	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:         "flow:" + itemID,
+			ItemID:         itemID,
+			SubjectType:    inferSubjectType(itemID),
+			DisplayName:    itemID,
+			State:          domain.FlowStatePendingReview,
+			Version:        0,
+			PolicySnapshot: domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 48, TimeoutAction: "delete"},
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}, 0)
+	})
+	if err != nil {
+		t.Fatalf("seed flow %s: %v", itemID, err)
+	}
+}
+
 func TestHITLArchiveLeavesNoDeletionJob(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)
@@ -58,6 +78,7 @@ func TestHITLArchiveLeavesNoDeletionJob(t *testing.T) {
 	svc.now = func() time.Time { return now }
 
 	targetID := "target:item:item-archive"
+	seedFlowForInteraction(t, store, targetID, now)
 	resp, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction("archive", targetID, 0, snowflakeIDFor(now)))
 	if err != nil {
 		t.Fatalf("handle interaction: %v", err)
@@ -98,6 +119,7 @@ func TestHITLDeleteQueuesImmediateDeleteJob(t *testing.T) {
 	svc.now = func() time.Time { return now }
 
 	targetID := "target:item:item-delete"
+	seedFlowForInteraction(t, store, targetID, now)
 	_, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction("delete", targetID, 0, snowflakeIDFor(now)))
 	if err != nil {
 		t.Fatalf("handle interaction: %v", err)
@@ -498,6 +520,7 @@ func TestGlobalDeferDaysAppliesLazilyOnNextDelayAction(t *testing.T) {
 	}
 
 	targetID := "target:season:season-lazy-defer"
+	seedFlowForInteraction(t, store, targetID, now)
 	_, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction("delay", targetID, 0, snowflakeIDFor(now)))
 	if err != nil {
 		t.Fatalf("handle delay interaction: %v", err)
@@ -533,6 +556,7 @@ func TestHITLDelaySchedulesFutureEvaluation(t *testing.T) {
 	svc.now = func() time.Time { return now }
 
 	targetID := "target:item:item-delay"
+	seedFlowForInteraction(t, store, targetID, now)
 	_, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction("delay", targetID, 0, snowflakeIDFor(now)))
 	if err != nil {
 		t.Fatalf("handle interaction: %v", err)
@@ -1460,6 +1484,7 @@ func TestDiscordInteractionUsesSnowflakeTimestamp(t *testing.T) {
 		t.Fatalf("snowflake timestamp: %v", err)
 	}
 
+	seedFlowForInteraction(t, store, "target:item:item-snowflake", ts.UTC())
 	_, err = svc.HandleDiscordComponentInteraction(context.Background(), interaction("keep", "target:item:item-snowflake", 0, id))
 	if err != nil {
 		t.Fatalf("handle interaction: %v", err)
