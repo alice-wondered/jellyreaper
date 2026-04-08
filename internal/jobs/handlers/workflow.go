@@ -252,6 +252,8 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 	var found bool
 	shouldSend := true
 	statusLine := ""
+	staleMessageID := ""
+	staleChannelID := ""
 	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
 		var err error
 		flow, found, err = tx.GetFlow(ctx, job.ItemID)
@@ -265,19 +267,58 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 			shouldSend = false
 			return nil
 		}
-		if flow.Discord.MessageID != "" {
-			shouldSend = false
-			return nil
-		}
 		if lastPlayedAt, ok, err := mostRecentPlayForFlow(ctx, tx, flow); err != nil {
 			return err
 		} else if ok {
 			statusLine = "Last played at: " + humanTimeLabel(lastPlayedAt)
 		}
+		if flow.Discord.MessageID != "" {
+			shouldSend = false
+			staleMessageID = strings.TrimSpace(flow.Discord.MessageID)
+			staleChannelID = strings.TrimSpace(flow.Discord.ChannelID)
+			return nil
+		}
 		return nil
 	})
 	if err != nil {
 		return err
+	}
+	if staleMessageID != "" {
+		exists, _ := h.discord.HITLPromptExists(ctx, staleChannelID, staleMessageID)
+		if exists {
+			return nil
+		}
+		clearNow := time.Now().UTC()
+		cleared := false
+		err = h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+			current, found, err := tx.GetFlow(ctx, job.ItemID)
+			if err != nil {
+				return err
+			}
+			if !found || current.State != domain.FlowStatePendingReview {
+				shouldSend = false
+				return nil
+			}
+			if strings.TrimSpace(current.Discord.MessageID) == "" {
+				return nil
+			}
+			expected := current.Version
+			current.Discord.MessageID = ""
+			current.UpdatedAt = clearNow
+			current.Version = expected + 1
+			if err := tx.UpsertFlowCAS(ctx, current, expected); err != nil {
+				return err
+			}
+			cleared = true
+			flow = current
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if cleared {
+			shouldSend = true
+		}
 	}
 	if !shouldSend {
 		return nil
@@ -506,10 +547,15 @@ func upsertScheduledEvaluateJob(ctx context.Context, tx repo.TxRepository, flow 
 type ExecuteDeleteHandler struct {
 	repository repo.Repository
 	client     *jellyfin.Client
+	discord    *discord.Service
 }
 
 func NewExecuteDeleteHandler(repository repo.Repository, client *jellyfin.Client) *ExecuteDeleteHandler {
 	return &ExecuteDeleteHandler{repository: repository, client: client}
+}
+
+func (h *ExecuteDeleteHandler) SetDiscordService(discordSvc *discord.Service) {
+	h.discord = discordSvc
 }
 
 func (h *ExecuteDeleteHandler) Kind() domain.JobKind { return domain.JobKindExecuteDelete }
@@ -546,7 +592,8 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 	}
 
 	now := time.Now().UTC()
-	return h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	committed := false
+	err = h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
 		current, found, err := tx.GetFlow(ctx, flow.ItemID)
 		if err != nil {
 			return err
@@ -588,7 +635,7 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 			}
 		}
 
-		return tx.AppendEvent(ctx, domain.Event{
+		if err := tx.AppendEvent(ctx, domain.Event{
 			EventID:        "evt:delete:" + current.ItemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
 			FlowID:         current.FlowID,
 			ItemID:         current.ItemID,
@@ -599,8 +646,25 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 			Payload: map[string]any{
 				"job_id": job.JobID,
 			},
-		})
+		}); err != nil {
+			return err
+		}
+		committed = true
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if committed && h.discord != nil && strings.TrimSpace(flow.Discord.ChannelID) != "" && strings.TrimSpace(flow.Discord.MessageID) != "" {
+		name := strings.TrimSpace(flow.DisplayName)
+		if name == "" {
+			name = flow.ItemID
+		}
+		if err := h.discord.FinalizeHITLPrompt(ctx, flow.Discord.ChannelID, flow.Discord.MessageID, fmt.Sprintf("Resolved: DELETED for %s", name)); err != nil {
+			// best effort
+		}
+	}
+	return nil
 }
 
 func (h *ExecuteDeleteHandler) deleteAggregateChildren(ctx context.Context, flow domain.Flow) ([]domain.MediaItem, error) {

@@ -210,6 +210,20 @@ func (s *Service) SetEditPromptHookForTest(hook func(context.Context, string, st
 	s.editHook = hook
 }
 
+func (s *Service) HITLPromptExists(ctx context.Context, channelID, messageID string) (bool, error) {
+	if strings.TrimSpace(channelID) == "" || strings.TrimSpace(messageID) == "" {
+		return false, nil
+	}
+	if s.session == nil {
+		return false, nil
+	}
+	msg, err := s.session.ChannelMessage(channelID, messageID)
+	if err != nil {
+		return false, nil
+	}
+	return msg != nil, nil
+}
+
 func (s *Service) FinalizeHITLPrompt(ctx context.Context, channelID, messageID, content string) error {
 	if strings.TrimSpace(channelID) == "" || strings.TrimSpace(messageID) == "" {
 		return nil
@@ -491,8 +505,6 @@ func finalizeEmojiForOutcome(outcome string) string {
 		return "⏸️"
 	case strings.Contains(l, "played"):
 		return "▶️"
-	case strings.Contains(l, "keep") || strings.Contains(l, "kept"):
-		return "✅"
 	default:
 		return "✅"
 	}

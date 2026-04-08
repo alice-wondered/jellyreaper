@@ -455,7 +455,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 
 			expected := flow.Version
 			flow.State = domain.FlowStateActive
-			flow.HITLOutcome = "keep"
+			flow.HITLOutcome = "played"
 			flow.DecisionDeadlineAt = time.Time{}
 			flow.NextActionAt = runAt
 			flow.UpdatedAt = now
@@ -597,8 +597,10 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 		case "archive":
 			flow.State = domain.FlowStateArchived
 		case "delay":
-			flow.State = domain.FlowStatePendingReview
+			flow.State = domain.FlowStateActive
 			flow.NextActionAt = now.Add(defaultDeferWindow)
+			flow.DecisionDeadlineAt = time.Time{}
+			flow.Discord.MessageID = ""
 			if err := enqueueEvaluatePolicy(ctx, tx, flow, now, "discord_delay", flow.NextActionAt); err != nil {
 				return err
 			}
@@ -710,6 +712,7 @@ func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action str
 		case "unarchive":
 			flow.State = domain.FlowStateActive
 			flow.DecisionDeadlineAt = time.Time{}
+			flow.Discord.MessageID = ""
 			if err := enqueueEvaluatePolicy(ctx, tx, flow, now, "ai_unarchive", now); err != nil {
 				return err
 			}
@@ -806,18 +809,20 @@ func (s *Service) ApplyAIDelayDays(ctx context.Context, itemID string, days int)
 			return fmt.Errorf("flow not found for item %s", itemID)
 		}
 		expectedVersion := flow.Version
-		flow.State = domain.FlowStatePendingReview
+		finalizeChannelID = flow.Discord.ChannelID
+		finalizeMessageID = flow.Discord.MessageID
+		finalizeDisplayName = strings.TrimSpace(flow.DisplayName)
+		flow.State = domain.FlowStateActive
 		flow.HITLOutcome = "delay"
 		flow.NextActionAt = delayUntil
+		flow.DecisionDeadlineAt = time.Time{}
 		if flow.PolicySnapshot.ExpireAfterDays <= 0 {
 			flow.PolicySnapshot.ExpireAfterDays = s.defaultExpireDays
 		}
 		flow.PolicySnapshot.ExpireAfterDays = days
+		flow.Discord.MessageID = ""
 		flow.UpdatedAt = now
 		flow.Version = expectedVersion + 1
-		finalizeChannelID = flow.Discord.ChannelID
-		finalizeMessageID = flow.Discord.MessageID
-		finalizeDisplayName = strings.TrimSpace(flow.DisplayName)
 		if err := tx.UpsertFlowCAS(ctx, flow, expectedVersion); err != nil {
 			return err
 		}
@@ -1185,7 +1190,7 @@ func staleDecisionMessage(flow domain.Flow, itemDisplay string) string {
 		case domain.FlowStateDeleted:
 			decision = "delete"
 		case domain.FlowStateActive:
-			decision = "keep"
+			decision = "resolved"
 		case domain.FlowStatePendingReview:
 			decision = "delay"
 		default:

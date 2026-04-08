@@ -228,6 +228,7 @@ func TestApplyAIDecisionUnarchiveEnqueuesEvaluateNow(t *testing.T) {
 			ItemID:      itemID,
 			SubjectType: "item",
 			DisplayName: "AI Unarchive Target",
+			Discord:     domain.DiscordContext{ChannelID: "ch-unarchive", MessageID: "msg-unarchive"},
 			State:       domain.FlowStateArchived,
 			Version:     0,
 			PolicySnapshot: domain.PolicySnapshot{
@@ -250,6 +251,9 @@ func TestApplyAIDecisionUnarchiveEnqueuesEvaluateNow(t *testing.T) {
 	flow := mustGetFlow(t, store, itemID)
 	if flow.State != domain.FlowStateActive {
 		t.Fatalf("expected active state, got %s", flow.State)
+	}
+	if flow.Discord.MessageID != "" {
+		t.Fatalf("expected unarchive to clear stale discord message id, got %q", flow.Discord.MessageID)
 	}
 
 	jobs, err := store.LeaseDueJobs(context.Background(), now, 10, "test", time.Minute)
@@ -301,6 +305,12 @@ func TestApplyAIDelayDaysSetsPolicyAndSchedulesEval(t *testing.T) {
 	}
 
 	flow := mustGetFlow(t, store, itemID)
+	if flow.State != domain.FlowStateActive {
+		t.Fatalf("expected active state after ai delay, got %s", flow.State)
+	}
+	if flow.Discord.MessageID != "" {
+		t.Fatalf("expected ai delay to clear stale discord message id, got %q", flow.Discord.MessageID)
+	}
 	if flow.PolicySnapshot.ExpireAfterDays != 12 {
 		t.Fatalf("expected policy expire days 12, got %d", flow.PolicySnapshot.ExpireAfterDays)
 	}
@@ -372,6 +382,13 @@ func TestApplyAIDelayDaysDefersLazilyAndFinalizesHITLPrompt(t *testing.T) {
 	}
 	if !finalized {
 		t.Fatal("expected HITL message to be finalized on ai delay")
+	}
+	flow := mustGetFlow(t, store, itemID)
+	if flow.State != domain.FlowStateActive {
+		t.Fatalf("expected active state after ai delay, got %s", flow.State)
+	}
+	if flow.Discord.MessageID != "" {
+		t.Fatalf("expected ai delay to clear discord message id, got %q", flow.Discord.MessageID)
 	}
 
 	jobsEarly, err := store.LeaseDueJobs(context.Background(), now.Add(6*24*time.Hour), 20, "test", time.Minute)
@@ -513,7 +530,7 @@ func TestHITLDelaySchedulesFutureEvaluation(t *testing.T) {
 	}
 
 	flow := mustGetFlow(t, store, targetID)
-	if flow.State != domain.FlowStatePendingReview {
+	if flow.State != domain.FlowStateActive {
 		t.Fatalf("unexpected flow state: %s", flow.State)
 	}
 	if want := now.Add(24 * time.Hour); !flow.NextActionAt.Equal(want) {
