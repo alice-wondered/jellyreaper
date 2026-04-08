@@ -237,19 +237,31 @@ func (s *Service) FinalizeHITLPrompt(ctx context.Context, channelID, messageID, 
 
 	trimmed := strings.TrimSpace(content)
 	title := "item"
+	var existingEmbeds []*discordgo.MessageEmbed
+	var existingAttachments []*discordgo.MessageAttachment
 	if msg, err := s.session.ChannelMessage(channelID, messageID); err == nil && msg != nil {
 		title = firstLineTitle(msg.Content)
+		existingEmbeds = msg.Embeds
+		existingAttachments = msg.Attachments
 	}
 	trimmed = fmt.Sprintf("**%s**\n\n%s", title, trimmed)
 	emptyComponents := []discordgo.MessageComponent{}
 	edit := &discordgo.MessageEdit{ID: messageID, Channel: channelID, Content: &trimmed, Components: &emptyComponents}
+	if len(existingEmbeds) > 0 {
+		edit.Embeds = &existingEmbeds
+	}
+	if len(existingAttachments) > 0 {
+		edit.Attachments = &existingAttachments
+	}
 	if _, err := s.session.ChannelMessageEditComplex(edit); err != nil {
 		return fmt.Errorf("finalize hitl prompt: %w", err)
 	}
 
 	emoji := finalizeEmojiForOutcome(content)
 	if emoji != "" {
-		_ = s.session.MessageReactionAdd(channelID, messageID, emoji)
+		if err := s.session.MessageReactionAdd(channelID, messageID, emoji); err != nil {
+			_ = s.session.MessageReactionAdd(channelID, messageID, "✅")
+		}
 	}
 	return nil
 }
@@ -500,11 +512,11 @@ func finalizeEmojiForOutcome(outcome string) string {
 	case strings.Contains(l, "archiv"):
 		return "📦"
 	case strings.Contains(l, "delete"):
-		return "🗑️"
+		return "🗑"
 	case strings.Contains(l, "delay"):
-		return "⏸️"
+		return "⏸"
 	case strings.Contains(l, "played"):
-		return "▶️"
+		return "▶"
 	default:
 		return "✅"
 	}

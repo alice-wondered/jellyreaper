@@ -1278,6 +1278,89 @@ func TestHandleSeasonRemovalMarksChildrenAndSeasonFlowDeleted(t *testing.T) {
 	}
 }
 
+func TestEpisodeRemovalKeepsSeasonProjectionWhenEpisodesRemain(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 10, 14, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-rm-one", SeasonID: "season-rm-keep", SeasonName: "Season Keep", UpdatedAt: now}); err != nil {
+			return err
+		}
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-rm-two", SeasonID: "season-rm-keep", SeasonName: "Season Keep", UpdatedAt: now}); err != nil {
+			return err
+		}
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:season:season-rm-keep",
+			ItemID:      "target:season:season-rm-keep",
+			SubjectType: "season",
+			DisplayName: "Season Keep of Show",
+			State:       domain.FlowStateActive,
+			Version:     0,
+			PolicySnapshot: domain.PolicySnapshot{
+				ExpireAfterDays: 30,
+				HITLTimeoutHrs:  48,
+				TimeoutAction:   "delete",
+			},
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed season state: %v", err)
+	}
+
+	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:           "ep-rm-one",
+			ItemType:         "Episode",
+			SeasonID:         "season-rm-keep",
+			SeasonName:       "Season Keep",
+			NotificationType: "ItemDeleted",
+			EventID:          "evt-episode-rm-one",
+		},
+		Raw:       map[string]any{"EventId": "evt-episode-rm-one"},
+		ItemID:    "ep-rm-one",
+		EventType: "ItemDeleted",
+		DedupeKey: "jellyfin:evt-episode-rm-one",
+	})
+	if err != nil {
+		t.Fatalf("handle episode removal: %v", err)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		_, found, err := tx.GetMedia(context.Background(), "ep-rm-one")
+		if err != nil {
+			return err
+		}
+		if found {
+			t.Fatal("expected removed episode media deleted")
+		}
+
+		_, found, err = tx.GetMedia(context.Background(), "ep-rm-two")
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatal("expected remaining episode media to stay")
+		}
+
+		flow, found, err := tx.GetFlow(context.Background(), "target:season:season-rm-keep")
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatal("expected season flow to remain while episodes still exist")
+		}
+		if flow.EpisodeCount != 1 {
+			t.Fatalf("expected season episode count to decrement to 1, got %d", flow.EpisodeCount)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify partial episode removal state: %v", err)
+	}
+}
+
 func TestCatalogStaleEventDoesNotOverwriteNewerMetadata(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)
@@ -1589,5 +1672,28 @@ func TestDiscordInteractionUsesSnowflakeTimestamp(t *testing.T) {
 	}
 	if flow.State != domain.FlowStateArchived {
 		t.Fatalf("expected archive action state, got %s", flow.State)
+	}
+}
+
+func TestSourceTimestampForPlaybackPrefersLastPlayedAtOverCatalogDate(t *testing.T) {
+	oldCatalog := time.Date(2025, 6, 20, 14, 1, 48, 0, time.UTC)
+	recentPlay := time.Date(2026, 4, 5, 0, 29, 37, 0, time.UTC)
+
+	event := jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			NotificationType:   "PlaybackStart",
+			ItemType:           "Movie",
+			DateCreated:        oldCatalog,
+			DateLastMediaAdded: oldCatalog,
+			LastPlayedAt:       recentPlay,
+		},
+	}
+
+	ts, ok := sourceTimestampForJellyfinEvent(event)
+	if !ok {
+		t.Fatal("expected source timestamp")
+	}
+	if !ts.Equal(recentPlay) {
+		t.Fatalf("expected playback timestamp to prefer LastPlayedAt, got=%s want=%s", ts, recentPlay)
 	}
 }
