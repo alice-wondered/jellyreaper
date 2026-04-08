@@ -363,7 +363,7 @@ func TestScheduleDeleteProjection_UsesProjectionSelectionFlow(t *testing.T) {
 	h.SetDecisionService(app.NewService(store, nil, nil))
 	threadID := "thread-series-delete"
 
-	out, _, err := h.setDeleteProjectionState(context.Background(), threadID, "the office", "series")
+	out, _, err := h.setDeleteState(context.Background(), threadID, "the office")
 	if err != nil {
 		t.Fatalf("set delete projection: %v", err)
 	}
