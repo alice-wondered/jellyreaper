@@ -1,9 +1,7 @@
 services:
   jellyreaper:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: jellyreaper:local
+    image: ghcr.io/alice-wondered/jellyreaper:latest
+    pull_policy: always
     container_name: jellyreaper
     restart: unless-stopped
     ports:

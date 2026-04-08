@@ -48,8 +48,23 @@ func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord
 			}
 		}
 
-		if flow.State == domain.FlowStateArchived || flow.State == domain.FlowStateDeleted {
+		if flow.State == domain.FlowStateArchived || flow.State == domain.FlowStateDeleted || flow.State == domain.FlowStateDeleteQueued || flow.State == domain.FlowStateDeleteInProgress {
 			return nil
+		}
+		if flow.State == domain.FlowStatePendingReview {
+			return nil
+		}
+
+		expected := flow.Version
+		flow.State = domain.FlowStatePendingReview
+		flow.HITLOutcome = ""
+		flow.UpdatedAt = now
+		flow.Version = expected + 1
+		if flow.CreatedAt.IsZero() {
+			flow.CreatedAt = now
+		}
+		if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+			return err
 		}
 
 		payload, err := json.Marshal(jobs.SendHITLPromptPayload{ChannelID: flow.Discord.ChannelID})
@@ -65,7 +80,7 @@ func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord
 			Status:         domain.JobStatusPending,
 			RunAt:          now,
 			MaxAttempts:    5,
-			IdempotencyKey: "job:prompt:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version+1, 10),
+			IdempotencyKey: "job:prompt:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version, 10),
 			PayloadJSON:    payload,
 			CreatedAt:      now,
 			UpdatedAt:      now,
@@ -113,6 +128,7 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 	now := time.Now().UTC()
 	var flow domain.Flow
 	var found bool
+	shouldSend := true
 	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
 		var err error
 		flow, found, err = tx.GetFlow(ctx, job.ItemID)
@@ -122,10 +138,21 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 		if !found {
 			return fmt.Errorf("flow not found for item %s", job.ItemID)
 		}
+		if flow.State != domain.FlowStatePendingReview {
+			shouldSend = false
+			return nil
+		}
+		if flow.Discord.MessageID != "" {
+			shouldSend = false
+			return nil
+		}
 		return nil
 	})
 	if err != nil {
 		return err
+	}
+	if !shouldSend {
+		return nil
 	}
 
 	channelID := payload.ChannelID

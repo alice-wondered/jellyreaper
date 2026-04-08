@@ -64,7 +64,7 @@ go build ./cmd/jellyreaper
 ## Docker
 ```bash
 cp .env.example .env
-docker compose -f docker-compose.example.yml up --build
+docker compose -f docker-compose.example.yml up -d
 ```
 
 Mounted persistence paths in compose:

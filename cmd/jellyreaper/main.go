@@ -78,6 +78,7 @@ func main() {
 		os.Exit(1)
 	}
 	discordService.SetEmbedPersistenceDir(cfg.EmbedDir)
+	discordService.SetJellyfinImageSource(cfg.JellyfinURL, cfg.JellyfinAPIKey)
 
 	handlerList := []jobs.JobHandler{
 		handlers.NewEvaluatePolicyHandler(store, logger),

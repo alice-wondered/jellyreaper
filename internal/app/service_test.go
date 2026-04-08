@@ -210,20 +210,15 @@ func TestWebhookEpisodeAggregatesToSeasonAndSeries(t *testing.T) {
 	}
 
 	seasonFlow := mustGetFlow(t, store, "target:season:season-1")
-	if seasonFlow.DisplayName != "Season 1" {
+	if seasonFlow.DisplayName != "Season 1 of My Show" {
 		t.Fatalf("unexpected season flow display name: %s", seasonFlow.DisplayName)
 	}
-	seriesFlow := mustGetFlow(t, store, "target:series:series-1")
-	if seriesFlow.DisplayName != "My Show" {
-		t.Fatalf("unexpected series flow display name: %s", seriesFlow.DisplayName)
-	}
-
 	jobs, err := store.LeaseDueJobs(context.Background(), now, 10, "test", time.Minute)
 	if err != nil {
 		t.Fatalf("lease jobs: %v", err)
 	}
-	if len(jobs) != 2 {
-		t.Fatalf("expected two evaluate jobs for season+series, got %d (%#v)", len(jobs), jobs)
+	if len(jobs) != 1 {
+		t.Fatalf("expected one evaluate job for season target, got %d (%#v)", len(jobs), jobs)
 	}
 }
 
@@ -254,14 +249,11 @@ func TestDeriveTargetsUsesIDsNotTitles(t *testing.T) {
 	}}
 
 	targets := deriveTargets(event)
-	if len(targets) != 2 {
-		t.Fatalf("expected two targets, got %d", len(targets))
+	if len(targets) != 1 {
+		t.Fatalf("expected one target, got %d", len(targets))
 	}
 	if targets[0].Canonical != "target:season:season-01" {
 		t.Fatalf("unexpected season canonical key: %s", targets[0].Canonical)
-	}
-	if targets[1].Canonical != "target:series:series-abc" {
-		t.Fatalf("unexpected series canonical key: %s", targets[1].Canonical)
 	}
 }
 
