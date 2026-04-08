@@ -39,6 +39,9 @@ func TestHITLArchiveLeavesNoDeletionJob(t *testing.T) {
 	if resp.Data.Content == "" {
 		t.Fatal("expected decision summary content")
 	}
+	if !strings.Contains(resp.Data.Content, "Resolved: ARCHIVED") {
+		t.Fatalf("expected archived decision wording, got %q", resp.Data.Content)
+	}
 
 	flow := mustGetFlow(t, store, targetID)
 	if flow.State != domain.FlowStateArchived {
@@ -64,9 +67,12 @@ func TestHITLDeleteQueuesImmediateDeleteJob(t *testing.T) {
 
 	targetID := "target:item:item-delete"
 	seedFlowForInteraction(t, store, targetID, now)
-	_, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction("delete", targetID, 0, snowflakeIDFor(now)))
+	resp, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction("delete", targetID, 0, snowflakeIDFor(now)))
 	if err != nil {
 		t.Fatalf("handle interaction: %v", err)
+	}
+	if resp == nil || resp.Data == nil || !strings.Contains(resp.Data.Content, "Resolved: DELETE REQUESTED") {
+		t.Fatalf("expected delete requested wording, got %#v", resp)
 	}
 
 	flow := mustGetFlow(t, store, targetID)

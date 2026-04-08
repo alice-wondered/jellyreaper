@@ -561,7 +561,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 					}
 					processedMessage = staleDecisionMessage(flow, display)
 				} else {
-					processedMessage = fmt.Sprintf("Resolved: %s for %s (target no longer exists)", strings.ToUpper(strings.TrimSpace(parsed.Action)), decisionDisplayName)
+					processedMessage = fmt.Sprintf("Resolved: %s for %s (target no longer exists)", interactionDecisionLabel(parsed.Action), decisionDisplayName)
 				}
 			}
 			return nil
@@ -573,7 +573,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 		}
 		if !found {
 			staleVersion = true
-			staleMessage = fmt.Sprintf("Resolved: %s for %s (target no longer exists)", strings.ToUpper(strings.TrimSpace(parsed.Action)), decisionDisplayName)
+			staleMessage = fmt.Sprintf("Resolved: %s for %s (target no longer exists)", interactionDecisionLabel(parsed.Action), decisionDisplayName)
 			return nil
 		}
 		if strings.TrimSpace(flow.DisplayName) != "" {
@@ -649,7 +649,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 
 	if alreadyProcessed {
 		if strings.TrimSpace(processedMessage) == "" {
-			processedMessage = fmt.Sprintf("Resolved: %s for %s", strings.ToUpper(strings.TrimSpace(parsed.Action)), decisionDisplayName)
+			processedMessage = fmt.Sprintf("Resolved: %s for %s", interactionDecisionLabel(parsed.Action), decisionDisplayName)
 		}
 		return interactionMessageUpdateResponse(processedMessage), nil
 	}
@@ -1164,15 +1164,12 @@ func interactionMessageUpdateResponse(content string) *discordgo.InteractionResp
 }
 
 func interactionDecisionUpdateResponse(action string, itemDisplay string) *discordgo.InteractionResponse {
-	decision := strings.TrimSpace(action)
-	if decision == "" {
-		decision = "unknown"
-	}
+	decision := interactionDecisionLabel(action)
 	item := strings.TrimSpace(itemDisplay)
 	if item == "" {
 		item = "item"
 	}
-	return interactionMessageUpdateResponse(fmt.Sprintf("Decision: %s for %s", strings.ToUpper(decision), item))
+	return interactionMessageUpdateResponse(fmt.Sprintf("Resolved: %s for %s", decision, item))
 }
 
 func staleDecisionMessage(flow domain.Flow, itemDisplay string) string {
@@ -1185,7 +1182,9 @@ func staleDecisionMessage(flow domain.Flow, itemDisplay string) string {
 		switch flow.State {
 		case domain.FlowStateArchived:
 			decision = "archive"
-		case domain.FlowStateDeleteQueued, domain.FlowStateDeleted:
+		case domain.FlowStateDeleteQueued:
+			decision = "delete_requested"
+		case domain.FlowStateDeleted:
 			decision = "delete"
 		case domain.FlowStateActive:
 			decision = "keep"
@@ -1195,7 +1194,26 @@ func staleDecisionMessage(flow domain.Flow, itemDisplay string) string {
 			decision = "resolved"
 		}
 	}
-	return fmt.Sprintf("Resolved: %s for %s", strings.ToUpper(decision), item)
+	return fmt.Sprintf("Resolved: %s for %s", interactionDecisionLabel(decision), item)
+}
+
+func interactionDecisionLabel(action string) string {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "archive":
+		return "ARCHIVED"
+	case "keep":
+		return "KEPT"
+	case "delay":
+		return "DELAYED"
+	case "delete", "delete_requested":
+		return "DELETE REQUESTED"
+	default:
+		v := strings.TrimSpace(action)
+		if v == "" {
+			return "RESOLVED"
+		}
+		return strings.ToUpper(v)
+	}
 }
 
 func jellyfinEventType(t string) string {
