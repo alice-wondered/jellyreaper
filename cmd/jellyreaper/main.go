@@ -89,7 +89,7 @@ func main() {
 	handlerList := []jobs.JobHandler{
 		handlers.NewEvaluatePolicyHandler(store, logger),
 		handlers.NewSendHITLPromptHandler(store, logger, discordService, cfg.DiscordChannelID, 48*time.Hour),
-		handlers.NewHITLTimeoutHandler(store),
+		handlers.NewHITLTimeoutHandler(store, discordService, logger),
 		handlers.NewExecuteDeleteHandler(store, jellyfin.NewClient(cfg.JellyfinURL, cfg.JellyfinAPIKey, nil)),
 		handlers.NewNoopHandler(domain.JobKindVerifyDelete, logger),
 		handlers.NewNoopHandler(domain.JobKindReconcileItem, logger),

@@ -25,6 +25,7 @@ type Service struct {
 	publicKey ed25519.PublicKey
 	session   *discordgo.Session
 	sendHook  func(context.Context, string, string, int64, string, string) (string, error)
+	editHook  func(context.Context, string, string, string) error
 
 	httpClient      *http.Client
 	imagePersistDir string
@@ -150,6 +151,30 @@ func (s *Service) SendHITLPrompt(ctx context.Context, channelID, itemID string, 
 
 func (s *Service) SetSendPromptHookForTest(hook func(context.Context, string, string, int64, string, string) (string, error)) {
 	s.sendHook = hook
+}
+
+func (s *Service) SetEditPromptHookForTest(hook func(context.Context, string, string, string) error) {
+	s.editHook = hook
+}
+
+func (s *Service) FinalizeHITLPrompt(ctx context.Context, channelID, messageID, content string) error {
+	if strings.TrimSpace(channelID) == "" || strings.TrimSpace(messageID) == "" {
+		return nil
+	}
+	if s.editHook != nil {
+		return s.editHook(ctx, channelID, messageID, content)
+	}
+	if s.session == nil {
+		return fmt.Errorf("discord bot token is not configured")
+	}
+
+	trimmed := strings.TrimSpace(content)
+	emptyComponents := []discordgo.MessageComponent{}
+	edit := &discordgo.MessageEdit{ID: messageID, Channel: channelID, Content: &trimmed, Components: &emptyComponents}
+	if _, err := s.session.ChannelMessageEditComplex(edit); err != nil {
+		return fmt.Errorf("finalize hitl prompt: %w", err)
+	}
+	return nil
 }
 
 func (s *Service) SetEmbedPersistenceDir(dir string) {

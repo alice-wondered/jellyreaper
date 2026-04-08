@@ -226,7 +226,7 @@ func TestIntegrationWebhookDoesNotDeleteImmediatelyWithShortTimeoutConfig(t *tes
 	reg, err := jobs.NewRegistry(
 		handlers.NewEvaluatePolicyHandler(store, nil),
 		handlers.NewSendHITLPromptHandler(store, nil, discordSvc, "ch-1", 25*time.Millisecond),
-		handlers.NewHITLTimeoutHandler(store),
+		handlers.NewHITLTimeoutHandler(store, discordSvc, nil),
 		handlers.NewExecuteDeleteHandler(store, jellyfin.NewClient(deleteServer.URL, "api", deleteServer.Client())),
 	)
 	if err != nil {
