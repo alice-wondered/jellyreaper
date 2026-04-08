@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/url"
 	"strings"
+	"time"
 )
 
 type WebhookPayload struct {
@@ -28,12 +29,13 @@ type WebhookPayload struct {
 }
 
 type WebhookEvent struct {
-	Payload   WebhookPayload
-	Raw       map[string]any
-	ItemID    string
-	EventID   string
-	EventType string
-	DedupeKey string
+	Payload    WebhookPayload
+	Raw        map[string]any
+	ItemID     string
+	EventID    string
+	EventType  string
+	DedupeKey  string
+	OccurredAt time.Time
 }
 
 func BuildWebhookEvent(payload WebhookPayload, raw map[string]any) WebhookEvent {

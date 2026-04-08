@@ -53,6 +53,15 @@ func TestHITLArchiveLeavesNoDeletionJob(t *testing.T) {
 	if resp == nil || resp.Data == nil {
 		t.Fatal("expected response data")
 	}
+	if resp.Type != discordgo.InteractionResponseUpdateMessage {
+		t.Fatalf("expected update message response, got %d", resp.Type)
+	}
+	if len(resp.Data.Components) != 0 {
+		t.Fatalf("expected cleared message components, got %d", len(resp.Data.Components))
+	}
+	if resp.Data.Content == "" {
+		t.Fatal("expected decision summary content")
+	}
 
 	flow := mustGetFlow(t, store, targetID)
 	if flow.State != domain.FlowStateArchived {
@@ -297,7 +306,7 @@ func TestIngestBackfillItemsSchedulesDeferredEvaluateFromLastPlay(t *testing.T) 
 	if flow.State != domain.FlowStateActive {
 		t.Fatalf("unexpected flow state: %s", flow.State)
 	}
-	wantRunAt := lastPlayed.Add(90 * 24 * time.Hour)
+	wantRunAt := lastPlayed.Add(30 * 24 * time.Hour)
 	if !flow.NextActionAt.Equal(wantRunAt) {
 		t.Fatalf("unexpected next action: got=%s want=%s", flow.NextActionAt, wantRunAt)
 	}
@@ -357,6 +366,32 @@ func TestIngestBackfillItemsPreservesHigherPlaybackMetrics(t *testing.T) {
 	}
 	if media.LastPlayedAt.IsZero() {
 		t.Fatal("expected preserved last played timestamp")
+	}
+}
+
+func TestIngestBackfillPlaybackUsesOriginalEventTimestamp(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 9, 10, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	eventAt := now.Add(-72 * time.Hour)
+	err := svc.IngestBackfillPlayback(context.Background(), []jellyfin.PlaybackEvent{{
+		ItemID: "movie-playback-ts",
+		Type:   "PlaybackStart",
+		Name:   "Movie Playback TS",
+		Date:   eventAt,
+	}})
+	if err != nil {
+		t.Fatalf("ingest backfill playback: %v", err)
+	}
+
+	media := mustGetMedia(t, store, "movie-playback-ts")
+	if !media.LastPlayedAt.Equal(eventAt) {
+		t.Fatalf("expected last played at original event time, got=%s want=%s", media.LastPlayedAt, eventAt)
+	}
+	if media.PlayCountTotal != 1 {
+		t.Fatalf("expected play count to increment to 1, got %d", media.PlayCountTotal)
 	}
 }
 

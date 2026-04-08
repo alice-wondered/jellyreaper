@@ -22,7 +22,7 @@ import (
 
 const (
 	defaultDelayDuration = 24 * time.Hour
-	defaultExpireDays    = 90
+	defaultExpireDays    = 30
 	defaultHITLTimeoutH  = 48
 	backfillReviewDelay  = 24 * time.Hour
 )
@@ -54,6 +54,10 @@ func NewService(repository repo.Repository, logger *slog.Logger, wake func(time.
 
 func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.WebhookEvent) error {
 	now := s.now().UTC()
+	eventAt := now
+	if !event.OccurredAt.IsZero() {
+		eventAt = event.OccurredAt.UTC()
+	}
 	dedupeKey := event.DedupeKey
 	itemID := event.ItemID
 	targets := deriveTargets(event)
@@ -73,7 +77,7 @@ func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.Webh
 			ItemID:         itemID,
 			Type:           jellyfinEventType(event.EventType),
 			Source:         "jellyfin",
-			OccurredAt:     now,
+			OccurredAt:     eventAt,
 			IdempotencyKey: dedupeKey,
 			Payload:        event.Raw,
 		}
@@ -127,7 +131,9 @@ func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.Webh
 				media.PlayCountTotal = existing.PlayCountTotal
 			}
 			if isPlaybackEvent(event.EventType) {
-				media.LastPlayedAt = now
+				if eventAt.After(media.LastPlayedAt) {
+					media.LastPlayedAt = eventAt
+				}
 				media.PlayCountTotal++
 			}
 			if err := tx.UpsertMedia(ctx, media); err != nil {
@@ -233,6 +239,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 	dedupeKey := discordDedupeKey(interaction)
 	alreadyProcessed := false
 	staleVersion := false
+	decisionDisplayName := parsed.ItemID
 
 	err = s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
 		processed, err := tx.IsProcessed(ctx, dedupeKey)
@@ -269,6 +276,9 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 		if parsed.Version != expectedVersion {
 			staleVersion = true
 			return nil
+		}
+		if strings.TrimSpace(flow.DisplayName) != "" {
+			decisionDisplayName = strings.TrimSpace(flow.DisplayName)
 		}
 
 		flow.UpdatedAt = now
@@ -332,14 +342,14 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 	}
 
 	if alreadyProcessed {
-		return interactionResponse("This interaction was already processed."), nil
+		return interactionMessageUpdateResponse("Decision already recorded."), nil
 	}
 	if staleVersion {
-		return interactionResponse("This decision is stale. Please refresh and try again."), nil
+		return interactionMessageUpdateResponse("This decision is stale. Please refresh and try again."), nil
 	}
 
 	s.wake(now)
-	return interactionResponse(fmt.Sprintf("Applied action %q to %s.", parsed.Action, parsed.ItemID)), nil
+	return interactionDecisionUpdateResponse(parsed.Action, decisionDisplayName), nil
 }
 
 func (s *Service) IngestBackfillPlayback(ctx context.Context, events []jellyfin.PlaybackEvent) error {
@@ -354,10 +364,11 @@ func (s *Service) IngestBackfillPlayback(ctx context.Context, events []jellyfin.
 				Name:             e.Name,
 				NotificationType: e.Type,
 			},
-			Raw:       map[string]any{"source": "backfill", "type": e.Type, "item_id": e.ItemID, "name": e.Name},
-			ItemID:    e.ItemID,
-			EventType: e.Type,
-			DedupeKey: key,
+			Raw:        map[string]any{"source": "backfill", "type": e.Type, "item_id": e.ItemID, "name": e.Name},
+			ItemID:     e.ItemID,
+			EventType:  e.Type,
+			DedupeKey:  key,
+			OccurredAt: e.Date,
 		}); err != nil {
 			return err
 		}
@@ -604,6 +615,28 @@ func interactionResponse(content string) *discordgo.InteractionResponse {
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{Content: content},
 	}
+}
+
+func interactionMessageUpdateResponse(content string) *discordgo.InteractionResponse {
+	return &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseUpdateMessage,
+		Data: &discordgo.InteractionResponseData{
+			Content:    content,
+			Components: []discordgo.MessageComponent{},
+		},
+	}
+}
+
+func interactionDecisionUpdateResponse(action string, itemDisplay string) *discordgo.InteractionResponse {
+	decision := strings.TrimSpace(action)
+	if decision == "" {
+		decision = "unknown"
+	}
+	item := strings.TrimSpace(itemDisplay)
+	if item == "" {
+		item = "item"
+	}
+	return interactionMessageUpdateResponse(fmt.Sprintf("Decision: %s for %s", strings.ToUpper(decision), item))
 }
 
 func jellyfinEventType(t string) string {

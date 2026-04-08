@@ -59,7 +59,7 @@ func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord
 
 		expireDays := flow.PolicySnapshot.ExpireAfterDays
 		if expireDays <= 0 {
-			expireDays = 90
+			expireDays = 30
 		}
 
 		lastPlayed, known, err := mostRecentPlayForFlow(ctx, tx, flow)
