@@ -38,6 +38,10 @@ func (f *fakeRepo) GetNextDueAt(context.Context) (time.Time, bool, error) {
 	return f.nextDue, f.hasDue, nil
 }
 
+func (f *fakeRepo) GetNextQueuedJob(context.Context) (domain.JobRecord, bool, error) {
+	return domain.JobRecord{}, false, nil
+}
+
 func TestLoop_LeaseAndDispatchCallsDispatch(t *testing.T) {
 	repo := &fakeRepo{jobs: []domain.JobRecord{{JobID: "job1"}, {JobID: "job2"}}}
 

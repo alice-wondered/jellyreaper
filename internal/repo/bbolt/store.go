@@ -208,6 +208,51 @@ func (s *Store) GetNextDueAt(ctx context.Context) (time.Time, bool, error) {
 	return out, ok, nil
 }
 
+func (s *Store) GetNextQueuedJob(ctx context.Context) (domain.JobRecord, bool, error) {
+	if err := checkContext(ctx); err != nil {
+		return domain.JobRecord{}, false, err
+	}
+
+	var out domain.JobRecord
+	var ok bool
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		dueIndex, err := requireBucket(tx, bucketDueIndex)
+		if err != nil {
+			return err
+		}
+		jobs, err := requireBucket(tx, bucketJobs)
+		if err != nil {
+			return err
+		}
+
+		_, v := dueIndex.Cursor().First()
+		if v == nil {
+			return nil
+		}
+
+		jobID := string(v)
+		if jobID == "" {
+			return nil
+		}
+
+		var job domain.JobRecord
+		found, err := bucketGetJSON(jobs, jobID, &job)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return nil
+		}
+		out = job
+		ok = true
+		return nil
+	})
+	if err != nil {
+		return domain.JobRecord{}, false, err
+	}
+	return out, ok, nil
+}
+
 func (s *Store) CompleteJob(ctx context.Context, jobID string, completedAt time.Time) error {
 	if err := checkContext(ctx); err != nil {
 		return err

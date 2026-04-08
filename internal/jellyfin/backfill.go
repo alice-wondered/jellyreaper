@@ -146,6 +146,8 @@ func (s *BackfillService) FetchPlaybackEventsSince(ctx context.Context, since ti
 func (s *BackfillService) FetchChangedItemsSince(ctx context.Context, since time.Time, limit int32) ([]ItemSnapshot, error) {
 	recursive := true
 	enableUserData := true
+	sortBy := []gen.ItemSortBy{gen.ItemSortByDateCreated}
+	sortOrder := []gen.SortOrder{gen.SortOrder("Ascending")}
 	pageSize := limit
 	if pageSize <= 0 {
 		pageSize = 500
@@ -158,6 +160,8 @@ func (s *BackfillService) FetchChangedItemsSince(ctx context.Context, since time
 		params := &gen.GetItemsParams{
 			Recursive:      &recursive,
 			EnableUserData: &enableUserData,
+			SortBy:         &sortBy,
+			SortOrder:      &sortOrder,
 			Limit:          &pageSize,
 			StartIndex:     &startIndex,
 		}

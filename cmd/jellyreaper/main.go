@@ -225,6 +225,7 @@ func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.R
 	}
 
 	run(true)
+	logNextQueuedJob(ctx, logger, repository)
 
 	ticker := time.NewTicker(cfg.BackfillInterval)
 	defer ticker.Stop()
@@ -236,6 +237,26 @@ func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.R
 			run(false)
 		}
 	}
+}
+
+func logNextQueuedJob(ctx context.Context, logger *slog.Logger, repository repo.Repository) {
+	job, found, err := repository.GetNextQueuedJob(ctx)
+	if err != nil {
+		logger.Warn("failed to inspect next queued job", "error", err)
+		return
+	}
+	if !found {
+		logger.Info("queue state after startup reconciliation", "next_job", "none")
+		return
+	}
+
+	logger.Info("queue state after startup reconciliation",
+		"job_id", job.JobID,
+		"kind", job.Kind,
+		"item_id", job.ItemID,
+		"run_at", job.RunAt,
+		"status", job.Status,
+	)
 }
 
 func resolveBackfillStart(ctx context.Context, repository repo.Repository, cfg config.Config) (time.Time, error) {
