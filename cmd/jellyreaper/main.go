@@ -193,8 +193,11 @@ func main() {
 				})
 
 				logger.Info("running startup backfill before scheduler/http")
-				runBackfillWithRetries(ctx, logger, store, appService, discordService, cfg, backfillSvc, true)
-				logNextQueuedJob(ctx, logger, store)
+				if err := runBackfillOnce(ctx, logger, store, appService, discordService, cfg, backfillSvc, true); err != nil {
+					logger.Warn("startup backfill run failed", "error", err)
+				} else {
+					logNextQueuedJob(ctx, logger, store)
+				}
 
 				go runBackfillLoop(ctx, logger, store, appService, discordService, cfg, backfillSvc, false)
 			}
@@ -239,39 +242,12 @@ func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.R
 		}
 	}
 
-	run := func(isStartup bool) {
-		attempt := 0
-		for {
-			err := runBackfillOnce(ctx, logger, repository, appService, discordService, cfg, backfillSvc, isStartup)
-			if err == nil {
-				if attempt > 0 {
-					logger.Info("backfill recovered after retries", "failed_attempts", attempt)
-				}
-				return
-			}
-			if ctx.Err() != nil {
-				return
-			}
-
-			delay := retryBackoffDelay(attempt, backfillRetryBaseDelay, backfillRetryMaxDelay)
-			attempt++
-			logger.Warn("backfill run failed; retrying",
-				"error", err,
-				"attempt", attempt,
-				"retry_in", delay,
-			)
-
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(delay):
-			}
-		}
-	}
-
 	if runStartup {
-		run(true)
-		logNextQueuedJob(ctx, logger, repository)
+		if err := runBackfillOnce(ctx, logger, repository, appService, discordService, cfg, backfillSvc, true); err != nil {
+			logger.Warn("startup backfill run failed", "error", err)
+		} else {
+			logNextQueuedJob(ctx, logger, repository)
+		}
 	}
 
 	ticker := time.NewTicker(cfg.BackfillInterval)
@@ -281,35 +257,9 @@ func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.R
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			run(false)
-		}
-	}
-}
-
-func runBackfillWithRetries(ctx context.Context, logger *slog.Logger, repository repo.Repository, appService *app.Service, discordService *discord.Service, cfg config.Config, backfillSvc *jellyfin.BackfillService, isStartup bool) {
-	attempt := 0
-	for {
-		err := runBackfillOnce(ctx, logger, repository, appService, discordService, cfg, backfillSvc, isStartup)
-		if err == nil {
-			if attempt > 0 {
-				logger.Info("backfill recovered after retries", "failed_attempts", attempt)
+			if err := runBackfillOnce(ctx, logger, repository, appService, discordService, cfg, backfillSvc, false); err != nil {
+				logger.Warn("periodic backfill run failed", "error", err)
 			}
-			return
-		}
-		if ctx.Err() != nil {
-			return
-		}
-		delay := retryBackoffDelay(attempt, backfillRetryBaseDelay, backfillRetryMaxDelay)
-		attempt++
-		logger.Warn("backfill run failed; retrying",
-			"error", err,
-			"attempt", attempt,
-			"retry_in", delay,
-		)
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(delay):
 		}
 	}
 }
