@@ -1,0 +1,77 @@
+package jellyfin
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+
+	gen "jellyreaper/internal/jellyfin/gen"
+)
+
+func TestBackfillFetchPlaybackEventsSince(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/System/ActivityLog/Entries" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		res := gen.ActivityLogEntryQueryResult{Items: &[]gen.ActivityLogEntry{
+			{Type: strPtr("PlaybackStart"), ItemId: strPtr("item-1"), Name: strPtr("Movie A")},
+			{Type: strPtr("ItemAdded"), ItemId: strPtr("item-2"), Name: strPtr("Movie B")},
+		}}
+		_ = json.NewEncoder(w).Encode(res)
+	}))
+	defer server.Close()
+
+	b, err := NewBackfillService(server.URL, "token", server.Client())
+	if err != nil {
+		t.Fatalf("new backfill service: %v", err)
+	}
+
+	events, err := b.FetchPlaybackEventsSince(context.Background(), time.Now().Add(-time.Hour), 100)
+	if err != nil {
+		t.Fatalf("fetch playback events: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("unexpected event count: %d", len(events))
+	}
+	if events[0].Type != "PlaybackStart" || events[0].ItemID != "item-1" {
+		t.Fatalf("unexpected first event: %#v", events[0])
+	}
+}
+
+func TestBackfillFetchChangedItemsSince(t *testing.T) {
+	id := uuid.New()
+	now := time.Now().UTC()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/Items" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		res := gen.BaseItemDtoQueryResult{Items: &[]gen.BaseItemDto{{Id: &id, Name: strPtr("Movie C"), DateCreated: &now, DateLastMediaAdded: &now}}}
+		_ = json.NewEncoder(w).Encode(res)
+	}))
+	defer server.Close()
+
+	b, err := NewBackfillService(server.URL, "token", server.Client())
+	if err != nil {
+		t.Fatalf("new backfill service: %v", err)
+	}
+
+	items, err := b.FetchChangedItemsSince(context.Background(), time.Now().Add(-24*time.Hour), 100)
+	if err != nil {
+		t.Fatalf("fetch changed items: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("unexpected changed item count: %d", len(items))
+	}
+	if items[0].ItemID != id.String() || items[0].Name != "Movie C" {
+		t.Fatalf("unexpected changed item: %#v", items[0])
+	}
+}
+
+func strPtr(v string) *string { return &v }

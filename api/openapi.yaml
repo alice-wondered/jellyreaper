@@ -1,0 +1,89 @@
+openapi: 3.0.3
+info:
+  title: JellyReaper API
+  version: 0.1.0
+paths:
+  /healthz:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: OK
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: ok
+  /webhooks/jellyfin:
+    post:
+      summary: Receive Jellyfin webhook event
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JellyfinWebhook'
+      responses:
+        '202':
+          description: Accepted
+        '400':
+          description: Invalid payload
+        '500':
+          description: Processing failure
+  /discord/interactions:
+    post:
+      summary: Receive Discord interaction webhook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DiscordInteraction'
+      responses:
+        '200':
+          description: Discord response payload
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          description: Invalid payload
+        '401':
+          description: Invalid signature
+components:
+  schemas:
+    JellyfinWebhook:
+      type: object
+      properties:
+        EventId:
+          type: string
+        NotificationId:
+          type: string
+        NotificationType:
+          type: string
+        Event:
+          type: string
+        ItemId:
+          type: string
+        UserId:
+          type: string
+        ServerId:
+          type: string
+        Name:
+          type: string
+      additionalProperties: true
+    DiscordInteraction:
+      type: object
+      properties:
+        id:
+          type: string
+        token:
+          type: string
+        type:
+          type: integer
+        data:
+          type: object
+          additionalProperties: true
+      required: [type]
+      additionalProperties: true

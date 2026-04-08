@@ -1,0 +1,26 @@
+data/
+bin/
+*.log
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime outputs
+logs/
+embeds/
+
+# Build and tooling artifacts
+dist/
+tmp/
+coverage.out
+*.test
+
+# IDE / OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Local orchestration overrides
+docker-compose.local.yml

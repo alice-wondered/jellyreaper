@@ -1,0 +1,379 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"strconv"
+	"strings"
+	"time"
+
+	"jellyreaper/internal/discord"
+	"jellyreaper/internal/domain"
+	"jellyreaper/internal/jellyfin"
+	"jellyreaper/internal/jobs"
+	"jellyreaper/internal/repo"
+)
+
+type EvaluatePolicyHandler struct {
+	repository repo.Repository
+	logger     *slog.Logger
+}
+
+func NewEvaluatePolicyHandler(repository repo.Repository, logger *slog.Logger) *EvaluatePolicyHandler {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &EvaluatePolicyHandler{repository: repository, logger: logger}
+}
+
+func (h *EvaluatePolicyHandler) Kind() domain.JobKind { return domain.JobKindEvaluatePolicy }
+
+func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord) error {
+	now := time.Now().UTC()
+
+	return h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(ctx, job.ItemID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			flow = domain.Flow{
+				FlowID:    "flow:" + job.ItemID,
+				ItemID:    job.ItemID,
+				State:     domain.FlowStateActive,
+				Version:   0,
+				CreatedAt: now,
+			}
+		}
+
+		if flow.State == domain.FlowStateArchived || flow.State == domain.FlowStateDeleted {
+			return nil
+		}
+
+		payload, err := json.Marshal(jobs.SendHITLPromptPayload{ChannelID: flow.Discord.ChannelID})
+		if err != nil {
+			return err
+		}
+
+		promptJob := domain.JobRecord{
+			JobID:          "job:prompt:" + job.ItemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
+			FlowID:         flow.FlowID,
+			ItemID:         flow.ItemID,
+			Kind:           domain.JobKindSendHITLPrompt,
+			Status:         domain.JobStatusPending,
+			RunAt:          now,
+			MaxAttempts:    5,
+			IdempotencyKey: "job:prompt:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version+1, 10),
+			PayloadJSON:    payload,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		return tx.EnqueueJob(ctx, promptJob)
+	})
+}
+
+type SendHITLPromptHandler struct {
+	repository       repo.Repository
+	logger           *slog.Logger
+	discord          *discord.Service
+	defaultChannelID string
+	hitlTimeout      time.Duration
+}
+
+func NewSendHITLPromptHandler(repository repo.Repository, logger *slog.Logger, discord *discord.Service, defaultChannelID string, hitlTimeout time.Duration) *SendHITLPromptHandler {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if hitlTimeout <= 0 {
+		hitlTimeout = 48 * time.Hour
+	}
+	return &SendHITLPromptHandler{
+		repository:       repository,
+		logger:           logger,
+		discord:          discord,
+		defaultChannelID: defaultChannelID,
+		hitlTimeout:      hitlTimeout,
+	}
+}
+
+func (h *SendHITLPromptHandler) Kind() domain.JobKind { return domain.JobKindSendHITLPrompt }
+
+func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord) error {
+	if h.discord == nil {
+		return fmt.Errorf("discord session not configured")
+	}
+
+	var payload jobs.SendHITLPromptPayload
+	if err := json.Unmarshal(job.PayloadJSON, &payload); err != nil && len(job.PayloadJSON) > 0 {
+		return fmt.Errorf("decode prompt payload: %w", err)
+	}
+
+	now := time.Now().UTC()
+	var flow domain.Flow
+	var found bool
+	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		var err error
+		flow, found, err = tx.GetFlow(ctx, job.ItemID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("flow not found for item %s", job.ItemID)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	channelID := payload.ChannelID
+	if channelID == "" {
+		channelID = flow.Discord.ChannelID
+	}
+	if channelID == "" {
+		channelID = h.defaultChannelID
+	}
+	if channelID == "" {
+		return fmt.Errorf("no discord channel configured for item %s", job.ItemID)
+	}
+
+	version := flow.Version
+	messageID, err := h.discord.SendHITLPrompt(ctx, channelID, job.ItemID, version, flow.DisplayName, flow.ImageURL)
+	if err != nil {
+		return err
+	}
+
+	return h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		current, found, err := tx.GetFlow(ctx, job.ItemID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("flow not found for update %s", job.ItemID)
+		}
+
+		expected := current.Version
+		current.State = domain.FlowStatePendingReview
+		current.DecisionDeadlineAt = now.Add(h.hitlTimeout)
+		current.NextActionAt = current.DecisionDeadlineAt
+		current.Discord.ChannelID = channelID
+		current.Discord.MessageID = messageID
+		current.UpdatedAt = now
+		current.Version = expected + 1
+
+		if err := tx.UpsertFlowCAS(ctx, current, expected); err != nil {
+			return err
+		}
+
+		timeoutPayload, err := json.Marshal(jobs.HITLTimeoutPayload{DefaultAction: "delete"})
+		if err != nil {
+			return err
+		}
+
+		return tx.EnqueueJob(ctx, domain.JobRecord{
+			JobID:          "job:timeout:" + job.ItemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
+			FlowID:         current.FlowID,
+			ItemID:         current.ItemID,
+			Kind:           domain.JobKindHITLTimeout,
+			Status:         domain.JobStatusPending,
+			RunAt:          current.DecisionDeadlineAt,
+			MaxAttempts:    5,
+			IdempotencyKey: "job:timeout:" + current.ItemID + ":" + strconv.FormatInt(current.Version, 10),
+			PayloadJSON:    timeoutPayload,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		})
+	})
+}
+
+type HITLTimeoutHandler struct {
+	repository repo.Repository
+}
+
+func NewHITLTimeoutHandler(repository repo.Repository) *HITLTimeoutHandler {
+	return &HITLTimeoutHandler{repository: repository}
+}
+
+func (h *HITLTimeoutHandler) Kind() domain.JobKind { return domain.JobKindHITLTimeout }
+
+func (h *HITLTimeoutHandler) Handle(ctx context.Context, job domain.JobRecord) error {
+	now := time.Now().UTC()
+	return h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(ctx, job.ItemID)
+		if err != nil {
+			return err
+		}
+		if !found || flow.State != domain.FlowStatePendingReview {
+			return nil
+		}
+		if flow.HITLOutcome != "" && flow.HITLOutcome != "delete" {
+			return nil
+		}
+
+		expected := flow.Version
+		flow.State = domain.FlowStateDeleteQueued
+		flow.NextActionAt = now
+		flow.UpdatedAt = now
+		flow.Version = expected + 1
+		if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+			return err
+		}
+
+		payload, err := json.Marshal(jobs.ExecuteDeletePayload{RequestedBy: "timeout"})
+		if err != nil {
+			return err
+		}
+		return tx.EnqueueJob(ctx, domain.JobRecord{
+			JobID:          "job:delete:" + job.ItemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
+			FlowID:         flow.FlowID,
+			ItemID:         flow.ItemID,
+			Kind:           domain.JobKindExecuteDelete,
+			Status:         domain.JobStatusPending,
+			RunAt:          now,
+			MaxAttempts:    5,
+			IdempotencyKey: "job:delete:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version, 10),
+			PayloadJSON:    payload,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		})
+	})
+}
+
+type ExecuteDeleteHandler struct {
+	repository repo.Repository
+	client     *jellyfin.Client
+}
+
+func NewExecuteDeleteHandler(repository repo.Repository, client *jellyfin.Client) *ExecuteDeleteHandler {
+	return &ExecuteDeleteHandler{repository: repository, client: client}
+}
+
+func (h *ExecuteDeleteHandler) Kind() domain.JobKind { return domain.JobKindExecuteDelete }
+
+func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord) error {
+	if h.client == nil {
+		return fmt.Errorf("jellyfin client is not configured")
+	}
+
+	flow, expected, ok, err := h.loadFlowForDelete(ctx, job.ItemID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+
+	if flow.SubjectType == "season" || flow.SubjectType == "series" {
+		if err := h.deleteAggregateChildren(ctx, flow); err != nil {
+			return err
+		}
+	} else {
+		deleteID := flow.ItemID
+		if strings.HasPrefix(deleteID, "target:item:") || strings.HasPrefix(deleteID, "target:movie:") {
+			deleteID = deleteID[strings.LastIndex(deleteID, ":")+1:]
+		}
+		if err := h.client.DeleteItem(ctx, deleteID); err != nil {
+			return err
+		}
+	}
+
+	now := time.Now().UTC()
+	return h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		current, found, err := tx.GetFlow(ctx, flow.ItemID)
+		if err != nil {
+			return err
+		}
+		if !found || current.Version != expected {
+			return nil
+		}
+
+		current.State = domain.FlowStateDeleted
+		current.NextActionAt = time.Time{}
+		current.UpdatedAt = now
+		current.Version = expected + 1
+		if err := tx.UpsertFlowCAS(ctx, current, expected); err != nil {
+			return err
+		}
+
+		return tx.AppendEvent(ctx, domain.Event{
+			EventID:        "evt:delete:" + current.ItemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
+			FlowID:         current.FlowID,
+			ItemID:         current.ItemID,
+			Type:           "jellyfin.item.deleted",
+			Source:         "scheduler",
+			OccurredAt:     now,
+			IdempotencyKey: job.IdempotencyKey + ":deleted",
+			Payload: map[string]any{
+				"job_id": job.JobID,
+			},
+		})
+	})
+}
+
+func (h *ExecuteDeleteHandler) deleteAggregateChildren(ctx context.Context, flow domain.Flow) error {
+	parts := strings.SplitN(flow.ItemID, ":", 3)
+	if len(parts) != 3 {
+		return fmt.Errorf("invalid target id %s", flow.ItemID)
+	}
+	children, err := h.listChildren(ctx, parts[1], parts[2])
+	if err != nil {
+		return err
+	}
+	for _, child := range children {
+		if child.ItemID == "" {
+			continue
+		}
+		if err := h.client.DeleteItem(ctx, child.ItemID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *ExecuteDeleteHandler) listChildren(ctx context.Context, subjectType, subjectID string) ([]domain.MediaItem, error) {
+	var out []domain.MediaItem
+	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		var err error
+		out, err = tx.ListMediaBySubject(ctx, subjectType, subjectID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (h *ExecuteDeleteHandler) loadFlowForDelete(ctx context.Context, itemID string) (domain.Flow, int64, bool, error) {
+	var out domain.Flow
+	var expected int64
+	var ok bool
+	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(ctx, itemID)
+		if err != nil {
+			return err
+		}
+		if !found || flow.State != domain.FlowStateDeleteQueued {
+			ok = false
+			return nil
+		}
+
+		expected = flow.Version
+		flow.State = domain.FlowStateDeleteInProgress
+		flow.UpdatedAt = time.Now().UTC()
+		flow.Version = expected + 1
+		if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+			return err
+		}
+
+		out = flow
+		expected = flow.Version
+		ok = true
+		return nil
+	})
+	if err != nil {
+		return domain.Flow{}, 0, false, err
+	}
+	return out, expected, ok, nil
+}

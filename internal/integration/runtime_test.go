@@ -1,0 +1,360 @@
+package integration
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	bbolt "go.etcd.io/bbolt"
+
+	"jellyreaper/internal/app"
+	"jellyreaper/internal/discord"
+	"jellyreaper/internal/domain"
+	api "jellyreaper/internal/http"
+	"jellyreaper/internal/jellyfin"
+	"jellyreaper/internal/jobs"
+	"jellyreaper/internal/jobs/handlers"
+	"jellyreaper/internal/repo"
+	bboltrepo "jellyreaper/internal/repo/bbolt"
+	"jellyreaper/internal/scheduler"
+	"jellyreaper/internal/worker"
+)
+
+type evalCounterHandler struct{ count *atomic.Int64 }
+
+func (h evalCounterHandler) Kind() domain.JobKind { return domain.JobKindEvaluatePolicy }
+func (h evalCounterHandler) Handle(context.Context, domain.JobRecord) error {
+	h.count.Add(1)
+	return nil
+}
+
+func openStore(t *testing.T) *bboltrepo.Store {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "integration.db")
+	store, err := bboltrepo.Open(path, 0o600, &bbolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close(); _ = os.Remove(path) })
+	return store
+}
+
+func TestIntegrationWebhookToSchedulerDispatch(t *testing.T) {
+	store := openStore(t)
+	pub, _, _ := ed25519.GenerateKey(nil)
+	discordSvc, err := discord.NewService("", pub)
+	if err != nil {
+		t.Fatalf("discord service: %v", err)
+	}
+
+	wakeCh := make(chan time.Time, 32)
+	appSvc := app.NewService(store, nil, func(at time.Time) {
+		select {
+		case wakeCh <- at:
+		default:
+		}
+	})
+
+	var counter atomic.Int64
+	reg, err := jobs.NewRegistry(evalCounterHandler{count: &counter})
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+	dispatcher := worker.NewDispatcher(store, reg, nil)
+	loop := scheduler.NewLoop(store, dispatcher.Dispatch, nil, scheduler.Config{
+		LeaseOwner: "it",
+		LeaseTTL:   2 * time.Second,
+		IdlePoll:   10 * time.Millisecond,
+		LeaseLimit: 8,
+		Signal:     wakeCh,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = loop.Run(ctx) }()
+
+	mux, err := api.NewMux(api.Config{
+		Addr:                     ":0",
+		Jellyfin:                 appSvc.HandleJellyfinWebhook,
+		Discord:                  discordSvc,
+		HandleDiscordInteraction: appSvc.HandleDiscordComponentInteraction,
+	})
+	if err != nil {
+		t.Fatalf("new mux: %v", err)
+	}
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	body := []byte(`{"ItemId":"item-e2e","ItemType":"Movie","Name":"E2E Movie","EventId":"evt-e2e-1","NotificationType":"PlaybackStart"}`)
+	resp, err := http.Post(server.URL+"/webhooks/jellyfin", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("post webhook: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("unexpected status: %d", resp.StatusCode)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for counter.Load() < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if counter.Load() < 1 {
+		t.Fatal("expected evaluate_policy handler to be dispatched")
+	}
+}
+
+func TestIntegrationDiscordArchiveNoDeleteJob(t *testing.T) {
+	store := openStore(t)
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	discordSvc, err := discord.NewService("", pub)
+	if err != nil {
+		t.Fatalf("discord service: %v", err)
+	}
+
+	appSvc := app.NewService(store, nil, nil)
+	mux, err := api.NewMux(api.Config{
+		Addr:                     ":0",
+		Jellyfin:                 appSvc.HandleJellyfinWebhook,
+		Discord:                  discordSvc,
+		HandleDiscordInteraction: appSvc.HandleDiscordComponentInteraction,
+	})
+	if err != nil {
+		t.Fatalf("new mux: %v", err)
+	}
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	payload := []byte(`{"id":"i-archive","token":"tok","type":3,"data":{"custom_id":"jr:v1:archive:target:item:item-arc:0"}}`)
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/discord/interactions", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	signDiscord(req, priv, payload)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post discord interaction: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d", resp.StatusCode)
+	}
+
+	var flow domain.Flow
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		var found bool
+		var err error
+		flow, found, err = tx.GetFlow(context.Background(), "target:item:item-arc")
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatalf("expected archived flow")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read flow: %v", err)
+	}
+	if flow.State != domain.FlowStateArchived {
+		t.Fatalf("unexpected flow state: %s", flow.State)
+	}
+
+	jobs, err := store.LeaseDueJobs(context.Background(), time.Now().Add(24*time.Hour), 100, "it", time.Minute)
+	if err != nil {
+		t.Fatalf("lease jobs: %v", err)
+	}
+	for _, job := range jobs {
+		if job.ItemID == "item-arc" && job.Kind == domain.JobKindExecuteDelete {
+			t.Fatalf("unexpected delete job for archived item: %#v", job)
+		}
+	}
+}
+
+func TestIntegrationWebhookToPromptToTimeoutDelete(t *testing.T) {
+	store := openStore(t)
+	pub, _, _ := ed25519.GenerateKey(nil)
+	discordSvc, err := discord.NewService("", pub)
+	if err != nil {
+		t.Fatalf("discord service: %v", err)
+	}
+
+	var sentPrompts atomic.Int64
+	discordSvc.SetSendPromptHookForTest(func(context.Context, string, string, int64, string, string) (string, error) {
+		sentPrompts.Add(1)
+		return "msg-1", nil
+	})
+
+	deleteServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && r.URL.Path == "/Items/item-timeout" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer deleteServer.Close()
+
+	wakeCh := make(chan time.Time, 32)
+	appSvc := app.NewService(store, nil, func(at time.Time) {
+		select {
+		case wakeCh <- at:
+		default:
+		}
+	})
+
+	reg, err := jobs.NewRegistry(
+		handlers.NewEvaluatePolicyHandler(store, nil),
+		handlers.NewSendHITLPromptHandler(store, nil, discordSvc, "ch-1", 25*time.Millisecond),
+		handlers.NewHITLTimeoutHandler(store),
+		handlers.NewExecuteDeleteHandler(store, jellyfin.NewClient(deleteServer.URL, "api", deleteServer.Client())),
+	)
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+
+	dispatcher := worker.NewDispatcher(store, reg, nil)
+	loop := scheduler.NewLoop(store, dispatcher.Dispatch, nil, scheduler.Config{
+		LeaseOwner: "it",
+		LeaseTTL:   100 * time.Millisecond,
+		IdlePoll:   5 * time.Millisecond,
+		LeaseLimit: 16,
+		Signal:     wakeCh,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = loop.Run(ctx) }()
+
+	mux, err := api.NewMux(api.Config{
+		Addr:                     ":0",
+		Jellyfin:                 appSvc.HandleJellyfinWebhook,
+		Discord:                  discordSvc,
+		HandleDiscordInteraction: appSvc.HandleDiscordComponentInteraction,
+	})
+	if err != nil {
+		t.Fatalf("new mux: %v", err)
+	}
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	body := []byte(`{"ItemId":"item-timeout","ItemType":"Movie","Name":"Timeout Movie","EventId":"evt-timeout-1","NotificationType":"PlaybackStart"}`)
+	resp, err := http.Post(server.URL+"/webhooks/jellyfin", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("post webhook: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		flow, found, err := getFlow(store, "target:movie:item-timeout")
+		if err == nil && found && flow.State == domain.FlowStateDeleted {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	flow, found, err := getFlow(store, "target:movie:item-timeout")
+	if err != nil || !found {
+		t.Fatalf("expected timeout flow: found=%v err=%v", found, err)
+	}
+	if flow.State != domain.FlowStateDeleted {
+		t.Fatalf("unexpected flow state after timeout chain: %s", flow.State)
+	}
+	if sentPrompts.Load() < 1 {
+		t.Fatal("expected outgoing discord prompt to be sent")
+	}
+
+	nextDue, ok, err := store.GetNextDueAt(context.Background())
+	if err != nil {
+		t.Fatalf("get next due: %v", err)
+	}
+	if ok {
+		t.Fatalf("expected no pending due jobs, got %s", nextDue)
+	}
+}
+
+func TestIntegrationBackfillIndexesStateFromGeneratedTypes(t *testing.T) {
+	store := openStore(t)
+	now := time.Now().UTC().Add(-time.Hour)
+
+	backfillServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/System/ActivityLog/Entries":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"Items": []map[string]any{
+					{"Type": "PlaybackStart", "ItemId": "item-bf", "Name": "BF Movie", "Date": now.Format(time.RFC3339)},
+				},
+			})
+		case "/Items":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"Items": []map[string]any{
+					{"Id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8", "Name": "BF Movie", "DateCreated": now.Format(time.RFC3339), "DateLastMediaAdded": now.Format(time.RFC3339)},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer backfillServer.Close()
+
+	b, err := jellyfin.NewBackfillService(backfillServer.URL, "api", backfillServer.Client())
+	if err != nil {
+		t.Fatalf("new backfill service: %v", err)
+	}
+
+	plays, err := b.FetchPlaybackEventsSince(context.Background(), now.Add(-time.Minute), 50)
+	if err != nil {
+		t.Fatalf("fetch plays: %v", err)
+	}
+	items, err := b.FetchChangedItemsSince(context.Background(), now.Add(-time.Minute), 50)
+	if err != nil {
+		t.Fatalf("fetch changed items: %v", err)
+	}
+
+	if len(plays) != 1 || plays[0].ItemID != "item-bf" {
+		t.Fatalf("unexpected plays: %#v", plays)
+	}
+	if len(items) != 1 || items[0].Name != "BF Movie" {
+		t.Fatalf("unexpected changed items: %#v", items)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: items[0].ItemID, Title: items[0].Name, LastPlayedAt: plays[0].Date, UpdatedAt: time.Now().UTC()}); err != nil {
+			return err
+		}
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{FlowID: "flow:" + items[0].ItemID, ItemID: items[0].ItemID, State: domain.FlowStateActive, Version: 0, CreatedAt: time.Now().UTC()}, 0)
+	}); err != nil {
+		t.Fatalf("persist backfill snapshots: %v", err)
+	}
+
+	if _, found, err := getFlow(store, items[0].ItemID); err != nil || !found {
+		t.Fatalf("expected flow from backfill indexing, found=%v err=%v", found, err)
+	}
+}
+
+func getFlow(store *bboltrepo.Store, itemID string) (domain.Flow, bool, error) {
+	var flow domain.Flow
+	var found bool
+	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		var err error
+		flow, found, err = tx.GetFlow(context.Background(), itemID)
+		return err
+	})
+	return flow, found, err
+}
+
+func signDiscord(req *http.Request, priv ed25519.PrivateKey, body []byte) {
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	msg := append([]byte(timestamp), body...)
+	sig := ed25519.Sign(priv, msg)
+	req.Header.Set("X-Signature-Timestamp", timestamp)
+	req.Header.Set("X-Signature-Ed25519", hex.EncodeToString(sig))
+}

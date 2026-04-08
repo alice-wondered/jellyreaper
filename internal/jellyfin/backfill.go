@@ -1,0 +1,225 @@
+package jellyfin
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	gen "jellyreaper/internal/jellyfin/gen"
+)
+
+type BackfillClient interface {
+	GetLogEntriesWithResponse(ctx context.Context, params *gen.GetLogEntriesParams, reqEditors ...gen.RequestEditorFn) (*gen.GetLogEntriesResponse, error)
+	GetItemsWithResponse(ctx context.Context, params *gen.GetItemsParams, reqEditors ...gen.RequestEditorFn) (*gen.GetItemsResponse, error)
+}
+
+type BackfillService struct {
+	client  BackfillClient
+	baseURL string
+}
+
+type PlaybackEvent struct {
+	ItemID string
+	UserID string
+	Type   string
+	Name   string
+	Date   time.Time
+}
+
+type ItemSnapshot struct {
+	ItemID             string
+	ItemType           string
+	SeasonID           string
+	SeasonName         string
+	SeriesID           string
+	SeriesName         string
+	Name               string
+	ImageURL           string
+	DateCreated        time.Time
+	DateLastMediaAdded time.Time
+}
+
+func NewBackfillService(baseURL, apiKey string, httpClient *http.Client) (*BackfillService, error) {
+	if httpClient == nil {
+		httpClient = &http.Client{
+			Timeout: 20 * time.Second,
+			Transport: &http.Transport{
+				Proxy:             http.ProxyFromEnvironment,
+				ForceAttemptHTTP2: false,
+			},
+		}
+	}
+
+	opts := []gen.ClientOption{
+		gen.WithRequestEditorFn(func(_ context.Context, req *http.Request) error {
+			req.Header.Set("X-Emby-Token", apiKey)
+			return nil
+		}),
+	}
+	if httpClient != nil {
+		opts = append(opts, gen.WithHTTPClient(httpClient))
+	}
+	client, err := gen.NewClientWithResponses(baseURL, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("create generated jellyfin client: %w", err)
+	}
+	return &BackfillService{client: client, baseURL: strings.TrimRight(baseURL, "/")}, nil
+}
+
+func NewBackfillServiceWithClient(client BackfillClient) *BackfillService {
+	return &BackfillService{client: client}
+}
+
+func (s *BackfillService) FetchPlaybackEventsSince(ctx context.Context, since time.Time, limit int32) ([]PlaybackEvent, error) {
+	params := &gen.GetLogEntriesParams{MinDate: &since, Limit: &limit}
+	resp, err := s.client.GetLogEntriesWithResponse(ctx, params)
+	if err != nil {
+		return nil, fmt.Errorf("fetch jellyfin activity log: %w", err)
+	}
+	if resp.StatusCode() != http.StatusOK {
+		return nil, fmt.Errorf("activity log returned status %d", resp.StatusCode())
+	}
+
+	body := resp.JSON200
+	if body == nil {
+		body = resp.ApplicationjsonProfileCamelCase200
+	}
+	if body == nil {
+		body = resp.ApplicationjsonProfilePascalCase200
+	}
+	if body == nil && len(resp.Body) > 0 {
+		var parsed gen.ActivityLogEntryQueryResult
+		if err := json.Unmarshal(resp.Body, &parsed); err == nil {
+			body = &parsed
+		} else if looksLikeHTML(resp.Body) {
+			return nil, fmt.Errorf("activity log returned HTML; verify JELLYFIN_URL includes correct base path (often /jellyfin)")
+		}
+	}
+	if body == nil || body.Items == nil {
+		return nil, nil
+	}
+
+	out := make([]PlaybackEvent, 0, len(*body.Items))
+	for _, entry := range *body.Items {
+		t := safeString(entry.Type)
+		if t == "" {
+			continue
+		}
+		out = append(out, PlaybackEvent{
+			ItemID: safeString(entry.ItemId),
+			UserID: uuidString(entry.UserId),
+			Type:   t,
+			Name:   safeString(entry.Name),
+			Date:   safeTime(entry.Date),
+		})
+	}
+	return out, nil
+}
+
+func (s *BackfillService) FetchChangedItemsSince(ctx context.Context, since time.Time, limit int32) ([]ItemSnapshot, error) {
+	recursive := true
+	params := &gen.GetItemsParams{MinDateLastSaved: &since, Limit: &limit, Recursive: &recursive}
+	resp, err := s.client.GetItemsWithResponse(ctx, params)
+	if err != nil {
+		return nil, fmt.Errorf("fetch jellyfin changed items: %w", err)
+	}
+	if resp.StatusCode() != http.StatusOK {
+		return nil, fmt.Errorf("items query returned status %d", resp.StatusCode())
+	}
+
+	body := resp.JSON200
+	if body == nil {
+		body = resp.ApplicationjsonProfileCamelCase200
+	}
+	if body == nil {
+		body = resp.ApplicationjsonProfilePascalCase200
+	}
+	if body == nil && len(resp.Body) > 0 {
+		var parsed gen.BaseItemDtoQueryResult
+		if err := json.Unmarshal(resp.Body, &parsed); err == nil {
+			body = &parsed
+		} else if looksLikeHTML(resp.Body) {
+			return nil, fmt.Errorf("items endpoint returned HTML; verify JELLYFIN_URL includes correct base path (often /jellyfin)")
+		}
+	}
+	if body == nil || body.Items == nil {
+		return nil, nil
+	}
+
+	out := make([]ItemSnapshot, 0, len(*body.Items))
+	for _, item := range *body.Items {
+		itemID := uuidString(item.Id)
+		itemType := stringValueFromKind(item.Type)
+		imageURL := buildPrimaryImageURL(s.baseURL, itemID, item.ImageTags)
+		out = append(out, ItemSnapshot{
+			ItemID:             itemID,
+			ItemType:           itemType,
+			SeasonID:           uuidString(item.SeasonId),
+			SeasonName:         safeString(item.SeasonName),
+			SeriesID:           uuidString(item.SeriesId),
+			SeriesName:         safeString(item.SeriesName),
+			Name:               safeString(item.Name),
+			ImageURL:           imageURL,
+			DateCreated:        safeTime(item.DateCreated),
+			DateLastMediaAdded: safeTime(item.DateLastMediaAdded),
+		})
+	}
+	return out, nil
+}
+
+func buildPrimaryImageURL(baseURL string, itemID string, imageTags *map[string]string) string {
+	if strings.TrimSpace(baseURL) == "" || strings.TrimSpace(itemID) == "" || imageTags == nil {
+		return ""
+	}
+	tag := ""
+	if t, ok := (*imageTags)["Primary"]; ok {
+		tag = t
+	}
+	base := strings.TrimRight(baseURL, "/")
+	if tag == "" {
+		return base + "/Items/" + itemID + "/Images/Primary"
+	}
+	return base + "/Items/" + itemID + "/Images/Primary?tag=" + tag
+}
+
+func stringValueFromKind(kind *gen.BaseItemKind) string {
+	if kind == nil {
+		return ""
+	}
+	return string(*kind)
+}
+
+func looksLikeHTML(body []byte) bool {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return false
+	}
+	return bytes.HasPrefix(trimmed, []byte("<"))
+}
+
+func safeString(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
+}
+
+func safeTime(v *time.Time) time.Time {
+	if v == nil {
+		return time.Time{}
+	}
+	return v.UTC()
+}
+
+func uuidString(v *uuid.UUID) string {
+	if v == nil {
+		return ""
+	}
+	return v.String()
+}
