@@ -14,6 +14,7 @@ import (
 type Config struct {
 	Addr                     string
 	Jellyfin                 func(context.Context, jellyfin.WebhookEvent) error
+	JellyfinWebhookToken     string
 	Discord                  *discord.Service
 	HandleDiscordInteraction func(context.Context, discord.IncomingInteraction) (*discordgo.InteractionResponse, error)
 }
@@ -31,7 +32,7 @@ func NewMux(cfg Config) (stdhttp.Handler, error) {
 
 	mux := stdhttp.NewServeMux()
 	mux.HandleFunc("/healthz", healthzHandler)
-	mux.Handle("/webhooks/jellyfin", NewJellyfinWebhookHandler(cfg.Jellyfin))
+	mux.Handle("/webhooks/jellyfin", NewJellyfinWebhookHandler(cfg.Jellyfin, cfg.JellyfinWebhookToken))
 	mux.Handle("/discord/interactions", NewDiscordInteractionsHandler(cfg.Discord, cfg.HandleDiscordInteraction))
 	return mux, nil
 }

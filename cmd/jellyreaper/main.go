@@ -160,6 +160,7 @@ func main() {
 	server, err := api.NewServer(api.Config{
 		Addr:                     cfg.HTTPAddr,
 		Jellyfin:                 appService.HandleJellyfinWebhook,
+		JellyfinWebhookToken:     cfg.JellyfinWebhookToken,
 		Discord:                  discordService,
 		HandleDiscordInteraction: appService.HandleDiscordComponentInteraction,
 	})

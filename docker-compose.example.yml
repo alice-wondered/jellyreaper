@@ -15,6 +15,7 @@ services:
       LOG_DIR: /logs
       EMBED_PERSIST_DIR: /embeds
       JELLYFIN_URL: http://jellyfin:8096
+      JELLYFIN_WEBHOOK_TOKEN: ${JELLYFIN_WEBHOOK_TOKEN:-}
       # Optional: enable Discord @mention AI assistant
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
     volumes:

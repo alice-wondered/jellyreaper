@@ -1,127 +1,216 @@
 # JellyReaper
 
-JellyReaper is a Go service that listens to Jellyfin and Discord webhooks, persists workflow state in bbolt, and runs a durable scheduler for HITL media lifecycle decisions.
+## 1) What This Project Is
 
-## What It Does
-- Ingests Jellyfin webhook events.
-- Creates/updates target flows and schedules jobs.
-- Sends Discord HITL prompts with buttons (`Archive`, `Delay`, `Keep`, `Delete`).
-- Executes timeout/delete workflows via durable jobs.
-- Recovers queue state from disk-backed storage.
+JellyReaper is a media lifecycle management server for Jellyfin. It ingests Jellyfin activity/catalog events, projects media into operational targets, and runs a durable scheduler to drive cleanup decisions through Discord HITL (Human-In-The-Loop) prompts.
 
-## Architecture At A Glance
-- HTTP ingress (`net/http`) with typed request mapping.
-- App orchestration service (`internal/app`).
-- Durable storage (`bbolt`) behind repository interfaces.
-- Scheduler loop (own goroutine) + wake channel.
-- Job dispatcher + handler registry.
+At a high level:
+- It watches Jellyfin events and maintains durable flow state in bbolt.
+- It sends Discord decision prompts (`Archive`, `Delay`, `Keep`, `Delete`) and executes queued actions safely.
+- It supports backfill/reconciliation so startup and drift recovery are operationally reliable.
+- It ships an optional Discord @mention AI assistant that can discover projection targets, inspect state, and submit domain-safe decisions.
 
-## Requirements
-- Go 1.24+
-- Discord application configured for Interactions Endpoint.
-- Jellyfin server API key.
+AI compatibility notes:
+- AI operations are projection-centric (`movie`, `season`, `series`), not raw per-item mutation.
+- AI uses domain services for decisions (queueing/scheduler consistency stays centralized).
+- AI can update global defaults, delay a specific target by arbitrary days, and finalize active HITL prompts when it records a delay decision.
 
-## Configuration
+Core runtime pieces:
+- HTTP ingress (`/webhooks/jellyfin`, `/discord/interactions`, `/healthz`)
+- App orchestration service (`internal/app`)
+- Durable storage + queue (`bbolt` via repository interfaces)
+- Scheduler loop + worker dispatcher/job handlers
+- Optional AI mention assistant
 
-| Variable | Required | Default | Description |
-|---|---:|---|---|
-| `HTTP_PORT` | no | `6767` | HTTP port when `HTTP_ADDR` is unset |
-| `HTTP_ADDR` | no | `:${HTTP_PORT}` | HTTP bind address |
-| `DB_PATH` | no | `./data/jellyreaper.db` | bbolt file path |
-| `LOG_DIR` | no | `./logs` | application log directory |
-| `EMBED_PERSIST_DIR` | no | `./embeds` | directory to persist downloaded embed images |
-| `WORKER_ID` | no | hostname | scheduler lease owner id |
-| `LEASE_TTL` | no | `30s` | job lease timeout |
-| `DISCORD_PUBLIC_KEY_HEX` | yes | - | Discord app public key (hex) |
-| `DISCORD_BOT_TOKEN` | yes (for sending HITL prompts) | - | bot token |
-| `DISCORD_CHANNEL_ID` | yes (for prompt fallback) | - | default channel for HITL messages |
-| `DEFAULT_DELAY_WINDOW` | no | `15d` | default delay duration for Delay actions |
-| `DEFAULT_LAST_PLAYED_THRESHOLD_DAYS` | no | `60` | default stale threshold in days when flow policy is unset/new |
-| `OPENAI_API_KEY` | no | - | enables @mention AI assistant in Discord |
-| `OPENAI_MODEL` | no | `gpt-4o-mini` | model for mention assistant intent/tool routing |
-| `JELLYFIN_URL` | no | derived from host/port | Jellyfin base URL |
-| `JELLYFIN_HOST` | no | `localhost` | Jellyfin host when `JELLYFIN_URL` is unset |
-| `JELLYFIN_PORT` | no | `8096` | Jellyfin port |
-| `JELLYFIN_API_KEY` | yes | - | Jellyfin API key |
-| `BACKFILL_ENABLED` | no | `true` | enables startup + periodic backfill |
-| `BACKFILL_INTERVAL` | no | `15m` | periodic backfill interval |
-| `BACKFILL_FULL_SWEEP_ON_STARTUP` | no | `true` | on first run (no checkpoint), sweep full Jellyfin history |
-| `BACKFILL_PLAYBACK_ENABLED` | no | `false` | enables activity-log playback backfill; item snapshot user data is used by default |
-| `BACKFILL_LOOKBACK` | no | `24h` | startup lookback if full sweep is disabled and no checkpoint exists |
-| `BACKFILL_OVERLAP` | no | `2m` | overlap from last checkpoint to avoid missing events |
-| `BACKFILL_LIMIT` | no | `500` | page size per Jellyfin backfill request (all pages are fetched) |
-| `BACKFILL_WRITE_BATCH_SIZE` | no | `100` | number of webhook-style backfill writes per storage batch |
-| `BACKFILL_WRITE_BATCH_TIMEOUT` | no | `500ms` | max wait before flushing a partial backfill write batch |
-| `BACKFILL_WRITE_QUEUE_CAPACITY` | no | `2000` | buffered queue capacity feeding batched backfill writes |
+## 2) Setup Guide
 
-## Run
+### Prerequisites
+- Go `1.24+` (for local run)
+- A Jellyfin server + API key
+- A Discord application with:
+  - Interactions endpoint configured
+  - Bot token (for gateway/messages)
+  - Message content intent enabled (for @mention assistant)
+
+### Recommended Security Setup
+
+Do this before exposing to the internet:
+- Keep JellyReaper behind a reverse proxy and only expose required routes.
+- Require Discord signature verification (built-in via `DISCORD_PUBLIC_KEY_HEX`).
+- Configure `JELLYFIN_WEBHOOK_TOKEN` and require it on `/webhooks/jellyfin`.
+- Restrict source IP/network for Jellyfin webhook route when possible.
+
+Generate a webhook token:
+
 ```bash
-go test ./...
-go run ./cmd/jellyreaper
+openssl rand -hex 32
 ```
 
-Service endpoints:
-- `GET /healthz`
-- `POST /webhooks/jellyfin`
-- `POST /discord/interactions`
+Set this token:
+- In JellyReaper env as `JELLYFIN_WEBHOOK_TOKEN`
+- In Jellyfin webhook custom headers as one of:
+  - `X-Jellyreaper-Token: <token>` (recommended)
+  - `X-Webhook-Token: <token>`
+  - `Authorization: Bearer <token>`
 
-## Build
-```bash
-go build ./cmd/jellyreaper
-```
+### Quick Start (Docker Compose)
 
-## Docker
 ```bash
 cp .env.example .env
 
-# if you use a shared external docker network with Jellyfin
+# if you use a shared external network with Jellyfin
 docker network create media_shared || true
 
 docker compose -f docker-compose.example.yml up -d
 ```
 
-If you want the Discord @mention assistant, set `OPENAI_API_KEY` in `.env`.
+Embedded `docker-compose.example.yml`:
 
-Mounted persistence paths in compose:
-- `./data` -> `/data`
-- `./logs` -> `/logs`
-- `./embeds` -> `/embeds`
+```yaml
+services:
+  jellyreaper:
+    image: ghcr.io/alice-wondered/jellyreaper:latest
+    pull_policy: always
+    container_name: jellyreaper
+    restart: unless-stopped
+    ports:
+      - "6767:6767"
+    env_file:
+      - .env
+    environment:
+      HTTP_PORT: "6767"
+      HTTP_ADDR: ":6767"
+      DB_PATH: /data/jellyreaper.db
+      LOG_DIR: /logs
+      EMBED_PERSIST_DIR: /embeds
+      JELLYFIN_URL: http://jellyfin:8096
+      JELLYFIN_WEBHOOK_TOKEN: ${JELLYFIN_WEBHOOK_TOKEN:-}
+      # Optional: enable Discord @mention AI assistant
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+    volumes:
+      - ./data:/data
+      - ./logs:/logs
+      - ./embeds:/embeds
+    networks:
+      - media_shared
 
-## OpenAPI And Provider Contracts
-- Service spec lives at `api/openapi.yaml`.
-- Official Jellyfin OpenAPI spec is vendored at `api/external/jellyfin-openapi-stable.json`.
-- Generate API types with:
-```bash
-go generate ./api
+networks:
+  media_shared:
+    external: true
+    name: ${JELLYREAPER_SHARED_NETWORK:-media_shared}
 ```
 
-### Provider Payload Sources
-- Discord interactions use `discordgo.Interaction` decoding and signature validation (`discordgo.VerifyInteraction`) based on Discord's documented interactions contract.
-- Jellyfin webhook ingress is mapped from documented Jellyfin webhook/plugin field names (`EventId`, `NotificationId`, `NotificationType`, `ItemId`, `UserId`, `ServerId`, `Name`).
+Persistence mounts:
+- `./data -> /data`
+- `./logs -> /logs`
+- `./embeds -> /embeds`
 
-### Target Projection Behavior
-- TV episode events project to season targets.
-- Scheduler/HITL runs on targets to reduce per-episode Discord noise.
-- Aggregate target deletion resolves child items and deletes each supported media item.
-- Discord prompts use human-readable names and include image embeds when available.
-- On startup the bot announces online status and that backfill has started.
+### Local Run (Go)
 
-### Backfill Behavior
-- Backfill is paginated and performs a full sweep from the checkpoint boundary (not just the first page).
-- First startup defaults to a full historical sweep; later runs sweep from the saved checkpoint with overlap.
-- Backfill reuses the same typed orchestration path as webhooks to keep flow/job behavior consistent.
+```bash
+go test ./...
+go run ./cmd/jellyreaper
+```
 
-### Discord Mention Assistant
-- Enabled when `OPENAI_API_KEY` is set.
-- Runs on Discord mention messages and responds in a thread (creates one when needed).
-- Uses tool-calling with `auto` tool choice so the model can decide whether to call tools or respond directly.
-- Includes discovery and control tools for fuzzy target search, target-state inspection, alias memory, and delete/archive scheduling.
-- Supports projection-level delete scheduling (season/series targets) so series cleanup can fan out through normal service workflows.
-- Receives serialized thread context each turn (selected target, pending action, candidate targets, known aliases).
-- Context memory is in-process and LRU-capped by thread to avoid unbounded growth; cache misses can restore recent thread messages from Discord.
-- Responses are designed to stay user-facing (Discord markdown, human-readable wording, no internal IDs).
+### Jellyfin Configuration Walkthrough
 
-## Notes On Provider Payloads
-- Discord ingress is validated and decoded using `discordgo` payload semantics.
-- Jellyfin ingress is mapped from known Jellyfin keys (`EventId`, `NotificationId`, `NotificationType`, `ItemId`, etc.) before orchestration.
-- Internal orchestration consumes typed ingress structs (`discord.IncomingInteraction`, `jellyfin.WebhookEvent`).
+1. Create/get Jellyfin API key.
+2. Set `JELLYFIN_URL` and `JELLYFIN_API_KEY` in `.env`.
+3. Configure Jellyfin webhook/plugin to call:
+   - `POST https://<your-host>/webhooks/jellyfin`
+4. Add custom header token (recommended):
+   - `X-Jellyreaper-Token: <JELLYFIN_WEBHOOK_TOKEN>`
+5. Keep webhook route private/allowlisted if possible.
+
+### Discord Configuration Walkthrough
+
+1. Create Discord application and bot.
+2. Set interactions endpoint to:
+   - `POST https://<your-host>/discord/interactions`
+3. Copy application public key (hex) to `DISCORD_PUBLIC_KEY_HEX`.
+4. Set `DISCORD_BOT_TOKEN`.
+5. Set `DISCORD_CHANNEL_ID` as fallback channel for HITL prompts.
+6. Enable message content intent if using the AI mention assistant.
+
+### Enabling AI Assistant
+
+Set:
+- `OPENAI_API_KEY`
+- optional `OPENAI_MODEL` (default `gpt-4o-mini`)
+
+Behavior:
+- Responds to @mentions in Discord threads.
+- Uses tool-calling for discovery/actions.
+- Keeps per-thread context in-memory with bounded retention and restore-on-miss from Discord thread history.
+
+## 3) Technical Knobs (All Configurable Controls)
+
+### Core Runtime
+
+| Variable | Required | Default | Description |
+|---|---:|---|---|
+| `HTTP_PORT` | no | `6767` | HTTP port when `HTTP_ADDR` is unset |
+| `HTTP_ADDR` | no | `:${HTTP_PORT}` | HTTP bind address |
+| `DB_PATH` | no | `./data/jellyreaper.db` | bbolt DB path |
+| `LOG_DIR` | no | `./logs` | log directory |
+| `EMBED_PERSIST_DIR` | no | `./embeds` | directory for persisted downloaded images |
+| `WORKER_ID` | no | hostname | lease owner ID for scheduler/worker |
+| `LEASE_TTL` | no | `30s` | job lease timeout |
+
+### Discord + AI
+
+| Variable | Required | Default | Description |
+|---|---:|---|---|
+| `DISCORD_PUBLIC_KEY_HEX` | yes | - | verifies Discord interaction signatures |
+| `DISCORD_BOT_TOKEN` | yes (for sending messages) | - | bot token for gateway/message APIs |
+| `DISCORD_CHANNEL_ID` | yes (recommended) | - | fallback channel for HITL prompt delivery |
+| `OPENAI_API_KEY` | no | - | enables Discord @mention AI assistant |
+| `OPENAI_MODEL` | no | `gpt-4o-mini` | OpenAI model for assistant |
+
+### Jellyfin
+
+| Variable | Required | Default | Description |
+|---|---:|---|---|
+| `JELLYFIN_URL` | no | from host/port | Jellyfin base URL |
+| `JELLYFIN_HOST` | no | `localhost` | used when `JELLYFIN_URL` is unset |
+| `JELLYFIN_PORT` | no | `8096` | used when `JELLYFIN_URL` is unset |
+| `JELLYFIN_API_KEY` | yes | - | Jellyfin API key |
+| `JELLYFIN_WEBHOOK_TOKEN` | no (strongly recommended) | - | required token for Jellyfin webhook auth |
+
+### Policy Defaults
+
+| Variable | Required | Default | Description |
+|---|---:|---|---|
+| `DEFAULT_DELAY_WINDOW` | no | `15d` | default delay window for Delay actions (supports `d` suffix, e.g. `15d`) |
+| `DEFAULT_LAST_PLAYED_THRESHOLD_DAYS` | no | `60` | default review threshold when policy is unset/new |
+
+Notes:
+- Global AI policy updates are meta-based and lazy by design.
+- They apply on next relevant action/evaluation, not by rewriting every existing flow.
+
+### Backfill / Reconciliation
+
+| Variable | Required | Default | Description |
+|---|---:|---|---|
+| `BACKFILL_ENABLED` | no | `true` | enables startup + periodic backfill |
+| `BACKFILL_INTERVAL` | no | `15m` | periodic backfill interval |
+| `BACKFILL_FULL_SWEEP_ON_STARTUP` | no | `true` | first-run full historical sweep |
+| `BACKFILL_PLAYBACK_ENABLED` | no | `false` | include playback activity backfill stream |
+| `BACKFILL_LOOKBACK` | no | `24h` | startup lookback when no checkpoint and full sweep disabled |
+| `BACKFILL_OVERLAP` | no | `2m` | checkpoint overlap for event safety |
+| `BACKFILL_LIMIT` | no | `500` | provider page size |
+| `BACKFILL_WRITE_BATCH_SIZE` | no | `100` | storage write batch size |
+| `BACKFILL_WRITE_BATCH_TIMEOUT` | no | `500ms` | flush timeout for partial backfill batches |
+| `BACKFILL_WRITE_QUEUE_CAPACITY` | no | `2000` | queue capacity for batched backfill writes |
+
+### Endpoints
+
+- `GET /healthz`
+- `POST /webhooks/jellyfin`
+- `POST /discord/interactions`
+
+### Provider Contract Notes
+
+- Discord interactions are validated with Ed25519 signature verification.
+- Jellyfin webhook payloads are mapped into typed internal events before orchestration.
+- API/provider contracts are documented in `api/openapi.yaml` and `api/external/jellyfin-openapi-stable.json`.
