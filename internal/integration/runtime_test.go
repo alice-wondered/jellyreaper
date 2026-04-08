@@ -148,7 +148,7 @@ func TestIntegrationDiscordArchiveNoDeleteJob(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	payload := []byte(`{"id":"i-archive","token":"tok","type":3,"data":{"custom_id":"jr:v1:archive:target:item:item-arc:0"}}`)
+	payload := []byte(`{"id":"175928847299117063","token":"tok","type":3,"data":{"custom_id":"jr:v1:archive:target:item:item-arc:0"}}`)
 	req, _ := http.NewRequest(http.MethodPost, server.URL+"/discord/interactions", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 	signDiscord(req, priv, payload)

@@ -18,12 +18,16 @@ const (
 	defaultLeaseTTL = 30 * time.Second
 	fallbackWorker  = "jellyreaper-1"
 
-	defaultBackfillEnabled   = true
-	defaultBackfillInterval  = 15 * time.Minute
-	defaultBackfillLookback  = 24 * time.Hour
-	defaultBackfillOverlap   = 2 * time.Minute
-	defaultBackfillLimit     = 500
-	defaultBackfillFullSweep = true
+	defaultBackfillEnabled            = true
+	defaultBackfillInterval           = 15 * time.Minute
+	defaultBackfillLookback           = 24 * time.Hour
+	defaultBackfillOverlap            = 2 * time.Minute
+	defaultBackfillLimit              = 500
+	defaultBackfillFullSweep          = true
+	defaultBackfillPlayback           = false
+	defaultBackfillWriteBatchSize     = 100
+	defaultBackfillWriteBatchTimeout  = 500 * time.Millisecond
+	defaultBackfillWriteQueueCapacity = 2000
 )
 
 type Config struct {
@@ -49,6 +53,10 @@ type Config struct {
 	BackfillOverlap            time.Duration
 	BackfillLimit              int32
 	BackfillFullSweepOnStartup bool
+	BackfillPlaybackEnabled    bool
+	BackfillWriteBatchSize     int
+	BackfillWriteBatchTimeout  time.Duration
+	BackfillWriteQueueCapacity int
 }
 
 func LoadFromEnv() (Config, error) {
@@ -117,6 +125,38 @@ func LoadFromEnv() (Config, error) {
 		backfillFullSweep = parsed
 	}
 
+	backfillPlaybackEnabled := defaultBackfillPlayback
+	if raw := strings.TrimSpace(os.Getenv("BACKFILL_PLAYBACK_ENABLED")); raw != "" {
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse BACKFILL_PLAYBACK_ENABLED: %w", err)
+		}
+		backfillPlaybackEnabled = parsed
+	}
+
+	backfillWriteBatchSize := defaultBackfillWriteBatchSize
+	if raw := strings.TrimSpace(os.Getenv("BACKFILL_WRITE_BATCH_SIZE")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			return Config{}, fmt.Errorf("parse BACKFILL_WRITE_BATCH_SIZE: must be a positive integer")
+		}
+		backfillWriteBatchSize = parsed
+	}
+
+	backfillWriteBatchTimeout, err := parseDurationEnv("BACKFILL_WRITE_BATCH_TIMEOUT", defaultBackfillWriteBatchTimeout)
+	if err != nil {
+		return Config{}, err
+	}
+
+	backfillWriteQueueCapacity := defaultBackfillWriteQueueCapacity
+	if raw := strings.TrimSpace(os.Getenv("BACKFILL_WRITE_QUEUE_CAPACITY")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			return Config{}, fmt.Errorf("parse BACKFILL_WRITE_QUEUE_CAPACITY: must be a positive integer")
+		}
+		backfillWriteQueueCapacity = parsed
+	}
+
 	cfg := Config{
 		HTTPAddr: httpAddr,
 		HTTPPort: httpPort,
@@ -138,6 +178,10 @@ func LoadFromEnv() (Config, error) {
 		BackfillOverlap:            backfillOverlap,
 		BackfillLimit:              backfillLimit,
 		BackfillFullSweepOnStartup: backfillFullSweep,
+		BackfillPlaybackEnabled:    backfillPlaybackEnabled,
+		BackfillWriteBatchSize:     backfillWriteBatchSize,
+		BackfillWriteBatchTimeout:  backfillWriteBatchTimeout,
+		BackfillWriteQueueCapacity: backfillWriteQueueCapacity,
 	}
 
 	if raw := os.Getenv("DISCORD_PUBLIC_KEY_HEX"); raw != "" {
