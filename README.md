@@ -64,6 +64,10 @@ go build ./cmd/jellyreaper
 ## Docker
 ```bash
 cp .env.example .env
+
+# if you use a shared external docker network with Jellyfin
+docker network create media_shared || true
+
 docker compose -f docker-compose.example.yml up -d
 ```
 

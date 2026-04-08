@@ -16,6 +16,8 @@ import (
 	"jellyreaper/internal/repo"
 )
 
+const minHITLResponseWindow = 24 * time.Hour
+
 type EvaluatePolicyHandler struct {
 	repository repo.Repository
 	logger     *slog.Logger
@@ -55,6 +57,48 @@ func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord
 			return nil
 		}
 
+		expireDays := flow.PolicySnapshot.ExpireAfterDays
+		if expireDays <= 0 {
+			expireDays = 90
+		}
+
+		lastPlayed, known, err := mostRecentPlayForFlow(ctx, tx, flow)
+		if err != nil {
+			return err
+		}
+		if known {
+			dueAt := lastPlayed.Add(time.Duration(expireDays) * 24 * time.Hour)
+			if dueAt.After(now) {
+				expected := flow.Version
+				flow.NextActionAt = dueAt
+				flow.UpdatedAt = now
+				flow.Version = expected + 1
+				if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+					return err
+				}
+
+				payload, err := json.Marshal(jobs.EvaluatePolicyPayload{Reason: "not_due_yet"})
+				if err != nil {
+					return err
+				}
+				return upsertScheduledEvaluateJob(ctx, tx, flow, now, dueAt, payload)
+			}
+		} else {
+			expected := flow.Version
+			flow.NextActionAt = now.Add(24 * time.Hour)
+			flow.UpdatedAt = now
+			flow.Version = expected + 1
+			if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+				return err
+			}
+
+			payload, err := json.Marshal(jobs.EvaluatePolicyPayload{Reason: "await_play_metrics"})
+			if err != nil {
+				return err
+			}
+			return upsertScheduledEvaluateJob(ctx, tx, flow, now, flow.NextActionAt, payload)
+		}
+
 		expected := flow.Version
 		flow.State = domain.FlowStatePendingReview
 		flow.HITLOutcome = ""
@@ -87,6 +131,35 @@ func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord
 		}
 		return tx.EnqueueJob(ctx, promptJob)
 	})
+}
+
+func mostRecentPlayForFlow(ctx context.Context, tx repo.TxRepository, flow domain.Flow) (time.Time, bool, error) {
+	parts := strings.SplitN(flow.ItemID, ":", 3)
+	if len(parts) == 3 && parts[0] == "target" {
+		items, err := tx.ListMediaBySubject(ctx, parts[1], parts[2])
+		if err != nil {
+			return time.Time{}, false, err
+		}
+		latest := time.Time{}
+		for _, item := range items {
+			if item.LastPlayedAt.After(latest) {
+				latest = item.LastPlayedAt
+			}
+		}
+		if latest.IsZero() {
+			return time.Time{}, false, nil
+		}
+		return latest, true, nil
+	}
+
+	item, found, err := tx.GetMedia(ctx, flow.ItemID)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if !found || item.LastPlayedAt.IsZero() {
+		return time.Time{}, false, nil
+	}
+	return item.LastPlayedAt, true, nil
 }
 
 type SendHITLPromptHandler struct {
@@ -183,7 +256,13 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 
 		expected := current.Version
 		current.State = domain.FlowStatePendingReview
-		current.DecisionDeadlineAt = now.Add(h.hitlTimeout)
+		deadline := now.Add(h.hitlTimeout)
+		minDeadline := now.Add(minHITLResponseWindow)
+		if deadline.Before(minDeadline) {
+			deadline = minDeadline
+		}
+
+		current.DecisionDeadlineAt = deadline
 		current.NextActionAt = current.DecisionDeadlineAt
 		current.Discord.ChannelID = channelID
 		current.Discord.MessageID = messageID
@@ -239,6 +318,38 @@ func (h *HITLTimeoutHandler) Handle(ctx context.Context, job domain.JobRecord) e
 			return nil
 		}
 
+		deadline := flow.DecisionDeadlineAt
+		if deadline.IsZero() {
+			deadline = now.Add(minHITLResponseWindow)
+		}
+		if deadline.After(now) {
+			expected := flow.Version
+			flow.NextActionAt = deadline
+			flow.UpdatedAt = now
+			flow.Version = expected + 1
+			if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+				return err
+			}
+
+			timeoutPayload, err := json.Marshal(jobs.HITLTimeoutPayload{DefaultAction: "delete"})
+			if err != nil {
+				return err
+			}
+			return tx.EnqueueJob(ctx, domain.JobRecord{
+				JobID:          "job:timeout:" + job.ItemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
+				FlowID:         flow.FlowID,
+				ItemID:         flow.ItemID,
+				Kind:           domain.JobKindHITLTimeout,
+				Status:         domain.JobStatusPending,
+				RunAt:          deadline,
+				MaxAttempts:    5,
+				IdempotencyKey: "job:timeout:deferred:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version, 10),
+				PayloadJSON:    timeoutPayload,
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			})
+		}
+
 		expected := flow.Version
 		flow.State = domain.FlowStateDeleteQueued
 		flow.NextActionAt = now
@@ -265,6 +376,46 @@ func (h *HITLTimeoutHandler) Handle(ctx context.Context, job domain.JobRecord) e
 			CreatedAt:      now,
 			UpdatedAt:      now,
 		})
+	})
+}
+
+func upsertScheduledEvaluateJob(ctx context.Context, tx repo.TxRepository, flow domain.Flow, now time.Time, runAt time.Time, payload []byte) error {
+	jobID := "job:eval:scheduled:" + flow.ItemID
+	job, found, err := tx.GetJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if found {
+		job.FlowID = flow.FlowID
+		job.ItemID = flow.ItemID
+		job.Kind = domain.JobKindEvaluatePolicy
+		job.Status = domain.JobStatusPending
+		job.RunAt = runAt
+		job.LeaseOwner = ""
+		job.LeaseUntil = time.Time{}
+		job.MaxAttempts = 5
+		job.IdempotencyKey = "job:eval:scheduled:" + flow.ItemID
+		job.PayloadJSON = payload
+		job.LastError = ""
+		job.UpdatedAt = now
+		if job.CreatedAt.IsZero() {
+			job.CreatedAt = now
+		}
+		return tx.UpdateJob(ctx, job)
+	}
+
+	return tx.EnqueueJob(ctx, domain.JobRecord{
+		JobID:          jobID,
+		FlowID:         flow.FlowID,
+		ItemID:         flow.ItemID,
+		Kind:           domain.JobKindEvaluatePolicy,
+		Status:         domain.JobStatusPending,
+		RunAt:          runAt,
+		MaxAttempts:    5,
+		IdempotencyKey: "job:eval:scheduled:" + flow.ItemID,
+		PayloadJSON:    payload,
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	})
 }
 

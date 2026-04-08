@@ -56,6 +56,35 @@ func (s *Service) VerifyRequest(r *http.Request) bool {
 	return discordgo.VerifyInteraction(r, s.publicKey)
 }
 
+func (s *Service) VerifyInteractionPayload(signatureHex string, timestamp string, body []byte) (bool, string) {
+	if len(s.publicKey) != ed25519.PublicKeySize {
+		return false, "public key missing or invalid length"
+	}
+	if strings.TrimSpace(signatureHex) == "" {
+		return false, "missing signature header"
+	}
+	if strings.TrimSpace(timestamp) == "" {
+		return false, "missing timestamp header"
+	}
+
+	sig, err := hex.DecodeString(strings.TrimSpace(signatureHex))
+	if err != nil {
+		return false, "signature header is not valid hex"
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return false, "signature has invalid length"
+	}
+
+	message := make([]byte, 0, len(timestamp)+len(body))
+	message = append(message, []byte(strings.TrimSpace(timestamp))...)
+	message = append(message, body...)
+	if !ed25519.Verify(s.publicKey, message, sig) {
+		return false, "signature mismatch"
+	}
+
+	return true, ""
+}
+
 func (s *Service) HandleIncomingInteraction(ctx context.Context, interaction IncomingInteraction, handle InteractionCallback) (*discordgo.InteractionResponse, int, error) {
 	switch interaction.Type {
 	case discordgo.InteractionPing:
@@ -106,9 +135,9 @@ func (s *Service) SendHITLPrompt(ctx context.Context, channelID, itemID string, 
 	if file, err := s.prepareEmbedFile(ctx, itemID, imageURL); err == nil && file != nil {
 		send.Files = []*discordgo.File{file}
 		send.Embeds = []*discordgo.MessageEmbed{{Image: &discordgo.MessageEmbedImage{URL: "attachment://" + file.Name}}}
-	} else if strings.TrimSpace(imageURL) != "" {
+	} else if normalized := normalizeHTTPURL(imageURL); normalized != "" {
 		send.Embeds = []*discordgo.MessageEmbed{{
-			Image: &discordgo.MessageEmbedImage{URL: imageURL},
+			Image: &discordgo.MessageEmbedImage{URL: normalized},
 		}}
 	}
 
@@ -177,13 +206,31 @@ func (s *Service) prepareEmbedFile(ctx context.Context, itemID string, imageURL 
 }
 
 func (s *Service) resolveImageURL(itemID string, imageURL string) string {
-	if strings.TrimSpace(imageURL) != "" {
-		return strings.TrimSpace(imageURL)
+	if normalized := normalizeHTTPURL(imageURL); normalized != "" {
+		return normalized
 	}
 	if s.jellyfinBaseURL == "" || itemID == "" || strings.Contains(itemID, ":") {
 		return ""
 	}
 	return s.jellyfinBaseURL + "/Items/" + url.PathEscape(itemID) + "/Images/Primary"
+}
+
+func normalizeHTTPURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return ""
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return ""
+	}
+	if parsed.Host == "" {
+		return ""
+	}
+	return parsed.String()
 }
 
 func (s *Service) fetchImage(ctx context.Context, imageURL string) ([]byte, string, error) {

@@ -78,3 +78,76 @@ func TestFailJobRequeuesPending(t *testing.T) {
 		t.Fatalf("unexpected next due: ok=%v due=%s retryAt=%s", ok, next, retryAt)
 	}
 }
+
+func TestLeaseDueJobsReclaimsExpiredLeases(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.EnqueueJob(context.Background(), domain.JobRecord{JobID: "job-expired", ItemID: "i1", Kind: domain.JobKindEvaluatePolicy, Status: domain.JobStatusPending, RunAt: now})
+	}); err != nil {
+		t.Fatalf("seed job: %v", err)
+	}
+
+	leased, err := store.LeaseDueJobs(context.Background(), now, 1, "worker-a", 15*time.Millisecond)
+	if err != nil {
+		t.Fatalf("initial lease: %v", err)
+	}
+	if len(leased) != 1 {
+		t.Fatalf("expected one leased job, got %d", len(leased))
+	}
+
+	time.Sleep(20 * time.Millisecond)
+
+	reclaimed, err := store.LeaseDueJobs(context.Background(), time.Now().UTC(), 1, "worker-b", time.Minute)
+	if err != nil {
+		t.Fatalf("reclaim lease: %v", err)
+	}
+	if len(reclaimed) != 1 || reclaimed[0].JobID != "job-expired" {
+		t.Fatalf("expected reclaimed job, got %#v", reclaimed)
+	}
+}
+
+func TestOpenReconcilesPersistedQueueAfterRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "restart.db")
+
+	store, err := Open(path, 0o600, &bboltlib.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	now := time.Now().UTC()
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.EnqueueJob(context.Background(), domain.JobRecord{JobID: "job-restart", ItemID: "i-restart", Kind: domain.JobKindEvaluatePolicy, Status: domain.JobStatusPending, RunAt: now}); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed restart job: %v", err)
+	}
+
+	leased, err := store.LeaseDueJobs(context.Background(), now, 1, "worker-a", 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("lease before restart: %v", err)
+	}
+	if len(leased) != 1 {
+		t.Fatalf("expected one leased job before restart, got %d", len(leased))
+	}
+
+	_ = store.Close()
+	time.Sleep(15 * time.Millisecond)
+
+	reopened, err := Open(path, 0o600, &bboltlib.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+
+	jobs, err := reopened.LeaseDueJobs(context.Background(), time.Now().UTC(), 10, "worker-b", time.Minute)
+	if err != nil {
+		t.Fatalf("lease after restart: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].JobID != "job-restart" {
+		t.Fatalf("expected restored job after restart, got %#v", jobs)
+	}
+}

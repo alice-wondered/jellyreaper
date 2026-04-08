@@ -52,7 +52,16 @@ func TestBackfillFetchChangedItemsSince(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		res := gen.BaseItemDtoQueryResult{Items: &[]gen.BaseItemDto{{Id: &id, Name: strPtr("Movie C"), DateCreated: &now, DateLastMediaAdded: &now}}}
+		enableUserData := r.URL.Query().Get("EnableUserData")
+		if enableUserData == "" {
+			enableUserData = r.URL.Query().Get("enableUserData")
+		}
+		if enableUserData != "true" {
+			t.Fatalf("expected EnableUserData=true query parameter")
+		}
+		playCount := int32(7)
+		userData := gen.UserItemDataDto{LastPlayedDate: &now, PlayCount: &playCount}
+		res := gen.BaseItemDtoQueryResult{Items: &[]gen.BaseItemDto{{Id: &id, Name: strPtr("Movie C"), DateCreated: &now, DateLastMediaAdded: &now, UserData: &userData}}}
 		_ = json.NewEncoder(w).Encode(res)
 	}))
 	defer server.Close()
@@ -71,6 +80,12 @@ func TestBackfillFetchChangedItemsSince(t *testing.T) {
 	}
 	if items[0].ItemID != id.String() || items[0].Name != "Movie C" {
 		t.Fatalf("unexpected changed item: %#v", items[0])
+	}
+	if items[0].PlayCount != 7 {
+		t.Fatalf("unexpected play count: %d", items[0].PlayCount)
+	}
+	if items[0].LastPlayedAt.IsZero() {
+		t.Fatal("expected last played timestamp")
 	}
 }
 

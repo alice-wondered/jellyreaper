@@ -83,6 +83,19 @@ func TestIntegrationWebhookToSchedulerDispatch(t *testing.T) {
 	defer cancel()
 	go func() { _ = loop.Run(ctx) }()
 
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID:       "item-timeout",
+			Name:         "Timeout Movie",
+			Title:        "Timeout Movie",
+			ItemType:     "Movie",
+			LastPlayedAt: time.Now().UTC().Add(-120 * 24 * time.Hour),
+			UpdatedAt:    time.Now().UTC(),
+		})
+	}); err != nil {
+		t.Fatalf("seed stale media: %v", err)
+	}
+
 	mux, err := api.NewMux(api.Config{
 		Addr:                     ":0",
 		Jellyfin:                 appSvc.HandleJellyfinWebhook,
@@ -95,7 +108,7 @@ func TestIntegrationWebhookToSchedulerDispatch(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	body := []byte(`{"ItemId":"item-e2e","ItemType":"Movie","Name":"E2E Movie","EventId":"evt-e2e-1","NotificationType":"PlaybackStart"}`)
+	body := []byte(`{"ItemId":"item-e2e","ItemType":"Movie","Name":"E2E Movie","EventId":"evt-e2e-1","NotificationType":"ItemAdded"}`)
 	resp, err := http.Post(server.URL+"/webhooks/jellyfin", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("post webhook: %v", err)
@@ -179,7 +192,7 @@ func TestIntegrationDiscordArchiveNoDeleteJob(t *testing.T) {
 	}
 }
 
-func TestIntegrationWebhookToPromptToTimeoutDelete(t *testing.T) {
+func TestIntegrationWebhookDoesNotDeleteImmediatelyWithShortTimeoutConfig(t *testing.T) {
 	store := openStore(t)
 	pub, _, _ := ed25519.GenerateKey(nil)
 	discordSvc, err := discord.NewService("", pub)
@@ -245,39 +258,20 @@ func TestIntegrationWebhookToPromptToTimeoutDelete(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	body := []byte(`{"ItemId":"item-timeout","ItemType":"Movie","Name":"Timeout Movie","EventId":"evt-timeout-1","NotificationType":"PlaybackStart"}`)
+	body := []byte(`{"ItemId":"item-timeout","ItemType":"Movie","Name":"Timeout Movie","EventId":"evt-timeout-1","NotificationType":"ItemAdded"}`)
 	resp, err := http.Post(server.URL+"/webhooks/jellyfin", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("post webhook: %v", err)
 	}
 	_ = resp.Body.Close()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		flow, found, err := getFlow(store, "target:movie:item-timeout")
-		if err == nil && found && flow.State == domain.FlowStateDeleted {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
+	time.Sleep(150 * time.Millisecond)
 	flow, found, err := getFlow(store, "target:movie:item-timeout")
 	if err != nil || !found {
 		t.Fatalf("expected timeout flow: found=%v err=%v", found, err)
 	}
-	if flow.State != domain.FlowStateDeleted {
-		t.Fatalf("unexpected flow state after timeout chain: %s", flow.State)
-	}
-	if sentPrompts.Load() < 1 {
-		t.Fatal("expected outgoing discord prompt to be sent")
-	}
-
-	nextDue, ok, err := store.GetNextDueAt(context.Background())
-	if err != nil {
-		t.Fatalf("get next due: %v", err)
-	}
-	if ok {
-		t.Fatalf("expected no pending due jobs, got %s", nextDue)
+	if flow.State == domain.FlowStateDeleted || flow.State == domain.FlowStateDeleteQueued || flow.State == domain.FlowStateDeleteInProgress {
+		t.Fatalf("unexpected immediate deletion state: %s", flow.State)
 	}
 }
 

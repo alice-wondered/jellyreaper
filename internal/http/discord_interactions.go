@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	stdhttp "net/http"
 
 	"github.com/bwmarrin/discordgo"
@@ -32,14 +33,22 @@ func (h *DiscordInteractionsHandler) ServeHTTP(w stdhttp.ResponseWriter, r *stdh
 		return
 	}
 
-	if !h.service.VerifyRequest(r) {
-		stdhttp.Error(w, "invalid request signature", stdhttp.StatusUnauthorized)
-		return
-	}
-
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		stdhttp.Error(w, "failed to read request body", stdhttp.StatusBadRequest)
+		return
+	}
+
+	sig := r.Header.Get("X-Signature-Ed25519")
+	ts := r.Header.Get("X-Signature-Timestamp")
+	if ok, reason := h.service.VerifyInteractionPayload(sig, ts, body); !ok {
+		slog.Warn("discord interaction signature verification failed",
+			"reason", reason,
+			"has_signature_header", sig != "",
+			"has_timestamp_header", ts != "",
+			"body_len", len(body),
+		)
+		stdhttp.Error(w, "invalid request signature", stdhttp.StatusUnauthorized)
 		return
 	}
 
