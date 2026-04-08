@@ -263,3 +263,40 @@ func TestBackfillFetchChangedItemsSinceCachesUsersList(t *testing.T) {
 		t.Fatalf("expected /Users to be fetched once from cache, got %d", usersCalls)
 	}
 }
+
+func TestBackfillFetchChangedItemsPageIncludesRecentUserPlaysWhenCatalogPageEmpty(t *testing.T) {
+	itemID := uuid.New()
+	recentPlay := time.Date(2026, 4, 5, 0, 29, 37, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/Items":
+			_ = json.NewEncoder(w).Encode(gen.BaseItemDtoQueryResult{Items: &[]gen.BaseItemDto{}})
+		case "/Users":
+			_, _ = w.Write([]byte(`[{"Id":"u1"}]`))
+		case "/Users/u1/Items":
+			_, _ = w.Write([]byte(`{"Items":[{"Id":"` + itemID.String() + `","Type":"Movie","Name":"Sample Movie","UserData":{"LastPlayedDate":"` + recentPlay.Format(time.RFC3339Nano) + `","PlayCount":3}}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	b, err := NewBackfillService(server.URL, "token", server.Client())
+	if err != nil {
+		t.Fatalf("new backfill service: %v", err)
+	}
+
+	page, err := b.FetchChangedItemsPage(context.Background(), time.Now().Add(-60*24*time.Hour), 0, 100)
+	if err != nil {
+		t.Fatalf("fetch changed items page: %v", err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("expected one merged recent-play item, got %d", len(page.Items))
+	}
+	if page.Items[0].ItemID != itemID.String() {
+		t.Fatalf("unexpected merged item id: %q", page.Items[0].ItemID)
+	}
+	if !page.Items[0].LastPlayedAt.Equal(recentPlay) {
+		t.Fatalf("expected merged last played %s, got %s", recentPlay, page.Items[0].LastPlayedAt)
+	}
+}
