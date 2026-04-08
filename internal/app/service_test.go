@@ -189,7 +189,7 @@ func TestWebhookIndexesFlowAndJobAndDedupe(t *testing.T) {
 	}
 }
 
-func TestWebhookEpisodeAggregatesToSeasonAndSeries(t *testing.T) {
+func TestWebhookEpisodeCatalogEventAggregatesToSeasonTarget(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 15, 0, 0, 0, time.UTC)
@@ -204,13 +204,13 @@ func TestWebhookEpisodeAggregatesToSeasonAndSeries(t *testing.T) {
 			SeasonName:       "Season 1",
 			SeriesID:         "series-1",
 			SeriesName:       "My Show",
-			NotificationType: "PlaybackStart",
+			NotificationType: "ItemAdded",
 			EventID:          "evt-episode-1",
 		},
 		Raw:       map[string]any{"ItemId": "ep-1", "ItemType": "Episode", "SeasonId": "season-1", "SeriesId": "series-1", "EventId": "evt-episode-1"},
 		ItemID:    "ep-1",
 		EventID:   "evt-episode-1",
-		EventType: "PlaybackStart",
+		EventType: "ItemAdded",
 		DedupeKey: "jellyfin:evt-episode-1",
 	}
 
@@ -392,6 +392,196 @@ func TestIngestBackfillPlaybackUsesOriginalEventTimestamp(t *testing.T) {
 	}
 	if media.PlayCountTotal != 1 {
 		t.Fatalf("expected play count to increment to 1, got %d", media.PlayCountTotal)
+	}
+}
+
+func TestIngestBackfillPlaybackDoesNotCreateReviewFlowWithoutItemType(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	err := svc.IngestBackfillPlayback(context.Background(), []jellyfin.PlaybackEvent{{
+		ItemID: "movie-no-type",
+		Type:   "PlaybackStart",
+		Name:   "alice is playing Movie X",
+		Date:   now.Add(-time.Hour),
+	}})
+	if err != nil {
+		t.Fatalf("ingest backfill playback: %v", err)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		_, found, err := tx.GetFlow(context.Background(), "target:item:movie-no-type")
+		if err != nil {
+			return err
+		}
+		if found {
+			t.Fatal("expected no review flow from playback-only backfill event without item type")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify flow absence: %v", err)
+	}
+}
+
+func TestHandlePlaybackWebhookDoesNotCreateFlowOrOverwriteNames(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID:         "movie-play-1",
+			Name:           "Canonical Movie",
+			Title:          "Canonical Movie",
+			ItemType:       "Movie",
+			PlayCountTotal: 2,
+			UpdatedAt:      now.Add(-time.Hour),
+		}); err != nil {
+			return err
+		}
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:movie:movie-play-1",
+			ItemID:      "target:movie:movie-play-1",
+			SubjectType: "movie",
+			DisplayName: "Canonical Movie",
+			State:       domain.FlowStateActive,
+			Version:     0,
+			PolicySnapshot: domain.PolicySnapshot{
+				ExpireAfterDays: 30,
+				HITLTimeoutHrs:  48,
+				TimeoutAction:   "delete",
+			},
+			CreatedAt: now.Add(-time.Hour),
+			UpdatedAt: now.Add(-time.Hour),
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed existing media/flow: %v", err)
+	}
+
+	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:           "movie-play-1",
+			ItemType:         "Movie",
+			Name:             "alice is playing Canonical Movie",
+			NotificationType: "PlaybackStart",
+		},
+		Raw:        map[string]any{"EventId": "evt-play-1"},
+		ItemID:     "movie-play-1",
+		EventType:  "PlaybackStart",
+		DedupeKey:  "jellyfin:evt-play-1",
+		OccurredAt: now.Add(-time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("handle playback webhook: %v", err)
+	}
+
+	media := mustGetMedia(t, store, "movie-play-1")
+	if media.Name != "Canonical Movie" {
+		t.Fatalf("expected canonical media name, got %q", media.Name)
+	}
+	if media.PlayCountTotal != 3 {
+		t.Fatalf("expected playback count increment, got %d", media.PlayCountTotal)
+	}
+
+	flow := mustGetFlow(t, store, "target:movie:movie-play-1")
+	if flow.DisplayName != "Canonical Movie" {
+		t.Fatalf("expected canonical flow name, got %q", flow.DisplayName)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		_, found, err := tx.GetFlow(context.Background(), "target:item:movie-play-new")
+		if err != nil {
+			return err
+		}
+		if found {
+			t.Fatal("expected no new flow created from playback event")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify no new flow: %v", err)
+	}
+}
+
+func TestHandleSeasonRemovalMarksChildrenAndSeasonFlowDeleted(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 10, 13, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-rm-1", SeasonID: "season-rm-1", SeasonName: "Season X", UpdatedAt: now}); err != nil {
+			return err
+		}
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-rm-2", SeasonID: "season-rm-1", SeasonName: "Season X", UpdatedAt: now}); err != nil {
+			return err
+		}
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:season:season-rm-1",
+			ItemID:      "target:season:season-rm-1",
+			SubjectType: "season",
+			DisplayName: "Season X of Show Y",
+			State:       domain.FlowStateActive,
+			Version:     0,
+			PolicySnapshot: domain.PolicySnapshot{
+				ExpireAfterDays: 30,
+				HITLTimeoutHrs:  48,
+				TimeoutAction:   "delete",
+			},
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed season state: %v", err)
+	}
+
+	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:           "season-rm-1",
+			ItemType:         "Season",
+			SeasonID:         "season-rm-1",
+			SeasonName:       "Season X",
+			NotificationType: "ItemDeleted",
+			EventID:          "evt-season-rm",
+		},
+		Raw:       map[string]any{"EventId": "evt-season-rm"},
+		ItemID:    "season-rm-1",
+		EventType: "ItemDeleted",
+		DedupeKey: "jellyfin:evt-season-rm",
+	})
+	if err != nil {
+		t.Fatalf("handle season removal: %v", err)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		_, found, err := tx.GetMedia(context.Background(), "ep-rm-1")
+		if err != nil {
+			return err
+		}
+		if found {
+			t.Fatal("expected season child ep-rm-1 deleted from media index")
+		}
+
+		_, found, err = tx.GetMedia(context.Background(), "ep-rm-2")
+		if err != nil {
+			return err
+		}
+		if found {
+			t.Fatal("expected season child ep-rm-2 deleted from media index")
+		}
+
+		_, found, err = tx.GetFlow(context.Background(), "target:season:season-rm-1")
+		if err != nil {
+			return err
+		}
+		if found {
+			t.Fatal("expected season flow deleted")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify deletion state: %v", err)
 	}
 }
 

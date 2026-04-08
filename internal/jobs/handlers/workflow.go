@@ -472,10 +472,13 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 		return nil
 	}
 
+	deletedChildIDs := []string{}
 	if flow.SubjectType == "season" || flow.SubjectType == "series" {
-		if err := h.deleteAggregateChildren(ctx, flow); err != nil {
+		ids, err := h.deleteAggregateChildren(ctx, flow)
+		if err != nil {
 			return err
 		}
+		deletedChildIDs = ids
 	} else {
 		deleteID := flow.ItemID
 		if strings.HasPrefix(deleteID, "target:item:") || strings.HasPrefix(deleteID, "target:movie:") {
@@ -484,6 +487,7 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 		if err := h.client.DeleteItem(ctx, deleteID); err != nil {
 			return err
 		}
+		deletedChildIDs = append(deletedChildIDs, deleteID)
 	}
 
 	now := time.Now().UTC()
@@ -496,12 +500,25 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 			return nil
 		}
 
-		current.State = domain.FlowStateDeleted
-		current.NextActionAt = time.Time{}
-		current.UpdatedAt = now
-		current.Version = expected + 1
-		if err := tx.UpsertFlowCAS(ctx, current, expected); err != nil {
+		if err := tx.DeleteFlow(ctx, current.ItemID); err != nil {
 			return err
+		}
+
+		for _, childID := range deletedChildIDs {
+			if childID == "" {
+				continue
+			}
+			if err := tx.DeleteMedia(ctx, childID); err != nil {
+				return err
+			}
+
+			childFlowID := "target:item:" + childID
+			if err := tx.DeleteFlow(ctx, childFlowID); err != nil {
+				return err
+			}
+			if err := tx.DeleteFlow(ctx, "target:movie:"+childID); err != nil {
+				return err
+			}
 		}
 
 		return tx.AppendEvent(ctx, domain.Event{
@@ -519,24 +536,26 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 	})
 }
 
-func (h *ExecuteDeleteHandler) deleteAggregateChildren(ctx context.Context, flow domain.Flow) error {
+func (h *ExecuteDeleteHandler) deleteAggregateChildren(ctx context.Context, flow domain.Flow) ([]string, error) {
 	parts := strings.SplitN(flow.ItemID, ":", 3)
 	if len(parts) != 3 {
-		return fmt.Errorf("invalid target id %s", flow.ItemID)
+		return nil, fmt.Errorf("invalid target id %s", flow.ItemID)
 	}
 	children, err := h.listChildren(ctx, parts[1], parts[2])
 	if err != nil {
-		return err
+		return nil, err
 	}
+	deleted := make([]string, 0, len(children))
 	for _, child := range children {
 		if child.ItemID == "" {
 			continue
 		}
 		if err := h.client.DeleteItem(ctx, child.ItemID); err != nil {
-			return err
+			return nil, err
 		}
+		deleted = append(deleted, child.ItemID)
 	}
-	return nil
+	return deleted, nil
 }
 
 func (h *ExecuteDeleteHandler) listChildren(ctx context.Context, subjectType, subjectID string) ([]domain.MediaItem, error) {

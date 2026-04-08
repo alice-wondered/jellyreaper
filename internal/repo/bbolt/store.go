@@ -370,6 +370,20 @@ func (t *txRepo) UpsertFlowCAS(ctx context.Context, flow domain.Flow, expectedVe
 	return nil
 }
 
+func (t *txRepo) DeleteFlow(ctx context.Context, itemID string) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if itemID == "" {
+		return fmt.Errorf("delete flow: item id required: %w", ErrInvalidInput)
+	}
+	b, err := requireBucket(t.tx, bucketFlows)
+	if err != nil {
+		return err
+	}
+	return b.Delete(keyBytes(itemID))
+}
+
 func (t *txRepo) GetMedia(ctx context.Context, itemID string) (domain.MediaItem, bool, error) {
 	if err := checkContext(ctx); err != nil {
 		return domain.MediaItem{}, false, err
@@ -407,6 +421,20 @@ func (t *txRepo) UpsertMedia(ctx context.Context, media domain.MediaItem) error 
 		return fmt.Errorf("persist media %s: %w", media.ItemID, err)
 	}
 	return nil
+}
+
+func (t *txRepo) DeleteMedia(ctx context.Context, itemID string) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if itemID == "" {
+		return fmt.Errorf("delete media: item id required: %w", ErrInvalidInput)
+	}
+	b, err := requireBucket(t.tx, bucketMedia)
+	if err != nil {
+		return err
+	}
+	return b.Delete(keyBytes(itemID))
 }
 
 func (t *txRepo) ListMediaBySubject(ctx context.Context, subjectType string, subjectID string) ([]domain.MediaItem, error) {

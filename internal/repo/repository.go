@@ -10,9 +10,11 @@ import (
 type TxRepository interface {
 	GetFlow(ctx context.Context, itemID string) (domain.Flow, bool, error)
 	UpsertFlowCAS(ctx context.Context, flow domain.Flow, expectedVersion int64) error
+	DeleteFlow(ctx context.Context, itemID string) error
 
 	GetMedia(ctx context.Context, itemID string) (domain.MediaItem, bool, error)
 	UpsertMedia(ctx context.Context, media domain.MediaItem) error
+	DeleteMedia(ctx context.Context, itemID string) error
 	ListMediaBySubject(ctx context.Context, subjectType string, subjectID string) ([]domain.MediaItem, error)
 
 	AppendEvent(ctx context.Context, event domain.Event) error

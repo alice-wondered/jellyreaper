@@ -70,15 +70,12 @@ func TestExecuteDeleteHandlerTransitionsToDeleted(t *testing.T) {
 	}
 
 	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
-		flow, found, err := tx.GetFlow(context.Background(), "item1")
+		_, found, err := tx.GetFlow(context.Background(), "item1")
 		if err != nil {
 			return err
 		}
-		if !found {
-			t.Fatal("expected flow")
-		}
-		if flow.State != domain.FlowStateDeleted {
-			t.Fatalf("unexpected flow state: %s", flow.State)
+		if found {
+			t.Fatal("expected flow to be deleted from store")
 		}
 		return nil
 	}); err != nil {
@@ -237,6 +234,18 @@ func TestExecuteDeleteHandlerDeletesChildrenForSeriesTarget(t *testing.T) {
 		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-1", SeriesID: "series-1", UpdatedAt: now}); err != nil {
 			return err
 		}
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:item:ep-1",
+			ItemID:      "target:item:ep-1",
+			SubjectType: "item",
+			DisplayName: "Episode 1",
+			State:       domain.FlowStateActive,
+			Version:     0,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0); err != nil {
+			return err
+		}
 		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-2", SeriesID: "series-1", UpdatedAt: now})
 	}); err != nil {
 		t.Fatalf("seed aggregate flow/media: %v", err)
@@ -259,6 +268,27 @@ func TestExecuteDeleteHandlerDeletesChildrenForSeriesTarget(t *testing.T) {
 	}
 	if deleteCount != 2 {
 		t.Fatalf("expected 2 child deletes, got %d", deleteCount)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		_, found, err := tx.GetMedia(context.Background(), "ep-1")
+		if err != nil {
+			return err
+		}
+		if found {
+			t.Fatal("expected ep-1 media deleted")
+		}
+
+		_, found, err = tx.GetFlow(context.Background(), "target:item:ep-1")
+		if err != nil {
+			return err
+		}
+		if found {
+			t.Fatal("expected child item flow deleted")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify post-delete state: %v", err)
 	}
 }
 
