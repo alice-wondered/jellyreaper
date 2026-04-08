@@ -104,7 +104,7 @@ func TestHITLTimeoutHandlerQueuesDeleteWhenPendingReview(t *testing.T) {
 		t.Fatalf("seed flow: %v", err)
 	}
 
-	h := NewHITLTimeoutHandler(store)
+	h := NewHITLTimeoutHandler(store, nil, nil)
 	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "timeout1", ItemID: "item2"}); err != nil {
 		t.Fatalf("timeout handle: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestHITLTimeoutHandlerDefersDeleteUntilDeadline(t *testing.T) {
 		t.Fatalf("seed flow: %v", err)
 	}
 
-	h := NewHITLTimeoutHandler(store)
+	h := NewHITLTimeoutHandler(store, nil, nil)
 	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "timeout2", ItemID: "item3"}); err != nil {
 		t.Fatalf("timeout handle: %v", err)
 	}
@@ -174,6 +174,47 @@ func TestHITLTimeoutHandlerDefersDeleteUntilDeadline(t *testing.T) {
 		if job.Kind == domain.JobKindExecuteDelete && job.ItemID == "item3" {
 			t.Fatalf("unexpected delete before deadline: %#v", job)
 		}
+	}
+}
+
+func TestHITLTimeoutHandlerFinalizesPromptMessage(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:             "flow:item4",
+			ItemID:             "item4",
+			DisplayName:        "Season 2 of Test Show",
+			State:              domain.FlowStatePendingReview,
+			DecisionDeadlineAt: now.Add(-time.Minute),
+			Discord:            domain.DiscordContext{ChannelID: "ch-1", MessageID: "msg-1"},
+			Version:            0,
+			CreatedAt:          now,
+			UpdatedAt:          now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	pub, _, _ := ed25519.GenerateKey(nil)
+	discordSvc, err := discord.NewService("", pub)
+	if err != nil {
+		t.Fatalf("discord service: %v", err)
+	}
+	called := false
+	discordSvc.SetEditPromptHookForTest(func(context.Context, string, string, string) error {
+		called = true
+		return nil
+	})
+
+	h := NewHITLTimeoutHandler(store, discordSvc, nil)
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "timeout3", ItemID: "item4"}); err != nil {
+		t.Fatalf("timeout handle: %v", err)
+	}
+
+	if !called {
+		t.Fatal("expected timeout handler to finalize original HITL message")
 	}
 }
 

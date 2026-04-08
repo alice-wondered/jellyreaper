@@ -296,17 +296,25 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 
 type HITLTimeoutHandler struct {
 	repository repo.Repository
+	discord    *discord.Service
+	logger     *slog.Logger
 }
 
-func NewHITLTimeoutHandler(repository repo.Repository) *HITLTimeoutHandler {
-	return &HITLTimeoutHandler{repository: repository}
+func NewHITLTimeoutHandler(repository repo.Repository, discordSvc *discord.Service, logger *slog.Logger) *HITLTimeoutHandler {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &HITLTimeoutHandler{repository: repository, discord: discordSvc, logger: logger}
 }
 
 func (h *HITLTimeoutHandler) Kind() domain.JobKind { return domain.JobKindHITLTimeout }
 
 func (h *HITLTimeoutHandler) Handle(ctx context.Context, job domain.JobRecord) error {
 	now := time.Now().UTC()
-	return h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	finalizeChannelID := ""
+	finalizeMessageID := ""
+	finalizeDisplayName := ""
+	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, job.ItemID)
 		if err != nil {
 			return err
@@ -353,11 +361,16 @@ func (h *HITLTimeoutHandler) Handle(ctx context.Context, job domain.JobRecord) e
 		expected := flow.Version
 		flow.State = domain.FlowStateDeleteQueued
 		flow.NextActionAt = now
+		flow.HITLOutcome = "delete"
 		flow.UpdatedAt = now
 		flow.Version = expected + 1
 		if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
 			return err
 		}
+
+		finalizeChannelID = flow.Discord.ChannelID
+		finalizeMessageID = flow.Discord.MessageID
+		finalizeDisplayName = flow.DisplayName
 
 		payload, err := json.Marshal(jobs.ExecuteDeletePayload{RequestedBy: "timeout"})
 		if err != nil {
@@ -377,6 +390,22 @@ func (h *HITLTimeoutHandler) Handle(ctx context.Context, job domain.JobRecord) e
 			UpdatedAt:      now,
 		})
 	})
+	if err != nil {
+		return err
+	}
+
+	if h.discord != nil && finalizeChannelID != "" && finalizeMessageID != "" {
+		name := strings.TrimSpace(finalizeDisplayName)
+		if name == "" {
+			name = strings.TrimSpace(job.ItemID)
+		}
+		content := fmt.Sprintf("Decision: DELETE for %s (timeout).", name)
+		if err := h.discord.FinalizeHITLPrompt(ctx, finalizeChannelID, finalizeMessageID, content); err != nil {
+			h.logger.Warn("failed to finalize timeout HITL message", "item_id", job.ItemID, "error", err)
+		}
+	}
+
+	return nil
 }
 
 func upsertScheduledEvaluateJob(ctx context.Context, tx repo.TxRepository, flow domain.Flow, now time.Time, runAt time.Time, payload []byte) error {
