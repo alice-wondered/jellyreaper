@@ -11,6 +11,7 @@ import (
 
 	bbolt "go.etcd.io/bbolt"
 
+	"jellyreaper/internal/app"
 	"jellyreaper/internal/domain"
 	"jellyreaper/internal/repo"
 	bboltrepo "jellyreaper/internal/repo/bbolt"
@@ -30,11 +31,16 @@ func newTestStore(t *testing.T) *bboltrepo.Store {
 func seedFlow(t *testing.T, store *bboltrepo.Store, itemID string, title string, state domain.FlowState) {
 	t.Helper()
 	now := time.Date(2026, 4, 8, 10, 0, 0, 0, time.UTC)
+	subjectType := "movie"
+	parts := strings.SplitN(itemID, ":", 3)
+	if len(parts) == 3 && parts[0] == "target" && strings.TrimSpace(parts[1]) != "" {
+		subjectType = strings.TrimSpace(parts[1])
+	}
 	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
 		flow := domain.Flow{
 			FlowID:         "flow:" + itemID,
 			ItemID:         itemID,
-			SubjectType:    "movie",
+			SubjectType:    subjectType,
 			DisplayName:    title,
 			State:          state,
 			Version:        0,
@@ -49,6 +55,25 @@ func seedFlow(t *testing.T, store *bboltrepo.Store, itemID string, title string,
 	})
 	if err != nil {
 		t.Fatalf("seed flow: %v", err)
+	}
+}
+
+func seedMedia(t *testing.T, store *bboltrepo.Store, itemID string, seasonID string, seriesID string, seriesName string) {
+	t.Helper()
+	now := time.Date(2026, 4, 8, 10, 0, 0, 0, time.UTC)
+	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID:     itemID,
+			ItemType:   "Episode",
+			SeasonID:   seasonID,
+			SeriesID:   seriesID,
+			SeriesName: seriesName,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		})
+	})
+	if err != nil {
+		t.Fatalf("seed media: %v", err)
 	}
 }
 
@@ -156,6 +181,86 @@ func TestArchiveConfirmFlow_NoCancels(t *testing.T) {
 	}
 }
 
+func TestScheduleDelete_ConfirmQueuesDeleteJob(t *testing.T) {
+	store := newTestStore(t)
+	seedFlow(t, store, "m-9", "Interstellar", domain.FlowStateActive)
+
+	h := NewHarness(store, "", "")
+	h.SetDecisionService(app.NewService(store, nil, nil))
+	threadID := "thread-delete"
+
+	out, _, err := h.setDeleteState(context.Background(), threadID, "interstellar")
+	if err != nil {
+		t.Fatalf("set delete state: %v", err)
+	}
+	if !strings.Contains(out, "\"status\":\"needs_confirmation\"") {
+		t.Fatalf("expected confirmation payload, got: %s", out)
+	}
+
+	out, _, err = h.handleFollowUp(context.Background(), threadID, "yes")
+	if err != nil {
+		t.Fatalf("confirm schedule delete: %v", err)
+	}
+	if !strings.Contains(out, "\"status\":\"done\"") || !strings.Contains(out, "scheduled_delete") {
+		t.Fatalf("expected done scheduled delete payload, got: %s", out)
+	}
+
+	flow := mustGetFlow(t, store, "m-9")
+	if flow.State != domain.FlowStateDeleteQueued {
+		t.Fatalf("expected delete_queued state, got %s", flow.State)
+	}
+
+	jobs, err := store.LeaseDueJobs(context.Background(), time.Now().UTC().Add(time.Hour), 10, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease jobs: %v", err)
+	}
+	foundDelete := false
+	for _, job := range jobs {
+		if job.ItemID == "m-9" && job.Kind == domain.JobKindExecuteDelete {
+			foundDelete = true
+			break
+		}
+	}
+	if !foundDelete {
+		t.Fatal("expected execute_delete job to be queued")
+	}
+}
+
+func TestScheduleDelete_NoCancelsWithoutQueueing(t *testing.T) {
+	store := newTestStore(t)
+	seedFlow(t, store, "target:season:season-77", "Season 77", domain.FlowStateActive)
+
+	h := NewHarness(store, "", "")
+	h.SetDecisionService(app.NewService(store, nil, nil))
+	threadID := "thread-delete-cancel"
+
+	out, _, err := h.setDeleteState(context.Background(), threadID, "season 77")
+	if err != nil {
+		t.Fatalf("set delete state: %v", err)
+	}
+	if !strings.Contains(out, "\"status\":\"needs_confirmation\"") {
+		t.Fatalf("expected confirmation payload, got: %s", out)
+	}
+
+	out, _, err = h.handleFollowUp(context.Background(), threadID, "no")
+	if err != nil {
+		t.Fatalf("cancel delete: %v", err)
+	}
+	if !strings.Contains(out, "\"status\":\"cancelled\"") {
+		t.Fatalf("expected cancelled status, got: %s", out)
+	}
+
+	jobs, err := store.LeaseDueJobs(context.Background(), time.Now().UTC().Add(time.Hour), 10, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease jobs: %v", err)
+	}
+	for _, job := range jobs {
+		if job.Kind == domain.JobKindExecuteDelete {
+			t.Fatalf("expected no execute_delete job after cancellation, got %#v", job)
+		}
+	}
+}
+
 func TestHistoryRingBufferKeepsRecentWindow(t *testing.T) {
 	store := newTestStore(t)
 	h := NewHarness(store, "", "")
@@ -228,6 +333,29 @@ func TestThreadContextCapEvictsLeastRecentlyUsed(t *testing.T) {
 	}
 }
 
+func TestSerializeThreadContextUsesHumanReadableState(t *testing.T) {
+	store := newTestStore(t)
+	seedFlow(t, store, "target:season:s-human", "Season Human", domain.FlowStateActive)
+
+	h := NewHarness(store, "", "")
+	state := threadState{
+		SelectedTargetID: "target:season:s-human",
+		PendingAction:    "schedule_delete",
+		CandidateIDs:     []string{"target:season:s-human"},
+		AliasToItemID:    map[string]string{"this season": "target:season:s-human"},
+	}
+	ctx := h.serializeThreadContext(context.Background(), state)
+	if !strings.Contains(ctx, "pending_action=schedule_delete") {
+		t.Fatalf("expected pending action in context, got: %s", ctx)
+	}
+	if !strings.Contains(ctx, "selected_target=Season Human") {
+		t.Fatalf("expected human title in selected target, got: %s", ctx)
+	}
+	if strings.Contains(ctx, "target:season:s-human") {
+		t.Fatalf("did not expect internal target id in serialized context: %s", ctx)
+	}
+}
+
 func TestAliasMemorySupportsTitleLabelFollowUp(t *testing.T) {
 	store := newTestStore(t)
 	seedFlow(t, store, "m-21", "Dune", domain.FlowStateActive)
@@ -279,5 +407,68 @@ func TestRememberAliasToolStoresCustomPhrase(t *testing.T) {
 	resolved := h.resolveAlias(threadID, "neo movie")
 	if resolved != "m-41" {
 		t.Fatalf("expected alias to resolve to m-41, got %s", resolved)
+	}
+}
+
+func TestScheduleDeleteProjection_UsesProjectionSelectionFlow(t *testing.T) {
+	store := newTestStore(t)
+	seedFlow(t, store, "target:season:s-1", "Season 1 of The Office", domain.FlowStateActive)
+	seedFlow(t, store, "target:season:s-2", "Season 2 of The Office", domain.FlowStateActive)
+	seedMedia(t, store, "ep-1", "s-1", "series-1", "The Office")
+	seedMedia(t, store, "ep-2", "s-2", "series-1", "The Office")
+
+	h := NewHarness(store, "", "")
+	h.SetDecisionService(app.NewService(store, nil, nil))
+	threadID := "thread-series-delete"
+
+	out, _, err := h.setDeleteState(context.Background(), threadID, "the office")
+	if err != nil {
+		t.Fatalf("set delete projection: %v", err)
+	}
+	if !strings.Contains(out, "\"status\":\"needs_selection\"") {
+		t.Fatalf("expected selection status, got: %s", out)
+	}
+
+	out, _, err = h.handleFollowUp(context.Background(), threadID, "1")
+	if err != nil {
+		t.Fatalf("select projection candidate: %v", err)
+	}
+	if !strings.Contains(out, "\"status\":\"needs_confirmation\"") {
+		t.Fatalf("expected confirmation after selection, got: %s", out)
+	}
+
+	out, _, err = h.handleFollowUp(context.Background(), threadID, "yes")
+	if err != nil {
+		t.Fatalf("confirm delete projection: %v", err)
+	}
+	if !strings.Contains(out, "scheduled_delete") {
+		t.Fatalf("expected scheduled delete output, got: %s", out)
+	}
+
+	flow1 := mustGetFlow(t, store, "target:season:s-1")
+	flow2 := mustGetFlow(t, store, "target:season:s-2")
+	if flow1.State != domain.FlowStateDeleteQueued {
+		t.Fatalf("expected selected season flow delete_queued, got %s", flow1.State)
+	}
+	if flow2.State != domain.FlowStateActive {
+		t.Fatalf("expected non-selected season flow unchanged, got %s", flow2.State)
+	}
+}
+
+func TestFuzzySearchTargets_FiltersBySubjectType(t *testing.T) {
+	store := newTestStore(t)
+	seedFlow(t, store, "target:movie:m-1", "Dune", domain.FlowStateActive)
+	seedFlow(t, store, "target:season:s-9", "Season 1 of Dune Series", domain.FlowStateActive)
+
+	h := NewHarness(store, "", "")
+	out, _, err := h.fuzzySearchTargets(context.Background(), "dune", "movie", 10)
+	if err != nil {
+		t.Fatalf("fuzzy search targets: %v", err)
+	}
+	if !strings.Contains(out, "\"count\":1") {
+		t.Fatalf("expected one movie result, got: %s", out)
+	}
+	if !strings.Contains(out, "\"item_id\":\"target:movie:m-1\"") {
+		t.Fatalf("expected movie target in search results, got: %s", out)
 	}
 }

@@ -92,8 +92,9 @@ func main() {
 	}
 	discordService.SetEmbedPersistenceDir(cfg.EmbedDir)
 	discordService.SetJellyfinImageSource(cfg.JellyfinURL, cfg.JellyfinAPIKey)
+	var assistant *ai.Harness
 	if strings.TrimSpace(cfg.OpenAIAPIKey) != "" {
-		assistant := ai.NewHarness(store, cfg.OpenAIAPIKey, cfg.OpenAIModel)
+		assistant = ai.NewHarness(store, cfg.OpenAIAPIKey, cfg.OpenAIModel)
 		assistant.SetHistoryRestorer(func(ctx context.Context, threadID string, limit int) ([]string, error) {
 			return discordService.LoadThreadHistory(ctx, threadID, limit)
 		})
@@ -135,6 +136,10 @@ func main() {
 		}
 	}
 	appService := app.NewService(store, logger, wake)
+	appService.SetDiscordService(discordService)
+	if assistant != nil {
+		assistant.SetDecisionService(appService)
+	}
 	appService.SetBackfillWriteBatching(cfg.BackfillWriteBatchSize, cfg.BackfillWriteBatchTimeout, cfg.BackfillWriteQueueCapacity)
 	dispatcher := worker.NewDispatcher(store, registry, logger)
 	schedulerLoop := scheduler.NewLoop(store, dispatcher.Dispatch, logger, scheduler.Config{
@@ -163,19 +168,6 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	go func() {
-		logger.Info("scheduler started")
-		if err := schedulerLoop.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			logger.Error("scheduler stopped with error", "error", err)
-		}
-	}()
-
-	if cfg.DiscordChannelID != "" {
-		if err := discordService.SendSystemMessage(cfg.DiscordChannelID, "JellyReaper is online and ready."); err != nil {
-			logger.Warn("failed to send online announcement", "error", err)
-		}
-	}
-
 	if cfg.BackfillEnabled {
 		if cfg.JellyfinURL == "" || cfg.JellyfinAPIKey == "" {
 			logger.Warn("backfill enabled but jellyfin credentials are incomplete; skipping backfill startup")
@@ -199,8 +191,29 @@ func main() {
 						"since", progress.Since,
 					)
 				})
-				go runBackfillLoop(ctx, logger, store, appService, discordService, cfg, backfillSvc)
+
+				logger.Info("running startup backfill before scheduler/http")
+				if err := runBackfillOnce(ctx, logger, store, appService, discordService, cfg, backfillSvc, true); err != nil {
+					logger.Warn("startup backfill run failed", "error", err)
+				} else {
+					logNextQueuedJob(ctx, logger, store)
+				}
+
+				go runBackfillLoop(ctx, logger, store, appService, discordService, cfg, backfillSvc, false)
 			}
+		}
+	}
+
+	go func() {
+		logger.Info("scheduler started")
+		if err := schedulerLoop.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Error("scheduler stopped with error", "error", err)
+		}
+	}()
+
+	if cfg.DiscordChannelID != "" {
+		if err := discordService.SendSystemMessage(cfg.DiscordChannelID, "JellyReaper is online and ready."); err != nil {
+			logger.Warn("failed to send online announcement", "error", err)
 		}
 	}
 
@@ -222,45 +235,20 @@ func main() {
 	logger.Info("shutdown complete")
 }
 
-func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.Repository, appService *app.Service, discordService *discord.Service, cfg config.Config, backfillSvc *jellyfin.BackfillService) {
+func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.Repository, appService *app.Service, discordService *discord.Service, cfg config.Config, backfillSvc *jellyfin.BackfillService, runStartup bool) {
 	if cfg.DiscordChannelID != "" {
 		if err := discordService.SendSystemMessage(cfg.DiscordChannelID, "Starting Jellyfin backfill and reconciliation run."); err != nil {
 			logger.Warn("failed to send backfill start announcement", "error", err)
 		}
 	}
 
-	run := func(isStartup bool) {
-		attempt := 0
-		for {
-			err := runBackfillOnce(ctx, logger, repository, appService, discordService, cfg, backfillSvc, isStartup)
-			if err == nil {
-				if attempt > 0 {
-					logger.Info("backfill recovered after retries", "failed_attempts", attempt)
-				}
-				return
-			}
-			if ctx.Err() != nil {
-				return
-			}
-
-			delay := retryBackoffDelay(attempt, backfillRetryBaseDelay, backfillRetryMaxDelay)
-			attempt++
-			logger.Warn("backfill run failed; retrying",
-				"error", err,
-				"attempt", attempt,
-				"retry_in", delay,
-			)
-
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(delay):
-			}
+	if runStartup {
+		if err := runBackfillOnce(ctx, logger, repository, appService, discordService, cfg, backfillSvc, true); err != nil {
+			logger.Warn("startup backfill run failed", "error", err)
+		} else {
+			logNextQueuedJob(ctx, logger, repository)
 		}
 	}
-
-	run(true)
-	logNextQueuedJob(ctx, logger, repository)
 
 	ticker := time.NewTicker(cfg.BackfillInterval)
 	defer ticker.Stop()
@@ -269,7 +257,9 @@ func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.R
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			run(false)
+			if err := runBackfillOnce(ctx, logger, repository, appService, discordService, cfg, backfillSvc, false); err != nil {
+				logger.Warn("periodic backfill run failed", "error", err)
+			}
 		}
 	}
 }

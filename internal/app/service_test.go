@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -115,6 +116,182 @@ func TestHITLDeleteQueuesImmediateDeleteJob(t *testing.T) {
 	}
 	if jobs[0].Kind != domain.JobKindExecuteDelete {
 		t.Fatalf("unexpected job kind: %s", jobs[0].Kind)
+	}
+}
+
+func TestApplyAIDecisionDeleteQueuesImmediateDeleteJob(t *testing.T) {
+	store := newTestStore(t)
+	var wokeAt time.Time
+	wakeCount := 0
+	svc := NewService(store, nil, func(at time.Time) {
+		wakeCount++
+		wokeAt = at
+	})
+	now := time.Date(2026, 4, 7, 13, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	itemID := "target:item:item-ai-delete"
+	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:" + itemID,
+			ItemID:      itemID,
+			SubjectType: "item",
+			DisplayName: "AI Delete Target",
+			State:       domain.FlowStateActive,
+			Version:     0,
+			PolicySnapshot: domain.PolicySnapshot{
+				ExpireAfterDays: 30,
+				HITLTimeoutHrs:  48,
+				TimeoutAction:   "delete",
+			},
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0)
+	})
+	if err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	if err := svc.ApplyAIDecision(context.Background(), itemID, "delete"); err != nil {
+		t.Fatalf("apply ai decision: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, itemID)
+	if flow.State != domain.FlowStateDeleteQueued {
+		t.Fatalf("unexpected flow state: %s", flow.State)
+	}
+
+	jobs, err := store.LeaseDueJobs(context.Background(), now, 10, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease jobs: %v", err)
+	}
+	found := false
+	for _, job := range jobs {
+		if job.ItemID == itemID && job.Kind == domain.JobKindExecuteDelete {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected execute_delete job from ai decision")
+	}
+	if wakeCount != 1 {
+		t.Fatalf("expected one scheduler wake, got %d", wakeCount)
+	}
+	if !wokeAt.Equal(now) {
+		t.Fatalf("expected wake at now, got %s want %s", wokeAt, now)
+	}
+}
+
+func TestApplyAIDecisionFinalizesOpenHITLPrompt(t *testing.T) {
+	store := newTestStore(t)
+	discordSvc, err := discord.NewService("", nil)
+	if err != nil {
+		t.Fatalf("new discord service: %v", err)
+	}
+
+	svc := NewService(store, nil, nil)
+	svc.SetDiscordService(discordSvc)
+	now := time.Date(2026, 4, 7, 13, 30, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	itemID := "target:item:item-ai-archive"
+	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:" + itemID,
+			ItemID:      itemID,
+			SubjectType: "item",
+			DisplayName: "AI Archive Target",
+			State:       domain.FlowStatePendingReview,
+			Version:     0,
+			PolicySnapshot: domain.PolicySnapshot{
+				ExpireAfterDays: 30,
+				HITLTimeoutHrs:  48,
+				TimeoutAction:   "delete",
+			},
+			Discord:   domain.DiscordContext{ChannelID: "chan-1", MessageID: "msg-1"},
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0)
+	})
+	if err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	finalized := false
+	discordSvc.SetEditPromptHookForTest(func(ctx context.Context, channelID, messageID, content string) error {
+		if channelID != "chan-1" || messageID != "msg-1" {
+			t.Fatalf("unexpected finalize target: %s/%s", channelID, messageID)
+		}
+		if !strings.Contains(content, "Decision: ARCHIVE for AI Archive Target (AI).") {
+			t.Fatalf("unexpected finalize content: %s", content)
+		}
+		finalized = true
+		return nil
+	})
+
+	if err := svc.ApplyAIDecision(context.Background(), itemID, "archive"); err != nil {
+		t.Fatalf("apply ai decision: %v", err)
+	}
+	if !finalized {
+		t.Fatal("expected open HITL prompt to be finalized")
+	}
+	flow := mustGetFlow(t, store, itemID)
+	if flow.State != domain.FlowStateArchived {
+		t.Fatalf("expected archived state, got %s", flow.State)
+	}
+}
+
+func TestApplyAIDecisionUnarchiveEnqueuesEvaluateNow(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 7, 14, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	itemID := "target:item:item-ai-unarchive"
+	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:" + itemID,
+			ItemID:      itemID,
+			SubjectType: "item",
+			DisplayName: "AI Unarchive Target",
+			State:       domain.FlowStateArchived,
+			Version:     0,
+			PolicySnapshot: domain.PolicySnapshot{
+				ExpireAfterDays: 30,
+				HITLTimeoutHrs:  48,
+				TimeoutAction:   "delete",
+			},
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0)
+	})
+	if err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	if err := svc.ApplyAIDecision(context.Background(), itemID, "unarchive"); err != nil {
+		t.Fatalf("apply ai decision: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, itemID)
+	if flow.State != domain.FlowStateActive {
+		t.Fatalf("expected active state, got %s", flow.State)
+	}
+
+	jobs, err := store.LeaseDueJobs(context.Background(), now, 10, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease jobs: %v", err)
+	}
+	foundEval := false
+	for _, job := range jobs {
+		if job.ItemID == itemID && job.Kind == domain.JobKindEvaluatePolicy {
+			foundEval = true
+			break
+		}
+	}
+	if !foundEval {
+		t.Fatal("expected evaluate_policy job to be queued after unarchive")
 	}
 }
 

@@ -351,7 +351,19 @@ func TestExecuteDeleteHandlerDeletesChildrenForSeriesTarget(t *testing.T) {
 		}, 0); err != nil {
 			return err
 		}
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-1", SeriesID: "series-1", UpdatedAt: now}); err != nil {
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-1", SeriesID: "series-1", SeasonID: "season-1", UpdatedAt: now}); err != nil {
+			return err
+		}
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:season:season-1",
+			ItemID:      "target:season:season-1",
+			SubjectType: "season",
+			DisplayName: "Season 1",
+			State:       domain.FlowStateActive,
+			Version:     0,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0); err != nil {
 			return err
 		}
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
@@ -366,7 +378,19 @@ func TestExecuteDeleteHandlerDeletesChildrenForSeriesTarget(t *testing.T) {
 		}, 0); err != nil {
 			return err
 		}
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-2", SeriesID: "series-1", UpdatedAt: now})
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-2", SeriesID: "series-1", SeasonID: "season-1", UpdatedAt: now}); err != nil {
+			return err
+		}
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:item:ep-2",
+			ItemID:      "target:item:ep-2",
+			SubjectType: "item",
+			DisplayName: "Episode 2",
+			State:       domain.FlowStateActive,
+			Version:     0,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0)
 	}); err != nil {
 		t.Fatalf("seed aggregate flow/media: %v", err)
 	}
@@ -406,9 +430,168 @@ func TestExecuteDeleteHandlerDeletesChildrenForSeriesTarget(t *testing.T) {
 		if found {
 			t.Fatal("expected child item flow deleted")
 		}
+
+		_, found, err = tx.GetFlow(context.Background(), "target:item:ep-2")
+		if err != nil {
+			return err
+		}
+		if found {
+			t.Fatal("expected second child item flow deleted")
+		}
+
+		_, found, err = tx.GetFlow(context.Background(), "target:season:season-1")
+		if err != nil {
+			return err
+		}
+		if found {
+			t.Fatal("expected season projection flow deleted for series delete")
+		}
 		return nil
 	}); err != nil {
 		t.Fatalf("verify post-delete state: %v", err)
+	}
+}
+
+func TestExecuteDeleteHandlerDeletesChildrenForSeasonTarget(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:season:season-9",
+			ItemID:      "target:season:season-9",
+			SubjectType: "season",
+			State:       domain.FlowStateDeleteQueued,
+			Version:     0,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0); err != nil {
+			return err
+		}
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "s9e1", SeasonID: "season-9", UpdatedAt: now}); err != nil {
+			return err
+		}
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "s9e2", SeasonID: "season-9", UpdatedAt: now}); err != nil {
+			return err
+		}
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{FlowID: "flow:target:item:s9e1", ItemID: "target:item:s9e1", SubjectType: "item", State: domain.FlowStateActive, Version: 0, CreatedAt: now, UpdatedAt: now}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{FlowID: "flow:target:item:s9e2", ItemID: "target:item:s9e2", SubjectType: "item", State: domain.FlowStateActive, Version: 0, CreatedAt: now, UpdatedAt: now}, 0)
+	}); err != nil {
+		t.Fatalf("seed season aggregate: %v", err)
+	}
+
+	deleteCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && (r.URL.Path == "/Items/s9e1" || r.URL.Path == "/Items/s9e2") {
+			deleteCount++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	h := NewExecuteDeleteHandler(store, jellyfin.NewClient(server.URL, "api-key", server.Client()))
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-season", ItemID: "target:season:season-9", IdempotencyKey: "dedupe:season"}); err != nil {
+		t.Fatalf("execute season delete: %v", err)
+	}
+	if deleteCount != 2 {
+		t.Fatalf("expected 2 episode deletes, got %d", deleteCount)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		_, found, err := tx.GetFlow(context.Background(), "target:season:season-9")
+		if err != nil {
+			return err
+		}
+		if found {
+			t.Fatal("expected season flow deleted")
+		}
+		_, found, err = tx.GetFlow(context.Background(), "target:item:s9e1")
+		if err != nil {
+			return err
+		}
+		if found {
+			t.Fatal("expected episode flow s9e1 deleted")
+		}
+		_, found, err = tx.GetFlow(context.Background(), "target:item:s9e2")
+		if err != nil {
+			return err
+		}
+		if found {
+			t.Fatal("expected episode flow s9e2 deleted")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify season post-delete state: %v", err)
+	}
+}
+
+func TestExecuteDeleteHandlerDeletesMovieProjectionAndSiblingFlows(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{FlowID: "flow:target:movie:mv-1", ItemID: "target:movie:mv-1", SubjectType: "movie", State: domain.FlowStateDeleteQueued, Version: 0, CreatedAt: now, UpdatedAt: now}, 0); err != nil {
+			return err
+		}
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "mv-1", ItemType: "Movie", UpdatedAt: now}); err != nil {
+			return err
+		}
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{FlowID: "flow:target:item:mv-1", ItemID: "target:item:mv-1", SubjectType: "item", State: domain.FlowStateActive, Version: 0, CreatedAt: now, UpdatedAt: now}, 0); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed movie target: %v", err)
+	}
+
+	deleteCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && r.URL.Path == "/Items/mv-1" {
+			deleteCalled = true
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	h := NewExecuteDeleteHandler(store, jellyfin.NewClient(server.URL, "api-key", server.Client()))
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-movie", ItemID: "target:movie:mv-1", IdempotencyKey: "dedupe:movie"}); err != nil {
+		t.Fatalf("execute movie delete: %v", err)
+	}
+	if !deleteCalled {
+		t.Fatal("expected jellyfin movie delete call")
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		_, found, err := tx.GetFlow(context.Background(), "target:movie:mv-1")
+		if err != nil {
+			return err
+		}
+		if found {
+			t.Fatal("expected movie projection flow deleted")
+		}
+		_, found, err = tx.GetFlow(context.Background(), "target:item:mv-1")
+		if err != nil {
+			return err
+		}
+		if found {
+			t.Fatal("expected sibling item flow deleted")
+		}
+		_, found, err = tx.GetMedia(context.Background(), "mv-1")
+		if err != nil {
+			return err
+		}
+		if found {
+			t.Fatal("expected movie media deleted")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify movie post-delete state: %v", err)
 	}
 }
 

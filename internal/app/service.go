@@ -42,6 +42,7 @@ type targetRef struct {
 type Service struct {
 	repository            repo.Repository
 	logger                *slog.Logger
+	discord               *discord.Service
 	wake                  func(time.Time)
 	now                   func() time.Time
 	backfillBatchSize     int
@@ -77,6 +78,10 @@ func (s *Service) SetBackfillWriteBatching(size int, timeout time.Duration, queu
 	if queueCapacity > 0 {
 		s.backfillQueueCapacity = queueCapacity
 	}
+}
+
+func (s *Service) SetDiscordService(discordSvc *discord.Service) {
+	s.discord = discordSvc
 }
 
 func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.WebhookEvent) error {
@@ -534,6 +539,94 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 		"item_id", parsed.ItemID,
 	)
 	return interactionDecisionUpdateResponse(parsed.Action, decisionDisplayName), nil
+}
+
+func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action string) error {
+	itemID = strings.TrimSpace(itemID)
+	action = strings.TrimSpace(strings.ToLower(action))
+	if itemID == "" {
+		return fmt.Errorf("item id is required")
+	}
+	if action == "" {
+		return fmt.Errorf("action is required")
+	}
+
+	now := s.now().UTC()
+	finalizeChannelID := ""
+	finalizeMessageID := ""
+	finalizeDisplayName := ""
+	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(ctx, itemID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("flow not found for item %s", itemID)
+		}
+
+		expectedVersion := flow.Version
+		flow.UpdatedAt = now
+		flow.HITLOutcome = action
+		finalizeChannelID = flow.Discord.ChannelID
+		finalizeMessageID = flow.Discord.MessageID
+		finalizeDisplayName = strings.TrimSpace(flow.DisplayName)
+
+		switch action {
+		case "archive":
+			flow.State = domain.FlowStateArchived
+			flow.NextActionAt = time.Time{}
+			flow.DecisionDeadlineAt = time.Time{}
+		case "unarchive":
+			flow.State = domain.FlowStateActive
+			flow.DecisionDeadlineAt = time.Time{}
+			if err := enqueueEvaluatePolicy(ctx, tx, flow, now, "ai_unarchive", now); err != nil {
+				return err
+			}
+		case "delete":
+			flow.State = domain.FlowStateDeleteQueued
+			flow.NextActionAt = now
+			flow.DecisionDeadlineAt = time.Time{}
+			if err := enqueueExecuteDelete(ctx, tx, flow, now); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unsupported ai action %q", action)
+		}
+
+		flow.Version = expectedVersion + 1
+		if err := tx.UpsertFlowCAS(ctx, flow, expectedVersion); err != nil {
+			return err
+		}
+
+		event := domain.Event{
+			EventID:        "evt:ai:" + shortHash(itemID+":"+action+":"+strconv.FormatInt(now.UnixNano(), 10)),
+			FlowID:         flow.FlowID,
+			ItemID:         flow.ItemID,
+			Type:           "ai.decision." + action,
+			Source:         "ai",
+			OccurredAt:     now,
+			IdempotencyKey: "ai:" + action + ":" + itemID + ":" + strconv.FormatInt(expectedVersion+1, 10),
+			Payload: map[string]any{
+				"action": action,
+			},
+		}
+		return tx.AppendEvent(ctx, event)
+	})
+	if err != nil {
+		return err
+	}
+	if s.discord != nil && finalizeChannelID != "" && finalizeMessageID != "" {
+		display := finalizeDisplayName
+		if display == "" {
+			display = "item"
+		}
+		content := fmt.Sprintf("Decision: %s for %s (AI).", strings.ToUpper(action), display)
+		if err := s.discord.FinalizeHITLPrompt(ctx, finalizeChannelID, finalizeMessageID, content); err != nil {
+			s.logger.Warn("failed to finalize ai decision HITL message", "item_id", itemID, "error", err)
+		}
+	}
+	s.wake(now)
+	return nil
 }
 
 func (s *Service) IngestBackfillPlayback(ctx context.Context, events []jellyfin.PlaybackEvent) error {
