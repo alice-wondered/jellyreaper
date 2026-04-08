@@ -118,6 +118,59 @@ func TestHITLDeleteQueuesImmediateDeleteJob(t *testing.T) {
 	}
 }
 
+func TestApplyAIDecisionDeleteQueuesImmediateDeleteJob(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 7, 13, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	itemID := "target:item:item-ai-delete"
+	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:" + itemID,
+			ItemID:      itemID,
+			SubjectType: "item",
+			DisplayName: "AI Delete Target",
+			State:       domain.FlowStateActive,
+			Version:     0,
+			PolicySnapshot: domain.PolicySnapshot{
+				ExpireAfterDays: 30,
+				HITLTimeoutHrs:  48,
+				TimeoutAction:   "delete",
+			},
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0)
+	})
+	if err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	if err := svc.ApplyAIDecision(context.Background(), itemID, "delete"); err != nil {
+		t.Fatalf("apply ai decision: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, itemID)
+	if flow.State != domain.FlowStateDeleteQueued {
+		t.Fatalf("unexpected flow state: %s", flow.State)
+	}
+
+	jobs, err := store.LeaseDueJobs(context.Background(), now, 10, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease jobs: %v", err)
+	}
+	found := false
+	for _, job := range jobs {
+		if job.ItemID == itemID && job.Kind == domain.JobKindExecuteDelete {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected execute_delete job from ai decision")
+	}
+}
+
 func TestHITLDelaySchedulesFutureEvaluation(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)

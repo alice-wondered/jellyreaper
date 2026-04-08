@@ -11,6 +11,7 @@ import (
 
 	bbolt "go.etcd.io/bbolt"
 
+	"jellyreaper/internal/app"
 	"jellyreaper/internal/domain"
 	"jellyreaper/internal/repo"
 	bboltrepo "jellyreaper/internal/repo/bbolt"
@@ -153,6 +154,51 @@ func TestArchiveConfirmFlow_NoCancels(t *testing.T) {
 	flow := mustGetFlow(t, store, "m-8")
 	if flow.State != domain.FlowStateActive {
 		t.Fatalf("expected active state after cancel, got %s", flow.State)
+	}
+}
+
+func TestScheduleDelete_ConfirmQueuesDeleteJob(t *testing.T) {
+	store := newTestStore(t)
+	seedFlow(t, store, "m-9", "Interstellar", domain.FlowStateActive)
+
+	h := NewHarness(store, "", "")
+	h.SetDecisionService(app.NewService(store, nil, nil))
+	threadID := "thread-delete"
+
+	out, _, err := h.setDeleteState(context.Background(), threadID, "interstellar")
+	if err != nil {
+		t.Fatalf("set delete state: %v", err)
+	}
+	if !strings.Contains(out, "\"status\":\"needs_confirmation\"") {
+		t.Fatalf("expected confirmation payload, got: %s", out)
+	}
+
+	out, _, err = h.handleFollowUp(context.Background(), threadID, "yes")
+	if err != nil {
+		t.Fatalf("confirm schedule delete: %v", err)
+	}
+	if !strings.Contains(out, "\"status\":\"done\"") || !strings.Contains(out, "scheduled_delete") {
+		t.Fatalf("expected done scheduled delete payload, got: %s", out)
+	}
+
+	flow := mustGetFlow(t, store, "m-9")
+	if flow.State != domain.FlowStateDeleteQueued {
+		t.Fatalf("expected delete_queued state, got %s", flow.State)
+	}
+
+	jobs, err := store.LeaseDueJobs(context.Background(), time.Now().UTC().Add(time.Hour), 10, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease jobs: %v", err)
+	}
+	foundDelete := false
+	for _, job := range jobs {
+		if job.ItemID == "m-9" && job.Kind == domain.JobKindExecuteDelete {
+			foundDelete = true
+			break
+		}
+	}
+	if !foundDelete {
+		t.Fatal("expected execute_delete job to be queued")
 	}
 }
 

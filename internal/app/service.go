@@ -536,6 +536,71 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 	return interactionDecisionUpdateResponse(parsed.Action, decisionDisplayName), nil
 }
 
+func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action string) error {
+	itemID = strings.TrimSpace(itemID)
+	action = strings.TrimSpace(strings.ToLower(action))
+	if itemID == "" {
+		return fmt.Errorf("item id is required")
+	}
+	if action == "" {
+		return fmt.Errorf("action is required")
+	}
+
+	now := s.now().UTC()
+	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(ctx, itemID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("flow not found for item %s", itemID)
+		}
+
+		expectedVersion := flow.Version
+		flow.UpdatedAt = now
+		flow.HITLOutcome = action
+
+		switch action {
+		case "archive":
+			flow.State = domain.FlowStateArchived
+		case "unarchive":
+			flow.State = domain.FlowStateActive
+		case "delete":
+			flow.State = domain.FlowStateDeleteQueued
+			flow.NextActionAt = now
+			if err := enqueueExecuteDelete(ctx, tx, flow, now); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unsupported ai action %q", action)
+		}
+
+		flow.Version = expectedVersion + 1
+		if err := tx.UpsertFlowCAS(ctx, flow, expectedVersion); err != nil {
+			return err
+		}
+
+		event := domain.Event{
+			EventID:        "evt:ai:" + shortHash(itemID+":"+action+":"+strconv.FormatInt(now.UnixNano(), 10)),
+			FlowID:         flow.FlowID,
+			ItemID:         flow.ItemID,
+			Type:           "ai.decision." + action,
+			Source:         "ai",
+			OccurredAt:     now,
+			IdempotencyKey: "ai:" + action + ":" + itemID + ":" + strconv.FormatInt(expectedVersion+1, 10),
+			Payload: map[string]any{
+				"action": action,
+			},
+		}
+		return tx.AppendEvent(ctx, event)
+	})
+	if err != nil {
+		return err
+	}
+	s.wake(now)
+	return nil
+}
+
 func (s *Service) IngestBackfillPlayback(ctx context.Context, events []jellyfin.PlaybackEvent) error {
 	return s.ingestBackfillPlaybackWithCursor(ctx, events, "", "")
 }

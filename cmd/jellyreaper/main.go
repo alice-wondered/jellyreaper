@@ -92,8 +92,9 @@ func main() {
 	}
 	discordService.SetEmbedPersistenceDir(cfg.EmbedDir)
 	discordService.SetJellyfinImageSource(cfg.JellyfinURL, cfg.JellyfinAPIKey)
+	var assistant *ai.Harness
 	if strings.TrimSpace(cfg.OpenAIAPIKey) != "" {
-		assistant := ai.NewHarness(store, cfg.OpenAIAPIKey, cfg.OpenAIModel)
+		assistant = ai.NewHarness(store, cfg.OpenAIAPIKey, cfg.OpenAIModel)
 		assistant.SetHistoryRestorer(func(ctx context.Context, threadID string, limit int) ([]string, error) {
 			return discordService.LoadThreadHistory(ctx, threadID, limit)
 		})
@@ -135,6 +136,9 @@ func main() {
 		}
 	}
 	appService := app.NewService(store, logger, wake)
+	if assistant != nil {
+		assistant.SetDecisionService(appService)
+	}
 	appService.SetBackfillWriteBatching(cfg.BackfillWriteBatchSize, cfg.BackfillWriteBatchTimeout, cfg.BackfillWriteQueueCapacity)
 	dispatcher := worker.NewDispatcher(store, registry, logger)
 	schedulerLoop := scheduler.NewLoop(store, dispatcher.Dispatch, logger, scheduler.Config{

@@ -31,6 +31,7 @@ type Harness struct {
 	repository repo.Repository
 	client     openai.Client
 	model      string
+	decision   DecisionService
 
 	mu              sync.Mutex
 	history         map[string]*ringBuffer
@@ -39,6 +40,10 @@ type Harness struct {
 	maxThreads      int
 	threadLRU       *list.List
 	threadIndex     map[string]*list.Element
+}
+
+type DecisionService interface {
+	ApplyAIDecision(context.Context, string, string) error
 }
 
 type ringBuffer struct {
@@ -112,6 +117,12 @@ func (h *Harness) SetHistoryRestorer(restorer func(context.Context, string, int)
 	h.historyRestorer = restorer
 }
 
+func (h *Harness) SetDecisionService(decision DecisionService) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.decision = decision
+}
+
 func (h *Harness) SetMaxThreadContexts(max int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -145,6 +156,7 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 		"Only handle requests related to this media server and its review/archive workflow.",
 		"Use tools to gather data and take actions.",
 		"Tool usage guide: list_ready for queue overviews; query_target_state to inspect one target; remember_alias to bind user phrases to a target; archive_target for archive/unarchive intents; choose_candidate when user provides a numbered option; confirm_pending for yes/no confirmations; set_review_days and set_defer_days for policy tuning.",
+		"Use schedule_delete_target when the user asks to schedule a title for deletion; keep follow-up confirmation semantics consistent.",
 		"Natural-language target resolution guide: prefer known aliases from thread memory first, then exact title, then partial title, and ask clarifying follow-up when ambiguous.",
 		"When multiple targets are possible, present concise choices and invite a short follow-up reply (for example: `title a`, `title b`, or a clearer title).",
 		"When you reply, use Discord markdown and keep it conversational and concise.",
@@ -168,6 +180,7 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 		{Function: shared.FunctionDefinitionParam{Name: "list_ready", Description: openai.String("List targets currently ready for review."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 20}}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "query_target_state", Description: openai.String("Inspect state for a target by title text, or current selection when query omitted."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "remember_alias", Description: openai.String("Store a natural-language alias for a specific target so future follow-ups can resolve quickly."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"alias": map[string]any{"type": "string"}, "target_ref": map[string]any{"type": "string"}}, "required": []string{"alias"}}}},
+		{Function: shared.FunctionDefinitionParam{Name: "schedule_delete_target", Description: openai.String("Start schedule-for-deletion flow for a target title."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "archive_target", Description: openai.String("Start archive or unarchive flow for a target title."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "archived": map[string]any{"type": "boolean"}}, "required": []string{"archived"}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "choose_candidate", Description: openai.String("Choose one of the numbered candidates from the last disambiguation list."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"number": map[string]any{"type": "integer", "minimum": 1}}, "required": []string{"number"}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "confirm_pending", Description: openai.String("Confirm or cancel the pending archive/unarchive action."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"confirmed": map[string]any{"type": "boolean"}}, "required": []string{"confirmed"}}}},
@@ -272,6 +285,8 @@ func (h *Harness) executeToolCall(ctx context.Context, threadID string, tc opena
 		return h.queryTargetState(ctx, threadID, asString(args["query"]))
 	case "remember_alias":
 		return h.rememberAlias(ctx, threadID, asString(args["alias"]), asString(args["target_ref"]))
+	case "schedule_delete_target":
+		return h.setDeleteState(ctx, threadID, asString(args["query"]))
 	case "archive_target":
 		archived := asBool(args["archived"], true)
 		return h.setArchiveState(ctx, threadID, asString(args["query"]), archived)
@@ -492,6 +507,74 @@ func (h *Harness) setArchiveState(ctx context.Context, threadID string, query st
 	return marshalToolResult(map[string]any{"status": "needs_confirmation", "action": state.PendingAction, "target": h.flowToolPayload(ctx, flow)}), "", nil
 }
 
+func (h *Harness) setDeleteState(ctx context.Context, threadID string, query string) (string, string, error) {
+	query = strings.TrimSpace(strings.ToLower(query))
+	if query != "" {
+		if remembered := h.resolveAlias(threadID, query); remembered != "" {
+			state := h.getThreadState(threadID)
+			state.SelectedTargetID = remembered
+			h.setThreadState(threadID, state)
+			query = ""
+		}
+	}
+	if query == "" {
+		selected := h.getThreadState(threadID).SelectedTargetID
+		if selected == "" {
+			return "", "", fmt.Errorf("provide a title")
+		}
+		state := h.getThreadState(threadID)
+		state.PendingAction = "schedule_delete"
+		h.setThreadState(threadID, state)
+		flow, ok, _ := h.getFlowByID(ctx, selected)
+		payload := map[string]any{"status": "needs_confirmation", "action": state.PendingAction}
+		if ok {
+			payload["target"] = h.flowToolPayload(ctx, flow)
+		}
+		return marshalToolResult(payload), "", nil
+	}
+
+	matches, err := h.findFlowMatches(ctx, query)
+	if err != nil {
+		return "", "", err
+	}
+	if len(matches) == 0 {
+		return marshalToolResult(map[string]any{"status": "not_found"}), "", nil
+	}
+	if len(matches) > 1 {
+		state := h.getThreadState(threadID)
+		state.CandidateIDs = make([]string, 0, len(matches))
+		state.PendingAction = "schedule_delete"
+		for _, m := range matches {
+			state.CandidateIDs = append(state.CandidateIDs, m.ItemID)
+			h.rememberFlowAlias(&state, m, "")
+		}
+		h.rememberCandidateLabels(&state, matches)
+		h.setThreadState(threadID, state)
+
+		limit := len(matches)
+		if limit > 5 {
+			limit = 5
+		}
+		options := make([]map[string]any, 0, limit)
+		for i := 0; i < limit; i++ {
+			option := h.flowToolPayload(ctx, matches[i])
+			option["choice"] = i + 1
+			options = append(options, option)
+		}
+		return marshalToolResult(map[string]any{"status": "needs_selection", "options": options}), "", nil
+	}
+
+	flow := matches[0]
+	state := h.getThreadState(threadID)
+	state.SelectedTargetID = flow.ItemID
+	h.rememberFlowAlias(&state, flow, "")
+	state.PendingAction = "schedule_delete"
+	state.CandidateIDs = nil
+	h.setThreadState(threadID, state)
+
+	return marshalToolResult(map[string]any{"status": "needs_confirmation", "action": state.PendingAction, "target": h.flowToolPayload(ctx, flow)}), "", nil
+}
+
 func (h *Harness) queryTargetState(ctx context.Context, threadID string, query string) (string, string, error) {
 	query = strings.TrimSpace(strings.ToLower(query))
 	if query != "" {
@@ -605,8 +688,20 @@ func (h *Harness) handleFollowUp(ctx context.Context, threadID string, input str
 			h.setThreadState(threadID, state)
 			return marshalToolResult(map[string]any{"status": "needs_selection"}), "", nil
 		}
-		archived := state.PendingAction == "archive"
-		out, err := h.applyArchiveToID(ctx, state.SelectedTargetID, archived)
+		var (
+			out string
+			err error
+		)
+		switch state.PendingAction {
+		case "archive":
+			out, err = h.applyArchiveToID(ctx, state.SelectedTargetID, true)
+		case "unarchive":
+			out, err = h.applyArchiveToID(ctx, state.SelectedTargetID, false)
+		case "schedule_delete":
+			out, err = h.applyScheduleDeleteToID(ctx, state.SelectedTargetID)
+		default:
+			err = fmt.Errorf("unsupported pending action %q", state.PendingAction)
+		}
 		state.PendingAction = ""
 		h.setThreadState(threadID, state)
 		if err != nil {
@@ -657,6 +752,29 @@ func (h *Harness) applyArchiveToID(ctx context.Context, itemID string, archived 
 		name = flow.DisplayName
 	}
 	return marshalToolResult(map[string]any{"status": "done", "action": verb, "title": name}), nil
+}
+
+func (h *Harness) applyScheduleDeleteToID(ctx context.Context, itemID string) (string, error) {
+	decision := h.getDecisionService()
+	if decision == nil {
+		return "", fmt.Errorf("decision service is not configured")
+	}
+	err := decision.ApplyAIDecision(ctx, itemID, "delete")
+	if err != nil {
+		return "", err
+	}
+	flow, ok, _ := h.getFlowByID(ctx, itemID)
+	name := "selected target"
+	if ok && strings.TrimSpace(flow.DisplayName) != "" {
+		name = flow.DisplayName
+	}
+	return marshalToolResult(map[string]any{"status": "done", "action": "scheduled_delete", "title": name}), nil
+}
+
+func (h *Harness) getDecisionService() DecisionService {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.decision
 }
 
 func (h *Harness) flowToolPayload(ctx context.Context, flow domain.Flow) map[string]any {
