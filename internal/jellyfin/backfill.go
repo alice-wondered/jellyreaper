@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -22,6 +24,8 @@ type BackfillClient interface {
 type BackfillService struct {
 	client       BackfillClient
 	baseURL      string
+	apiKey       string
+	httpClient   *http.Client
 	progressHook func(FetchProgress)
 }
 
@@ -95,7 +99,7 @@ func NewBackfillService(baseURL, apiKey string, httpClient *http.Client) (*Backf
 	if err != nil {
 		return nil, fmt.Errorf("create generated jellyfin client: %w", err)
 	}
-	return &BackfillService{client: client, baseURL: strings.TrimRight(baseURL, "/")}, nil
+	return &BackfillService{client: client, baseURL: strings.TrimRight(baseURL, "/"), apiKey: strings.TrimSpace(apiKey), httpClient: httpClient}, nil
 }
 
 func NewBackfillServiceWithClient(client BackfillClient) *BackfillService {
@@ -315,12 +319,145 @@ func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.
 		})
 	}
 
+	if enriched, err := s.enrichItemsWithAllUsersPlayback(ctx, out); err == nil {
+		out = enriched
+	}
+
 	return ItemPage{
 		Items:            out,
 		NextStartIndex:   startIndex + int32(len(*body.Items)),
 		HasMore:          int32(len(*body.Items)) >= pageSize,
 		TotalRecordCount: safeTotalCount(body.TotalRecordCount),
 	}, nil
+}
+
+type userSummary struct {
+	ID string `json:"Id"`
+}
+
+type usersItemsResponse struct {
+	Items []struct {
+		ID       string `json:"Id"`
+		UserData *struct {
+			LastPlayedDate *time.Time `json:"LastPlayedDate"`
+			PlayCount      *int32     `json:"PlayCount"`
+		} `json:"UserData"`
+	} `json:"Items"`
+}
+
+func (s *BackfillService) enrichItemsWithAllUsersPlayback(ctx context.Context, items []ItemSnapshot) ([]ItemSnapshot, error) {
+	if len(items) == 0 || s.httpClient == nil || strings.TrimSpace(s.baseURL) == "" || strings.TrimSpace(s.apiKey) == "" {
+		return items, nil
+	}
+
+	users, err := s.fetchUsers(ctx)
+	if err != nil || len(users) == 0 {
+		return items, err
+	}
+
+	ids := make([]string, 0, len(items))
+	indexByID := make(map[string]int, len(items))
+	for i := range items {
+		id := strings.TrimSpace(items[i].ItemID)
+		if id == "" {
+			continue
+		}
+		ids = append(ids, id)
+		indexByID[id] = i
+	}
+	if len(ids) == 0 {
+		return items, nil
+	}
+
+	lastPlayed := map[string]time.Time{}
+	playCount := map[string]int32{}
+	for _, user := range users {
+		userItems, err := s.fetchUserItemsPlayback(ctx, user.ID, ids)
+		if err != nil {
+			continue
+		}
+		for _, it := range userItems.Items {
+			id := strings.TrimSpace(it.ID)
+			if id == "" || it.UserData == nil {
+				continue
+			}
+			if it.UserData.LastPlayedDate != nil {
+				ts := it.UserData.LastPlayedDate.UTC()
+				if ts.After(lastPlayed[id]) {
+					lastPlayed[id] = ts
+				}
+			}
+			if it.UserData.PlayCount != nil && *it.UserData.PlayCount > playCount[id] {
+				playCount[id] = *it.UserData.PlayCount
+			}
+		}
+	}
+
+	for id, idx := range indexByID {
+		if ts, ok := lastPlayed[id]; ok && ts.After(items[idx].LastPlayedAt) {
+			items[idx].LastPlayedAt = ts
+		}
+		if pc, ok := playCount[id]; ok && pc > items[idx].PlayCount {
+			items[idx].PlayCount = pc
+		}
+	}
+	return items, nil
+}
+
+func (s *BackfillService) fetchUsers(ctx context.Context) ([]userSummary, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL+"/Users", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Emby-Token", s.apiKey)
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("fetch users returned status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+	var users []userSummary
+	if err := json.Unmarshal(body, &users); err != nil {
+		return nil, err
+	}
+	return users, nil
+}
+
+func (s *BackfillService) fetchUserItemsPlayback(ctx context.Context, userID string, itemIDs []string) (usersItemsResponse, error) {
+	values := url.Values{}
+	values.Set("Ids", strings.Join(itemIDs, ","))
+	values.Set("Recursive", "true")
+	values.Set("EnableUserData", "true")
+	values.Set("Fields", "UserData")
+	endpoint := s.baseURL + "/Users/" + url.PathEscape(strings.TrimSpace(userID)) + "/Items?" + values.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return usersItemsResponse{}, err
+	}
+	req.Header.Set("X-Emby-Token", s.apiKey)
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return usersItemsResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return usersItemsResponse{}, fmt.Errorf("fetch user items returned status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return usersItemsResponse{}, err
+	}
+	var out usersItemsResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return usersItemsResponse{}, err
+	}
+	return out, nil
 }
 
 func (s *BackfillService) emitProgress(progress FetchProgress) {
