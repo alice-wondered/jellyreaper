@@ -21,7 +21,7 @@ func TestJellyfinWebhookHandlerAccepted(t *testing.T) {
 			t.Fatalf("unexpected payload item id: %s", event.Payload.ItemID)
 		}
 		return nil
-	})
+	}, "")
 
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/jellyfin", bytes.NewBufferString(`{"ItemId":"item1","EventId":"evt1"}`))
 	rr := httptest.NewRecorder()
@@ -36,7 +36,7 @@ func TestJellyfinWebhookHandlerAccepted(t *testing.T) {
 }
 
 func TestJellyfinWebhookHandlerRejectsInvalidJSON(t *testing.T) {
-	h := NewJellyfinWebhookHandler(func(context.Context, jellyfin.WebhookEvent) error { return nil })
+	h := NewJellyfinWebhookHandler(func(context.Context, jellyfin.WebhookEvent) error { return nil }, "")
 
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/jellyfin", bytes.NewBufferString(`{"ItemId":`))
 	rr := httptest.NewRecorder()
@@ -48,7 +48,7 @@ func TestJellyfinWebhookHandlerRejectsInvalidJSON(t *testing.T) {
 }
 
 func TestJellyfinWebhookHandlerRejectsMultipleJSONValues(t *testing.T) {
-	h := NewJellyfinWebhookHandler(func(context.Context, jellyfin.WebhookEvent) error { return nil })
+	h := NewJellyfinWebhookHandler(func(context.Context, jellyfin.WebhookEvent) error { return nil }, "")
 
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/jellyfin", bytes.NewBufferString(`{} {}`))
 	rr := httptest.NewRecorder()
@@ -64,7 +64,7 @@ func TestJellyfinWebhookHandlerHandlesUnexpectedFieldType(t *testing.T) {
 	h := NewJellyfinWebhookHandler(func(_ context.Context, event jellyfin.WebhookEvent) error {
 		called = true
 		return nil
-	})
+	}, "")
 
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/jellyfin", bytes.NewBufferString(`{"ItemId":123,"EventId":"evt1"}`))
 	rr := httptest.NewRecorder()
@@ -75,5 +75,44 @@ func TestJellyfinWebhookHandlerHandlesUnexpectedFieldType(t *testing.T) {
 	}
 	if called {
 		t.Fatal("callback should not be called for invalid provider payload type")
+	}
+}
+
+func TestJellyfinWebhookHandlerRejectsMissingTokenWhenConfigured(t *testing.T) {
+	called := false
+	h := NewJellyfinWebhookHandler(func(context.Context, jellyfin.WebhookEvent) error {
+		called = true
+		return nil
+	}, "super-secret")
+
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/jellyfin", bytes.NewBufferString(`{"ItemId":"item1","EventId":"evt1"}`))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("unexpected status: %d", rr.Code)
+	}
+	if called {
+		t.Fatal("callback should not be called with missing token")
+	}
+}
+
+func TestJellyfinWebhookHandlerAcceptsConfiguredTokenHeader(t *testing.T) {
+	called := false
+	h := NewJellyfinWebhookHandler(func(context.Context, jellyfin.WebhookEvent) error {
+		called = true
+		return nil
+	}, "super-secret")
+
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/jellyfin", bytes.NewBufferString(`{"ItemId":"item1","EventId":"evt1"}`))
+	req.Header.Set("X-Jellyreaper-Token", "super-secret")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("unexpected status: %d", rr.Code)
+	}
+	if !called {
+		t.Fatal("expected callback to be called with valid token")
 	}
 }

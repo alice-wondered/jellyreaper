@@ -47,9 +47,10 @@ type Config struct {
 	OpenAIAPIKey     string
 	OpenAIModel      string
 
-	JellyfinURL    string
-	JellyfinPort   string
-	JellyfinAPIKey string
+	JellyfinURL          string
+	JellyfinPort         string
+	JellyfinAPIKey       string
+	JellyfinWebhookToken string
 
 	BackfillEnabled            bool
 	BackfillInterval           time.Duration
@@ -187,13 +188,14 @@ func LoadFromEnv() (Config, error) {
 		WorkerID: resolveWorkerID(),
 		LeaseTTL: leaseTTL,
 
-		DiscordBotToken:  os.Getenv("DISCORD_BOT_TOKEN"),
-		DiscordChannelID: os.Getenv("DISCORD_CHANNEL_ID"),
-		OpenAIAPIKey:     strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
-		OpenAIModel:      envOrDefault("OPENAI_MODEL", "gpt-4o-mini"),
-		JellyfinURL:      jellyfinURL,
-		JellyfinPort:     jellyfinPort,
-		JellyfinAPIKey:   os.Getenv("JELLYFIN_API_KEY"),
+		DiscordBotToken:      os.Getenv("DISCORD_BOT_TOKEN"),
+		DiscordChannelID:     os.Getenv("DISCORD_CHANNEL_ID"),
+		OpenAIAPIKey:         strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
+		OpenAIModel:          envOrDefault("OPENAI_MODEL", "gpt-4o-mini"),
+		JellyfinURL:          jellyfinURL,
+		JellyfinPort:         jellyfinPort,
+		JellyfinAPIKey:       os.Getenv("JELLYFIN_API_KEY"),
+		JellyfinWebhookToken: strings.TrimSpace(os.Getenv("JELLYFIN_WEBHOOK_TOKEN")),
 
 		BackfillEnabled:            backfillEnabled,
 		BackfillInterval:           backfillInterval,

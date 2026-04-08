@@ -43,6 +43,7 @@ JellyReaper is a Go service that listens to Jellyfin and Discord webhooks, persi
 | `JELLYFIN_HOST` | no | `localhost` | Jellyfin host when `JELLYFIN_URL` is unset |
 | `JELLYFIN_PORT` | no | `8096` | Jellyfin port |
 | `JELLYFIN_API_KEY` | yes | - | Jellyfin API key |
+| `JELLYFIN_WEBHOOK_TOKEN` | no (strongly recommended) | - | required token for `/webhooks/jellyfin` (send as `X-Jellyreaper-Token` or `Authorization: Bearer ...`) |
 | `BACKFILL_ENABLED` | no | `true` | enables startup + periodic backfill |
 | `BACKFILL_INTERVAL` | no | `15m` | periodic backfill interval |
 | `BACKFILL_FULL_SWEEP_ON_STARTUP` | no | `true` | on first run (no checkpoint), sweep full Jellyfin history |
@@ -64,6 +65,14 @@ Service endpoints:
 - `GET /healthz`
 - `POST /webhooks/jellyfin`
 - `POST /discord/interactions`
+
+Webhook token recommendation (for Jellyfin webhook custom headers):
+
+```bash
+openssl rand -hex 32
+```
+
+Set that as `JELLYFIN_WEBHOOK_TOKEN` in JellyReaper and configure Jellyfin webhook header `X-Jellyreaper-Token: <value>`.
 
 ## Build
 ```bash

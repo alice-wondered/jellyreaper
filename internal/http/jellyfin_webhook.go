@@ -3,20 +3,23 @@ package http
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
 	stdhttp "net/http"
+	"strings"
 
 	"jellyreaper/internal/jellyfin"
 )
 
 type JellyfinWebhookHandler struct {
 	handle func(context.Context, jellyfin.WebhookEvent) error
+	token  string
 }
 
-func NewJellyfinWebhookHandler(handle func(context.Context, jellyfin.WebhookEvent) error) *JellyfinWebhookHandler {
-	return &JellyfinWebhookHandler{handle: handle}
+func NewJellyfinWebhookHandler(handle func(context.Context, jellyfin.WebhookEvent) error, token string) *JellyfinWebhookHandler {
+	return &JellyfinWebhookHandler{handle: handle, token: strings.TrimSpace(token)}
 }
 
 func (h *JellyfinWebhookHandler) ServeHTTP(w stdhttp.ResponseWriter, r *stdhttp.Request) {
@@ -27,6 +30,10 @@ func (h *JellyfinWebhookHandler) ServeHTTP(w stdhttp.ResponseWriter, r *stdhttp.
 	}
 	if h.handle == nil {
 		stdhttp.Error(w, "jellyfin callback is not configured", stdhttp.StatusInternalServerError)
+		return
+	}
+	if h.token != "" && !validJellyfinWebhookToken(r, h.token) {
+		stdhttp.Error(w, "invalid webhook token", stdhttp.StatusUnauthorized)
 		return
 	}
 
@@ -62,4 +69,28 @@ func (h *JellyfinWebhookHandler) ServeHTTP(w stdhttp.ResponseWriter, r *stdhttp.
 	}
 
 	w.WriteHeader(stdhttp.StatusAccepted)
+}
+
+func validJellyfinWebhookToken(r *stdhttp.Request, token string) bool {
+	headers := []string{
+		strings.TrimSpace(r.Header.Get("X-Jellyreaper-Token")),
+		strings.TrimSpace(r.Header.Get("X-Webhook-Token")),
+	}
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		headers = append(headers, strings.TrimSpace(auth[7:]))
+	}
+	for _, got := range headers {
+		if secureEquals(got, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func secureEquals(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
