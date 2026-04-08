@@ -335,7 +335,7 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 		return fmt.Errorf("no discord channel configured for item %s", job.ItemID)
 	}
 
-	version := flow.Version
+	version := flow.Version + 1
 	messageID, err := h.discord.SendHITLPrompt(ctx, channelID, job.ItemID, version, flow.DisplayName, flow.ImageURL, statusLine)
 	if err != nil {
 		return err
