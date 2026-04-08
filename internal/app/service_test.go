@@ -1371,6 +1371,46 @@ func TestCatalogEventUsesPayloadTimestampNotServiceClock(t *testing.T) {
 	}
 }
 
+func TestCollectionWebhookDoesNotCreateOperationalFlow(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 12, 10, 30, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:           "collection-1",
+			ItemType:         "BoxSet",
+			Name:             "My Action Collection",
+			NotificationType: "ItemUpdated",
+			EventID:          "evt-collection-1",
+		},
+		Raw:       map[string]any{"EventId": "evt-collection-1"},
+		ItemID:    "collection-1",
+		EventID:   "evt-collection-1",
+		EventType: "ItemUpdated",
+		DedupeKey: "jellyfin:evt-collection-1",
+	})
+	if err != nil {
+		t.Fatalf("handle collection webhook: %v", err)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		flows, err := tx.ListFlows(context.Background())
+		if err != nil {
+			return err
+		}
+		for _, flow := range flows {
+			if strings.Contains(flow.ItemID, "collection-1") {
+				return fmt.Errorf("expected no operational flow for collection, found %s", flow.ItemID)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify no collection flow created: %v", err)
+	}
+}
+
 func TestDiscordInteractionUsesSnowflakeTimestamp(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)

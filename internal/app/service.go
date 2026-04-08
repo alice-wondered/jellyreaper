@@ -1187,18 +1187,18 @@ func deriveTargets(event jellyfin.WebhookEvent) []targetRef {
 	case "episode":
 		seasonLabel := formatSeasonLabel(p.SeasonName, p.SeriesName, p.Name)
 		out = push(out, targetRef{Type: "season", ID: p.SeasonID, Name: seasonLabel, ImageURL: p.PrimaryImageURL})
-		if p.SeasonID == "" {
-			out = push(out, targetRef{Type: "item", ID: p.ItemID, Name: chooseName(p.Name, p.SeriesName), ImageURL: p.PrimaryImageURL})
-		}
+		allowFallback = false
 	case "season":
 		seasonLabel := formatSeasonLabel(chooseName(p.Name, p.SeasonName), p.SeriesName, p.Name)
 		out = push(out, targetRef{Type: "season", ID: p.ItemID, Name: seasonLabel, ImageURL: p.PrimaryImageURL})
+		allowFallback = false
 	case "series":
 		allowFallback = false
 	case "movie":
 		out = push(out, targetRef{Type: "movie", ID: p.ItemID, Name: p.Name, ImageURL: p.PrimaryImageURL})
+		allowFallback = false
 	default:
-		out = push(out, targetRef{Type: "item", ID: event.ItemID, Name: chooseName(p.Name, event.ItemID), ImageURL: p.PrimaryImageURL})
+		allowFallback = false
 	}
 	if allowFallback && len(out) == 0 && event.ItemID != "" {
 		out = push(out, targetRef{Type: "item", ID: event.ItemID, Name: chooseName(p.Name, event.ItemID), ImageURL: p.PrimaryImageURL})
