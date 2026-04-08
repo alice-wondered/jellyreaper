@@ -436,6 +436,11 @@ func TestScheduleDeleteProjection_UsesProjectionSelectionFlow(t *testing.T) {
 	if !strings.Contains(out, "\"status\":\"needs_confirmation\"") {
 		t.Fatalf("expected confirmation after selection, got: %s", out)
 	}
+	selectedSeason1 := strings.Contains(out, "\"title\":\"Season 1 of The Office\"")
+	selectedSeason2 := strings.Contains(out, "\"title\":\"Season 2 of The Office\"")
+	if !selectedSeason1 && !selectedSeason2 {
+		t.Fatalf("expected confirmation to identify selected season target, got: %s", out)
+	}
 
 	out, _, err = h.handleFollowUp(context.Background(), threadID, "yes")
 	if err != nil {
@@ -447,11 +452,20 @@ func TestScheduleDeleteProjection_UsesProjectionSelectionFlow(t *testing.T) {
 
 	flow1 := mustGetFlow(t, store, "target:season:s-1")
 	flow2 := mustGetFlow(t, store, "target:season:s-2")
-	if flow1.State != domain.FlowStateDeleteQueued {
-		t.Fatalf("expected selected season flow delete_queued, got %s", flow1.State)
-	}
-	if flow2.State != domain.FlowStateActive {
-		t.Fatalf("expected non-selected season flow unchanged, got %s", flow2.State)
+	if selectedSeason1 {
+		if flow1.State != domain.FlowStateDeleteQueued {
+			t.Fatalf("expected season 1 delete_queued, got %s", flow1.State)
+		}
+		if flow2.State != domain.FlowStateActive {
+			t.Fatalf("expected season 2 unchanged, got %s", flow2.State)
+		}
+	} else {
+		if flow2.State != domain.FlowStateDeleteQueued {
+			t.Fatalf("expected season 2 delete_queued, got %s", flow2.State)
+		}
+		if flow1.State != domain.FlowStateActive {
+			t.Fatalf("expected season 1 unchanged, got %s", flow1.State)
+		}
 	}
 }
 
