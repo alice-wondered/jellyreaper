@@ -80,13 +80,33 @@ func (s *Service) SetBackfillWriteBatching(size int, timeout time.Duration, queu
 }
 
 func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.WebhookEvent) error {
-	now, _ := sourceTimestampForJellyfinEvent(event)
+	now := s.now().UTC()
+	if sourceNow, ok := sourceTimestampForJellyfinEvent(event); ok {
+		now = sourceNow
+	}
 	itemID, targets, err := s.applyJellyfinWebhookTx(ctx, event, now)
 	if err != nil {
 		return err
 	}
 
-	s.logger.InfoContext(ctx, "processed jellyfin webhook", "dedupe_key", event.DedupeKey, "item_id", itemID, "target_count", len(targets))
+	primaryTarget := ""
+	if len(targets) > 0 {
+		primaryTarget = targets[0].Canonical
+	}
+
+	s.logger.InfoContext(ctx,
+		"processed jellyfin webhook",
+		"lex", jellyfinLogLexicon(event.EventType),
+		"event_type", event.EventType,
+		"item_type", normalizeMediaType(event.Payload.ItemType),
+		"title", chooseName(event.Payload.Name, event.Payload.SeasonName),
+		"series", event.Payload.SeriesName,
+		"season", event.Payload.SeasonName,
+		"target_primary", primaryTarget,
+		"target_count", len(targets),
+		"item_id", itemID,
+		"dedupe_key", event.DedupeKey,
+	)
 	s.wake(now)
 	return nil
 }
@@ -160,6 +180,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		catalogUpdateAllowed := true
 		playbackUpdateAllowed := true
 		if found {
+			media.CreatedAt = existing.CreatedAt
 			media.Name = existing.Name
 			media.Title = existing.Title
 			media.ItemType = existing.ItemType
@@ -181,6 +202,15 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		}
 
 		if catalogIndexEvent && catalogUpdateAllowed {
+			created := event.Payload.DateCreated.UTC()
+			if created.IsZero() {
+				created = event.Payload.DateLastMediaAdded.UTC()
+			}
+			if !created.IsZero() {
+				if media.CreatedAt.IsZero() || created.Before(media.CreatedAt) {
+					media.CreatedAt = created
+				}
+			}
 			if event.Payload.Name != "" {
 				media.Name = event.Payload.Name
 				media.Title = event.Payload.Name
@@ -493,6 +523,16 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 	}
 
 	s.wake(now)
+	actor := discordInteractionActor(interaction)
+	s.logger.InfoContext(ctx,
+		"processed discord interaction decision",
+		"lex", discordActionLexicon(parsed.Action),
+		"action", parsed.Action,
+		"subject_type", inferSubjectType(parsed.ItemID),
+		"title", decisionDisplayName,
+		"actor", actor,
+		"item_id", parsed.ItemID,
+	)
 	return interactionDecisionUpdateResponse(parsed.Action, decisionDisplayName), nil
 }
 
@@ -509,7 +549,7 @@ func (s *Service) ingestBackfillPlaybackWithCursor(ctx context.Context, events [
 	opCh := make(chan backfillWriteOp, s.backfillQueueCapacity)
 	for i, e := range events {
 		if total > 0 && ((i+1)%ingestProgressEvery == 0 || i+1 == total) {
-			s.logger.InfoContext(ctx, "backfill playback ingest progress", "processed", i+1, "total", total)
+			s.logger.InfoContext(ctx, "backfill playback ingest progress", "lex", "BACKFILL-INGEST", "stream", "playback", "processed", i+1, "total", total)
 		}
 
 		key := "backfill:play:" + e.ItemID + ":" + e.Type + ":" + strconv.FormatInt(e.Date.UnixNano(), 10)
@@ -562,7 +602,7 @@ func (s *Service) ingestBackfillItemsWithCursor(ctx context.Context, items []jel
 	opCh := make(chan backfillWriteOp, s.backfillQueueCapacity)
 	for i, it := range items {
 		if total > 0 && ((i+1)%ingestProgressEvery == 0 || i+1 == total) {
-			s.logger.InfoContext(ctx, "backfill item ingest progress", "processed", i+1, "total", total)
+			s.logger.InfoContext(ctx, "backfill item ingest progress", "lex", "BACKFILL-INGEST", "stream", "items", "processed", i+1, "total", total)
 		}
 
 		key := backfillItemDedupeKey(it, i)
@@ -644,7 +684,10 @@ func (s *Service) processWebhookBatches(ctx context.Context, ops <-chan backfill
 					continue
 				}
 				event := *op.event
-				now, _ := sourceTimestampForJellyfinEvent(event)
+				now := s.now().UTC()
+				if sourceNow, ok := sourceTimestampForJellyfinEvent(event); ok {
+					now = sourceNow
+				}
 				eventAt := now
 				if err := s.applyJellyfinWebhookInTx(
 					ctx,
@@ -666,7 +709,7 @@ func (s *Service) processWebhookBatches(ctx context.Context, ops <-chan backfill
 		}); err != nil {
 			return err
 		}
-		s.logger.InfoContext(ctx, "flushed backfill write batch", "source", source, "batch_size", len(batch))
+		s.logger.InfoContext(ctx, "flushed backfill write batch", "lex", "BACKFILL-WRITE", "source", source, "batch_size", len(batch))
 		batch = batch[:0]
 		return nil
 	}
@@ -1056,6 +1099,66 @@ func discordInteractionTimestamp(interaction discord.IncomingInteraction) (time.
 		return time.Time{}, err
 	}
 	return ts.UTC(), nil
+}
+
+func discordInteractionActor(interaction discord.IncomingInteraction) string {
+	if interaction.Raw == nil {
+		return "unknown"
+	}
+	if interaction.Raw.Member != nil && interaction.Raw.Member.User != nil {
+		user := interaction.Raw.Member.User
+		if user.Username != "" {
+			return user.Username
+		}
+		if user.ID != "" {
+			return user.ID
+		}
+	}
+	if interaction.Raw.User != nil {
+		if interaction.Raw.User.Username != "" {
+			return interaction.Raw.User.Username
+		}
+		if interaction.Raw.User.ID != "" {
+			return interaction.Raw.User.ID
+		}
+	}
+	return "unknown"
+}
+
+func jellyfinLogLexicon(eventType string) string {
+	if isRemovalEvent(eventType) {
+		return "REMOVAL"
+	}
+	if isPlaybackEvent(eventType) {
+		return "PLAYBACK-METRIC"
+	}
+	if isCatalogIndexEvent(eventType) {
+		return "CATALOG-INDEX"
+	}
+	return "JELLYFIN-EVENT"
+}
+
+func discordActionLexicon(action string) string {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "archive":
+		return "ARCHIVAL"
+	case "keep":
+		return "RETENTION"
+	case "delay":
+		return "DEFER"
+	case "delete":
+		return "DELETION-REQUEST"
+	default:
+		return "DISCORD-DECISION"
+	}
+}
+
+func normalizeMediaType(itemType string) string {
+	t := strings.ToUpper(strings.TrimSpace(itemType))
+	if t == "" {
+		return "UNKNOWN"
+	}
+	return t
 }
 
 func backfillItemDedupeKey(item jellyfin.ItemSnapshot, ordinal int) string {

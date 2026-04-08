@@ -871,6 +871,9 @@ func TestCatalogEventUsesPayloadTimestampNotServiceClock(t *testing.T) {
 	if !media.LastCatalogEventAt.Equal(payloadTS) {
 		t.Fatalf("expected catalog event timestamp from payload, got=%s want=%s", media.LastCatalogEventAt, payloadTS)
 	}
+	if !media.CreatedAt.Equal(payloadTS) {
+		t.Fatalf("expected media created timestamp from payload, got=%s want=%s", media.CreatedAt, payloadTS)
+	}
 }
 
 func TestDiscordInteractionUsesSnowflakeTimestamp(t *testing.T) {

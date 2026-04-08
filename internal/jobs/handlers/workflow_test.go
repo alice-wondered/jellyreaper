@@ -83,6 +83,126 @@ func TestExecuteDeleteHandlerTransitionsToDeleted(t *testing.T) {
 	}
 }
 
+func TestEvaluatePolicyAssumesNeverPlayedWhenMetricsMissing(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:item:item-never-played",
+			ItemID:      "target:item:item-never-played",
+			SubjectType: "item",
+			DisplayName: "Never Played",
+			State:       domain.FlowStateActive,
+			Version:     0,
+			PolicySnapshot: domain.PolicySnapshot{
+				ExpireAfterDays: 30,
+				HITLTimeoutHrs:  48,
+				TimeoutAction:   "delete",
+			},
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	h := NewEvaluatePolicyHandler(store, nil)
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-eval-never-played", ItemID: "target:item:item-never-played"}); err != nil {
+		t.Fatalf("evaluate policy: %v", err)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(context.Background(), "target:item:item-never-played")
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatal("expected flow")
+		}
+		if flow.State != domain.FlowStatePendingReview {
+			t.Fatalf("expected pending review, got %s", flow.State)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify flow state: %v", err)
+	}
+
+	jobs, err := store.LeaseDueJobs(context.Background(), time.Now().UTC(), 20, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease jobs: %v", err)
+	}
+	foundPrompt := false
+	for _, job := range jobs {
+		if job.Kind == domain.JobKindSendHITLPrompt && job.ItemID == "target:item:item-never-played" {
+			foundPrompt = true
+		}
+	}
+	if !foundPrompt {
+		t.Fatalf("expected hitl prompt job, got %#v", jobs)
+	}
+}
+
+func TestEvaluatePolicyFallsBackToCreatedAtWhenNeverPlayed(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+	createdAt := now.Add(-10 * 24 * time.Hour)
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID:    "movie-created-only",
+			Name:      "Created Only",
+			Title:     "Created Only",
+			ItemType:  "Movie",
+			CreatedAt: createdAt,
+			UpdatedAt: now,
+		}); err != nil {
+			return err
+		}
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:item:movie-created-only",
+			ItemID:      "target:item:movie-created-only",
+			SubjectType: "item",
+			DisplayName: "Created Only",
+			State:       domain.FlowStateActive,
+			Version:     0,
+			PolicySnapshot: domain.PolicySnapshot{
+				ExpireAfterDays: 30,
+				HITLTimeoutHrs:  48,
+				TimeoutAction:   "delete",
+			},
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed flow/media: %v", err)
+	}
+
+	h := NewEvaluatePolicyHandler(store, nil)
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-eval-created-only", ItemID: "target:item:movie-created-only"}); err != nil {
+		t.Fatalf("evaluate policy: %v", err)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(context.Background(), "target:item:movie-created-only")
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatal("expected flow")
+		}
+		if flow.State != domain.FlowStateActive {
+			t.Fatalf("expected active state (not yet stale by creation age), got %s", flow.State)
+		}
+		if flow.NextActionAt.Before(now.Add(19 * 24 * time.Hour)) {
+			t.Fatalf("expected deferred next action based on creation date, got %s", flow.NextActionAt)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify flow state: %v", err)
+	}
+}
+
 func TestHITLTimeoutHandlerQueuesDeleteWhenPendingReview(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
