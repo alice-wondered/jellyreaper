@@ -41,6 +41,8 @@ type ItemSnapshot struct {
 	SeriesName         string
 	Name               string
 	ImageURL           string
+	LastPlayedAt       time.Time
+	PlayCount          int32
 	DateCreated        time.Time
 	DateLastMediaAdded time.Time
 }
@@ -98,7 +100,7 @@ func (s *BackfillService) FetchPlaybackEventsSince(ctx context.Context, since ti
 		if err := json.Unmarshal(resp.Body, &parsed); err == nil {
 			body = &parsed
 		} else if looksLikeHTML(resp.Body) {
-			return nil, fmt.Errorf("activity log returned HTML; verify JELLYFIN_URL includes correct base path (often /jellyfin)")
+			return nil, htmlResponseError("activity log", resp.HTTPResponse, resp.Body)
 		}
 	}
 	if body == nil || body.Items == nil {
@@ -124,7 +126,8 @@ func (s *BackfillService) FetchPlaybackEventsSince(ctx context.Context, since ti
 
 func (s *BackfillService) FetchChangedItemsSince(ctx context.Context, since time.Time, limit int32) ([]ItemSnapshot, error) {
 	recursive := true
-	params := &gen.GetItemsParams{MinDateLastSaved: &since, Limit: &limit, Recursive: &recursive}
+	enableUserData := true
+	params := &gen.GetItemsParams{MinDateLastSaved: &since, Limit: &limit, Recursive: &recursive, EnableUserData: &enableUserData}
 	resp, err := s.client.GetItemsWithResponse(ctx, params)
 	if err != nil {
 		return nil, fmt.Errorf("fetch jellyfin changed items: %w", err)
@@ -145,7 +148,7 @@ func (s *BackfillService) FetchChangedItemsSince(ctx context.Context, since time
 		if err := json.Unmarshal(resp.Body, &parsed); err == nil {
 			body = &parsed
 		} else if looksLikeHTML(resp.Body) {
-			return nil, fmt.Errorf("items endpoint returned HTML; verify JELLYFIN_URL includes correct base path (often /jellyfin)")
+			return nil, htmlResponseError("items endpoint", resp.HTTPResponse, resp.Body)
 		}
 	}
 	if body == nil || body.Items == nil {
@@ -166,6 +169,8 @@ func (s *BackfillService) FetchChangedItemsSince(ctx context.Context, since time
 			SeriesName:         safeString(item.SeriesName),
 			Name:               safeString(item.Name),
 			ImageURL:           imageURL,
+			LastPlayedAt:       safeNestedLastPlayed(item.UserData),
+			PlayCount:          safeNestedPlayCount(item.UserData),
 			DateCreated:        safeTime(item.DateCreated),
 			DateLastMediaAdded: safeTime(item.DateLastMediaAdded),
 		})
@@ -203,6 +208,41 @@ func looksLikeHTML(body []byte) bool {
 	return bytes.HasPrefix(trimmed, []byte("<"))
 }
 
+func htmlResponseError(endpoint string, httpResp *http.Response, body []byte) error {
+	status := 0
+	location := ""
+	contentType := ""
+	if httpResp != nil {
+		status = httpResp.StatusCode
+		location = httpResp.Header.Get("Location")
+		contentType = httpResp.Header.Get("Content-Type")
+	}
+
+	snippet := strings.TrimSpace(string(bytes.TrimSpace(body)))
+	if len(snippet) > 200 {
+		snippet = snippet[:200]
+	}
+
+	parts := []string{
+		fmt.Sprintf("%s returned HTML instead of JSON", endpoint),
+		"check JELLYFIN_URL base path (often it must include /jellyfin)",
+	}
+	if status != 0 {
+		parts = append(parts, fmt.Sprintf("status=%d", status))
+	}
+	if contentType != "" {
+		parts = append(parts, fmt.Sprintf("content_type=%q", contentType))
+	}
+	if location != "" {
+		parts = append(parts, fmt.Sprintf("location=%q", location))
+	}
+	if snippet != "" {
+		parts = append(parts, fmt.Sprintf("body_snippet=%q", snippet))
+	}
+
+	return fmt.Errorf("%s", strings.Join(parts, " | "))
+}
+
 func safeString(v *string) string {
 	if v == nil {
 		return ""
@@ -222,4 +262,18 @@ func uuidString(v *uuid.UUID) string {
 		return ""
 	}
 	return v.String()
+}
+
+func safeNestedLastPlayed(data *gen.UserItemDataDto) time.Time {
+	if data == nil || data.LastPlayedDate == nil {
+		return time.Time{}
+	}
+	return data.LastPlayedDate.UTC()
+}
+
+func safeNestedPlayCount(data *gen.UserItemDataDto) int32 {
+	if data == nil || data.PlayCount == nil {
+		return 0
+	}
+	return *data.PlayCount
 }

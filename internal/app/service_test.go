@@ -138,11 +138,11 @@ func TestWebhookIndexesFlowAndJobAndDedupe(t *testing.T) {
 	svc.now = func() time.Time { return now }
 
 	event := jellyfin.WebhookEvent{
-		Payload:   jellyfin.WebhookPayload{ItemID: "item-webhook", ItemType: "Movie", Name: "Webhook Movie", NotificationType: "PlaybackStart", EventID: "evt-1"},
-		Raw:       map[string]any{"ItemId": "item-webhook", "NotificationType": "PlaybackStart", "EventId": "evt-1"},
+		Payload:   jellyfin.WebhookPayload{ItemID: "item-webhook", ItemType: "Movie", Name: "Webhook Movie", NotificationType: "ItemAdded", EventID: "evt-1"},
+		Raw:       map[string]any{"ItemId": "item-webhook", "NotificationType": "ItemAdded", "EventId": "evt-1"},
 		ItemID:    "item-webhook",
 		EventID:   "evt-1",
-		EventType: "PlaybackStart",
+		EventType: "ItemAdded",
 		DedupeKey: "jellyfin:evt-1",
 	}
 
@@ -213,7 +213,7 @@ func TestWebhookEpisodeAggregatesToSeasonAndSeries(t *testing.T) {
 	if seasonFlow.DisplayName != "Season 1 of My Show" {
 		t.Fatalf("unexpected season flow display name: %s", seasonFlow.DisplayName)
 	}
-	jobs, err := store.LeaseDueJobs(context.Background(), now, 10, "test", time.Minute)
+	jobs, err := store.LeaseDueJobs(context.Background(), now.Add(120*24*time.Hour), 10, "test", time.Minute)
 	if err != nil {
 		t.Fatalf("lease jobs: %v", err)
 	}
@@ -257,6 +257,109 @@ func TestDeriveTargetsUsesIDsNotTitles(t *testing.T) {
 	}
 }
 
+func TestDeriveTargetsSkipsSeriesItems(t *testing.T) {
+	event := jellyfin.WebhookEvent{Payload: jellyfin.WebhookPayload{
+		ItemType:   "Series",
+		ItemID:     "series-abc",
+		SeriesName: "My Show",
+		Name:       "My Show",
+	}}
+
+	targets := deriveTargets(event)
+	if len(targets) != 0 {
+		t.Fatalf("expected no targets for series payloads, got %#v", targets)
+	}
+}
+
+func TestIngestBackfillItemsSchedulesDeferredEvaluateFromLastPlay(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 8, 9, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	lastPlayed := now.Add(-2 * time.Hour)
+	err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+		ItemID:       "ep-backfill-1",
+		ItemType:     "Episode",
+		SeasonID:     "season-1",
+		SeasonName:   "Season 1",
+		SeriesID:     "series-1",
+		SeriesName:   "Show A",
+		Name:         "Pilot",
+		LastPlayedAt: lastPlayed,
+		PlayCount:    3,
+	}})
+	if err != nil {
+		t.Fatalf("ingest backfill items: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, "target:season:season-1")
+	if flow.State != domain.FlowStateActive {
+		t.Fatalf("unexpected flow state: %s", flow.State)
+	}
+	wantRunAt := lastPlayed.Add(90 * 24 * time.Hour)
+	if !flow.NextActionAt.Equal(wantRunAt) {
+		t.Fatalf("unexpected next action: got=%s want=%s", flow.NextActionAt, wantRunAt)
+	}
+
+	jobsEarly, err := store.LeaseDueJobs(context.Background(), now.Add(time.Hour), 10, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease jobs early: %v", err)
+	}
+	if len(jobsEarly) != 0 {
+		t.Fatalf("expected no due jobs before scheduled time, got %#v", jobsEarly)
+	}
+
+	jobsDue, err := store.LeaseDueJobs(context.Background(), wantRunAt.Add(time.Minute), 10, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease jobs due: %v", err)
+	}
+	if len(jobsDue) != 1 || jobsDue[0].Kind != domain.JobKindEvaluatePolicy {
+		t.Fatalf("unexpected due jobs: %#v", jobsDue)
+	}
+}
+
+func TestIngestBackfillItemsPreservesHigherPlaybackMetrics(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 8, 10, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID:         "movie-1",
+			Name:           "Movie One",
+			Title:          "Movie One",
+			ItemType:       "Movie",
+			LastPlayedAt:   now.Add(-time.Hour),
+			PlayCountTotal: 9,
+			UpdatedAt:      now.Add(-time.Hour),
+		})
+	}); err != nil {
+		t.Fatalf("seed media: %v", err)
+	}
+
+	err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+		ItemID:     "movie-1",
+		ItemType:   "Movie",
+		Name:       "Movie One",
+		PlayCount:  0,
+		ImageURL:   "",
+		SeriesName: "",
+	}})
+	if err != nil {
+		t.Fatalf("ingest backfill items: %v", err)
+	}
+
+	media := mustGetMedia(t, store, "movie-1")
+	if media.PlayCountTotal != 9 {
+		t.Fatalf("expected preserved play count 9, got %d", media.PlayCountTotal)
+	}
+	if media.LastPlayedAt.IsZero() {
+		t.Fatal("expected preserved last played timestamp")
+	}
+}
+
 func mustGetFlow(t *testing.T, store *bboltrepo.Store, itemID string) domain.Flow {
 	t.Helper()
 	var flow domain.Flow
@@ -276,4 +379,24 @@ func mustGetFlow(t *testing.T, store *bboltrepo.Store, itemID string) domain.Flo
 		t.Fatalf("get flow %s: %v", itemID, err)
 	}
 	return flow
+}
+
+func mustGetMedia(t *testing.T, store *bboltrepo.Store, itemID string) domain.MediaItem {
+	t.Helper()
+	var media domain.MediaItem
+	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		item, found, err := tx.GetMedia(context.Background(), itemID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatalf("media %s not found", itemID)
+		}
+		media = item
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("get media %s: %v", itemID, err)
+	}
+	return media
 }

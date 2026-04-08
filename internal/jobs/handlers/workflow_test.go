@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"crypto/ed25519"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +12,7 @@ import (
 
 	bbolt "go.etcd.io/bbolt"
 
+	"jellyreaper/internal/discord"
 	"jellyreaper/internal/domain"
 	"jellyreaper/internal/jellyfin"
 	"jellyreaper/internal/repo"
@@ -90,12 +92,13 @@ func TestHITLTimeoutHandlerQueuesDeleteWhenPendingReview(t *testing.T) {
 
 	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
-			FlowID:    "flow:item2",
-			ItemID:    "item2",
-			State:     domain.FlowStatePendingReview,
-			Version:   0,
-			CreatedAt: now,
-			UpdatedAt: now,
+			FlowID:             "flow:item2",
+			ItemID:             "item2",
+			State:              domain.FlowStatePendingReview,
+			DecisionDeadlineAt: now.Add(-time.Minute),
+			Version:            0,
+			CreatedAt:          now,
+			UpdatedAt:          now,
 		}, 0)
 	}); err != nil {
 		t.Fatalf("seed flow: %v", err)
@@ -118,6 +121,59 @@ func TestHITLTimeoutHandlerQueuesDeleteWhenPendingReview(t *testing.T) {
 	}
 	if !foundDelete {
 		t.Fatalf("expected execute_delete job, got %#v", jobs)
+	}
+}
+
+func TestHITLTimeoutHandlerDefersDeleteUntilDeadline(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:             "flow:item3",
+			ItemID:             "item3",
+			State:              domain.FlowStatePendingReview,
+			DecisionDeadlineAt: now.Add(2 * time.Hour),
+			Version:            0,
+			CreatedAt:          now,
+			UpdatedAt:          now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	h := NewHITLTimeoutHandler(store)
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "timeout2", ItemID: "item3"}); err != nil {
+		t.Fatalf("timeout handle: %v", err)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(context.Background(), "item3")
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatal("expected flow")
+		}
+		if flow.State != domain.FlowStatePendingReview {
+			t.Fatalf("expected pending review, got %s", flow.State)
+		}
+		if flow.NextActionAt.Before(flow.DecisionDeadlineAt) {
+			t.Fatalf("expected next action to be at/after deadline, next=%s deadline=%s", flow.NextActionAt, flow.DecisionDeadlineAt)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify flow: %v", err)
+	}
+
+	jobs, err := store.LeaseDueJobs(context.Background(), now.Add(90*time.Minute), 10, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease jobs: %v", err)
+	}
+	for _, job := range jobs {
+		if job.Kind == domain.JobKindExecuteDelete && job.ItemID == "item3" {
+			t.Fatalf("unexpected delete before deadline: %#v", job)
+		}
 	}
 }
 
@@ -162,5 +218,63 @@ func TestExecuteDeleteHandlerDeletesChildrenForSeriesTarget(t *testing.T) {
 	}
 	if deleteCount != 2 {
 		t.Fatalf("expected 2 child deletes, got %d", deleteCount)
+	}
+}
+
+func TestSendHITLPromptHandlerAppliesMinimumResponseWindow(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:    "flow:item-min-window",
+			ItemID:    "item-min-window",
+			State:     domain.FlowStatePendingReview,
+			Version:   0,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	pub, _, _ := ed25519.GenerateKey(nil)
+	discordSvc, err := discord.NewService("", pub)
+	if err != nil {
+		t.Fatalf("discord service: %v", err)
+	}
+	discordSvc.SetSendPromptHookForTest(func(context.Context, string, string, int64, string, string) (string, error) {
+		return "msg-min-window", nil
+	})
+
+	h := NewSendHITLPromptHandler(store, nil, discordSvc, "channel-1", 25*time.Millisecond)
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "prompt-min-window", ItemID: "item-min-window"}); err != nil {
+		t.Fatalf("handle prompt: %v", err)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(context.Background(), "item-min-window")
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatal("expected flow")
+		}
+		if flow.DecisionDeadlineAt.Before(now.Add(23 * time.Hour)) {
+			t.Fatalf("expected minimum response window, got deadline=%s", flow.DecisionDeadlineAt)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify flow: %v", err)
+	}
+
+	jobs, err := store.LeaseDueJobs(context.Background(), now.Add(2*time.Hour), 20, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease jobs: %v", err)
+	}
+	for _, job := range jobs {
+		if job.Kind == domain.JobKindExecuteDelete {
+			t.Fatalf("unexpected execute delete job before minimum window: %#v", job)
+		}
 	}
 }

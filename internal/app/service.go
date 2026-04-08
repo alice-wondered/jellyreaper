@@ -24,6 +24,7 @@ const (
 	defaultDelayDuration = 24 * time.Hour
 	defaultExpireDays    = 90
 	defaultHITLTimeoutH  = 48
+	backfillReviewDelay  = 24 * time.Hour
 )
 
 type targetRef struct {
@@ -81,6 +82,10 @@ func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.Webh
 		}
 
 		if itemID != "" {
+			existing, found, err := tx.GetMedia(ctx, itemID)
+			if err != nil {
+				return err
+			}
 			media := domain.MediaItem{
 				ItemID:     itemID,
 				Name:       event.Payload.Name,
@@ -92,6 +97,38 @@ func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.Webh
 				SeriesName: event.Payload.SeriesName,
 				ImageURL:   event.Payload.PrimaryImageURL,
 				UpdatedAt:  now,
+			}
+			if found {
+				if media.Name == "" {
+					media.Name = existing.Name
+				}
+				if media.Title == "" {
+					media.Title = existing.Title
+				}
+				if media.ItemType == "" {
+					media.ItemType = existing.ItemType
+				}
+				if media.SeasonID == "" {
+					media.SeasonID = existing.SeasonID
+				}
+				if media.SeasonName == "" {
+					media.SeasonName = existing.SeasonName
+				}
+				if media.SeriesID == "" {
+					media.SeriesID = existing.SeriesID
+				}
+				if media.SeriesName == "" {
+					media.SeriesName = existing.SeriesName
+				}
+				if media.ImageURL == "" {
+					media.ImageURL = existing.ImageURL
+				}
+				media.LastPlayedAt = existing.LastPlayedAt
+				media.PlayCountTotal = existing.PlayCountTotal
+			}
+			if isPlaybackEvent(event.EventType) {
+				media.LastPlayedAt = now
+				media.PlayCountTotal++
 			}
 			if err := tx.UpsertMedia(ctx, media); err != nil {
 				return err
@@ -138,23 +175,31 @@ func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.Webh
 				continue
 			}
 
-			payloadJSON, err := json.Marshal(jobs.EvaluatePolicyPayload{Reason: "jellyfin_webhook"})
-			if err != nil {
+			runAt := now
+			if playAt, known, err := mostRecentPlayForTarget(ctx, tx, flow); err != nil {
 				return err
+			} else if known {
+				expireDays := flow.PolicySnapshot.ExpireAfterDays
+				if expireDays <= 0 {
+					expireDays = defaultExpireDays
+				}
+				dueAt := playAt.Add(time.Duration(expireDays) * 24 * time.Hour)
+				if dueAt.After(runAt) {
+					runAt = dueAt
+				}
 			}
-			if err := tx.EnqueueJob(ctx, domain.JobRecord{
-				JobID:          "job:eval:" + target.Canonical + ":" + strconv.FormatInt(now.UnixNano(), 10),
-				FlowID:         flowIDFromItem(target.Canonical),
-				ItemID:         target.Canonical,
-				Kind:           domain.JobKindEvaluatePolicy,
-				Status:         domain.JobStatusPending,
-				RunAt:          now,
-				MaxAttempts:    5,
-				IdempotencyKey: dedupeKey + ":eval:" + target.Canonical,
-				PayloadJSON:    payloadJSON,
-				CreatedAt:      now,
-				UpdatedAt:      now,
-			}); err != nil {
+
+			if flow.NextActionAt.Before(runAt) {
+				expected := flow.Version
+				flow.NextActionAt = runAt
+				flow.UpdatedAt = now
+				flow.Version = expected + 1
+				if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+					return err
+				}
+			}
+
+			if err := upsertEvaluatePolicyJob(ctx, tx, flow, now, runAt, "jellyfin_webhook", dedupeKey+":eval"); err != nil {
 				return err
 			}
 		}
@@ -321,25 +366,153 @@ func (s *Service) IngestBackfillPlayback(ctx context.Context, events []jellyfin.
 }
 
 func (s *Service) IngestBackfillItems(ctx context.Context, items []jellyfin.ItemSnapshot) error {
+	now := s.now().UTC()
 	for i, it := range items {
 		key := "backfill:item:" + it.ItemID + ":" + strconv.Itoa(i)
-		if err := s.HandleJellyfinWebhook(ctx, jellyfin.WebhookEvent{
-			Payload: jellyfin.WebhookPayload{
-				ItemID:           it.ItemID,
-				ItemType:         it.ItemType,
-				Name:             it.Name,
-				SeasonID:         it.SeasonID,
-				SeasonName:       it.SeasonName,
-				SeriesID:         it.SeriesID,
-				SeriesName:       it.SeriesName,
-				PrimaryImageURL:  it.ImageURL,
-				NotificationType: "ItemChanged",
-			},
-			Raw:       map[string]any{"source": "backfill", "item_id": it.ItemID, "item_type": it.ItemType, "name": it.Name},
-			ItemID:    it.ItemID,
-			EventType: "ItemChanged",
-			DedupeKey: key,
-		}); err != nil {
+		targets := deriveTargets(jellyfin.WebhookEvent{Payload: jellyfin.WebhookPayload{
+			ItemID:          it.ItemID,
+			ItemType:        it.ItemType,
+			Name:            it.Name,
+			SeasonID:        it.SeasonID,
+			SeasonName:      it.SeasonName,
+			SeriesID:        it.SeriesID,
+			SeriesName:      it.SeriesName,
+			PrimaryImageURL: it.ImageURL,
+		}})
+
+		err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+			processed, err := tx.IsProcessed(ctx, key)
+			if err != nil {
+				return err
+			}
+			if processed {
+				return nil
+			}
+
+			existingMedia, mediaFound, err := tx.GetMedia(ctx, it.ItemID)
+			if err != nil {
+				return err
+			}
+
+			media := domain.MediaItem{
+				ItemID:         it.ItemID,
+				Name:           it.Name,
+				Title:          it.Name,
+				ItemType:       it.ItemType,
+				SeasonID:       it.SeasonID,
+				SeasonName:     it.SeasonName,
+				SeriesID:       it.SeriesID,
+				SeriesName:     it.SeriesName,
+				ImageURL:       it.ImageURL,
+				LastPlayedAt:   it.LastPlayedAt,
+				PlayCountTotal: int64(it.PlayCount),
+				UpdatedAt:      now,
+			}
+			if mediaFound {
+				if media.Name == "" {
+					media.Name = existingMedia.Name
+				}
+				if media.Title == "" {
+					media.Title = existingMedia.Title
+				}
+				if media.ItemType == "" {
+					media.ItemType = existingMedia.ItemType
+				}
+				if media.SeasonID == "" {
+					media.SeasonID = existingMedia.SeasonID
+				}
+				if media.SeasonName == "" {
+					media.SeasonName = existingMedia.SeasonName
+				}
+				if media.SeriesID == "" {
+					media.SeriesID = existingMedia.SeriesID
+				}
+				if media.SeriesName == "" {
+					media.SeriesName = existingMedia.SeriesName
+				}
+				if media.ImageURL == "" {
+					media.ImageURL = existingMedia.ImageURL
+				}
+				if existingMedia.LastPlayedAt.After(media.LastPlayedAt) {
+					media.LastPlayedAt = existingMedia.LastPlayedAt
+				}
+				if existingMedia.PlayCountTotal > media.PlayCountTotal {
+					media.PlayCountTotal = existingMedia.PlayCountTotal
+				}
+			}
+			if err := tx.UpsertMedia(ctx, media); err != nil {
+				return err
+			}
+
+			for _, target := range targets {
+				flow, found, err := tx.GetFlow(ctx, target.Canonical)
+				if err != nil {
+					return err
+				}
+				if !found {
+					flow = domain.Flow{
+						FlowID:      flowIDFromItem(target.Canonical),
+						ItemID:      target.Canonical,
+						SubjectType: target.Type,
+						DisplayName: target.Name,
+						ImageURL:    target.ImageURL,
+						State:       domain.FlowStateActive,
+						Version:     0,
+						PolicySnapshot: domain.PolicySnapshot{
+							ExpireAfterDays: defaultExpireDays,
+							HITLTimeoutHrs:  defaultHITLTimeoutH,
+							TimeoutAction:   "delete",
+						},
+						CreatedAt: now,
+					}
+					if err := tx.UpsertFlowCAS(ctx, flow, 0); err != nil {
+						return err
+					}
+				} else {
+					expected := flow.Version
+					flow.DisplayName = target.Name
+					flow.ImageURL = target.ImageURL
+					flow.SubjectType = target.Type
+					flow.Version = expected + 1
+					flow.UpdatedAt = now
+					if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+						return err
+					}
+				}
+
+				if flow.State != domain.FlowStateActive {
+					continue
+				}
+
+				runAt := now.Add(backfillReviewDelay)
+				if !it.LastPlayedAt.IsZero() {
+					dueAt := it.LastPlayedAt.Add(time.Duration(defaultExpireDays) * 24 * time.Hour)
+					if dueAt.After(runAt) {
+						runAt = dueAt
+					}
+				}
+				if flow.NextActionAt.After(runAt) {
+					runAt = flow.NextActionAt
+				}
+
+				if !flow.NextActionAt.Equal(runAt) {
+					expected := flow.Version
+					flow.NextActionAt = runAt
+					flow.UpdatedAt = now
+					flow.Version = expected + 1
+					if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+						return err
+					}
+				}
+
+				if err := upsertEvaluatePolicyJob(ctx, tx, flow, now, runAt, "backfill_index", "backfill:item"); err != nil {
+					return err
+				}
+			}
+
+			return tx.MarkProcessed(ctx, key, now)
+		})
+		if err != nil {
 			return err
 		}
 	}
@@ -460,6 +633,7 @@ func flowIDFromItem(itemID string) string {
 
 func deriveTargets(event jellyfin.WebhookEvent) []targetRef {
 	p := event.Payload
+	allowFallback := true
 	push := func(out []targetRef, t targetRef) []targetRef {
 		if t.ID == "" {
 			return out
@@ -480,25 +654,96 @@ func deriveTargets(event jellyfin.WebhookEvent) []targetRef {
 		seasonLabel := formatSeasonLabel(p.SeasonName, p.SeriesName, p.Name)
 		out = push(out, targetRef{Type: "season", ID: p.SeasonID, Name: seasonLabel, ImageURL: p.PrimaryImageURL})
 		if p.SeasonID == "" {
-			out = push(out, targetRef{Type: "series", ID: p.SeriesID, Name: chooseName(p.SeriesName, p.SeasonName), ImageURL: p.PrimaryImageURL})
+			out = push(out, targetRef{Type: "item", ID: p.ItemID, Name: chooseName(p.Name, p.SeriesName), ImageURL: p.PrimaryImageURL})
 		}
 	case "season":
 		seasonLabel := formatSeasonLabel(chooseName(p.Name, p.SeasonName), p.SeriesName, p.Name)
 		out = push(out, targetRef{Type: "season", ID: p.ItemID, Name: seasonLabel, ImageURL: p.PrimaryImageURL})
-		if p.ItemID == "" {
-			out = push(out, targetRef{Type: "series", ID: p.SeriesID, Name: chooseName(p.SeriesName, p.Name), ImageURL: p.PrimaryImageURL})
-		}
 	case "series":
-		out = push(out, targetRef{Type: "series", ID: p.ItemID, Name: chooseName(p.Name, p.SeriesName), ImageURL: p.PrimaryImageURL})
+		allowFallback = false
 	case "movie":
 		out = push(out, targetRef{Type: "movie", ID: p.ItemID, Name: p.Name, ImageURL: p.PrimaryImageURL})
 	default:
 		out = push(out, targetRef{Type: "item", ID: event.ItemID, Name: chooseName(p.Name, event.ItemID), ImageURL: p.PrimaryImageURL})
 	}
-	if len(out) == 0 && event.ItemID != "" {
+	if allowFallback && len(out) == 0 && event.ItemID != "" {
 		out = push(out, targetRef{Type: "item", ID: event.ItemID, Name: chooseName(p.Name, event.ItemID), ImageURL: p.PrimaryImageURL})
 	}
 	return out
+}
+
+func mostRecentPlayForTarget(ctx context.Context, tx repo.TxRepository, flow domain.Flow) (time.Time, bool, error) {
+	parts := strings.SplitN(flow.ItemID, ":", 3)
+	if len(parts) == 3 && parts[0] == "target" {
+		items, err := tx.ListMediaBySubject(ctx, parts[1], parts[2])
+		if err != nil {
+			return time.Time{}, false, err
+		}
+		latest := time.Time{}
+		for _, item := range items {
+			if item.LastPlayedAt.After(latest) {
+				latest = item.LastPlayedAt
+			}
+		}
+		if latest.IsZero() {
+			return time.Time{}, false, nil
+		}
+		return latest, true, nil
+	}
+
+	item, found, err := tx.GetMedia(ctx, flow.ItemID)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if !found || item.LastPlayedAt.IsZero() {
+		return time.Time{}, false, nil
+	}
+	return item.LastPlayedAt, true, nil
+}
+
+func upsertEvaluatePolicyJob(ctx context.Context, tx repo.TxRepository, flow domain.Flow, now time.Time, runAt time.Time, reason string, idempotencyPrefix string) error {
+	payload, err := json.Marshal(jobs.EvaluatePolicyPayload{Reason: reason})
+	if err != nil {
+		return err
+	}
+
+	jobID := "job:eval:scheduled:" + flow.ItemID
+	job, found, err := tx.GetJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if found {
+		job.FlowID = flow.FlowID
+		job.ItemID = flow.ItemID
+		job.Kind = domain.JobKindEvaluatePolicy
+		job.Status = domain.JobStatusPending
+		job.RunAt = runAt
+		job.LeaseOwner = ""
+		job.LeaseUntil = time.Time{}
+		job.MaxAttempts = 5
+		job.IdempotencyKey = idempotencyPrefix + ":" + flow.ItemID
+		job.PayloadJSON = payload
+		job.LastError = ""
+		job.UpdatedAt = now
+		if job.CreatedAt.IsZero() {
+			job.CreatedAt = now
+		}
+		return tx.UpdateJob(ctx, job)
+	}
+
+	return tx.EnqueueJob(ctx, domain.JobRecord{
+		JobID:          jobID,
+		FlowID:         flow.FlowID,
+		ItemID:         flow.ItemID,
+		Kind:           domain.JobKindEvaluatePolicy,
+		Status:         domain.JobStatusPending,
+		RunAt:          runAt,
+		MaxAttempts:    5,
+		IdempotencyKey: idempotencyPrefix + ":" + flow.ItemID,
+		PayloadJSON:    payload,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
 }
 
 func targetKey(targetType, id string) string {
@@ -520,6 +765,11 @@ func chooseName(values ...string) string {
 		}
 	}
 	return "Unknown"
+}
+
+func isPlaybackEvent(eventType string) bool {
+	t := strings.ToLower(strings.TrimSpace(eventType))
+	return strings.Contains(t, "playback") || strings.Contains(t, "played")
 }
 
 func formatSeasonLabel(seasonName string, seriesName string, fallback string) string {

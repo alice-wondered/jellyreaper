@@ -50,6 +50,19 @@ func Open(path string, mode os.FileMode, options *bbolt.Options) (*Store, error)
 				return fmt.Errorf("create bucket %s: %w", string(name), err)
 			}
 		}
+
+		jobs, err := requireBucket(tx, bucketJobs)
+		if err != nil {
+			return err
+		}
+		dueIndex, err := requireBucket(tx, bucketDueIndex)
+		if err != nil {
+			return err
+		}
+		if err := syncJobsToDueIndex(jobs, dueIndex, time.Now().UTC(), true); err != nil {
+			return fmt.Errorf("reconcile persisted job queue: %w", err)
+		}
+
 		return nil
 	}); err != nil {
 		_ = db.Close()
@@ -101,6 +114,9 @@ func (s *Store) LeaseDueJobs(ctx context.Context, now time.Time, limit int, leas
 		dueIndex, err := requireBucket(tx, bucketDueIndex)
 		if err != nil {
 			return err
+		}
+		if err := syncJobsToDueIndex(jobs, dueIndex, now, false); err != nil {
+			return fmt.Errorf("sync due index: %w", err)
 		}
 
 		maxDue := dueIndexKeyBytes(now, "\xff")
@@ -589,6 +605,57 @@ func putDueIndex(tx *bbolt.Tx, job domain.JobRecord) error {
 
 func putDueIndexBucket(dueIndex *bbolt.Bucket, job domain.JobRecord) error {
 	return dueIndex.Put(dueIndexKeyBytes(job.RunAt, job.JobID), keyBytes(job.JobID))
+}
+
+func syncJobsToDueIndex(jobs *bbolt.Bucket, dueIndex *bbolt.Bucket, now time.Time, clearExisting bool) error {
+	if clearExisting {
+		if err := clearBucket(dueIndex); err != nil {
+			return err
+		}
+	}
+
+	return jobs.ForEach(func(_, value []byte) error {
+		var job domain.JobRecord
+		if err := json.Unmarshal(value, &job); err != nil {
+			return err
+		}
+
+		updated := false
+		if job.Status == domain.JobStatusLeased && !job.LeaseUntil.After(now) {
+			job.Status = domain.JobStatusPending
+			job.LeaseOwner = ""
+			job.LeaseUntil = time.Time{}
+			job.UpdatedAt = now
+			updated = true
+		}
+		if job.Status == domain.JobStatusPending && job.RunAt.IsZero() {
+			job.RunAt = now
+			updated = true
+		}
+
+		if updated {
+			if err := bucketPutJSON(jobs, job.JobID, job); err != nil {
+				return fmt.Errorf("persist reconciled job %s: %w", job.JobID, err)
+			}
+		}
+
+		if job.Status == domain.JobStatusPending {
+			if err := putDueIndexBucket(dueIndex, job); err != nil {
+				return fmt.Errorf("insert due index for %s: %w", job.JobID, err)
+			}
+		}
+		return nil
+	})
+}
+
+func clearBucket(bucket *bbolt.Bucket) error {
+	cursor := bucket.Cursor()
+	for key, _ := cursor.First(); key != nil; key, _ = cursor.Next() {
+		if err := bucket.Delete(key); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func dueIndexKey(runAt time.Time, jobID string) string {
