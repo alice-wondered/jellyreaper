@@ -31,11 +31,16 @@ func newTestStore(t *testing.T) *bboltrepo.Store {
 func seedFlow(t *testing.T, store *bboltrepo.Store, itemID string, title string, state domain.FlowState) {
 	t.Helper()
 	now := time.Date(2026, 4, 8, 10, 0, 0, 0, time.UTC)
+	subjectType := "movie"
+	parts := strings.SplitN(itemID, ":", 3)
+	if len(parts) == 3 && parts[0] == "target" && strings.TrimSpace(parts[1]) != "" {
+		subjectType = strings.TrimSpace(parts[1])
+	}
 	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
 		flow := domain.Flow{
 			FlowID:         "flow:" + itemID,
 			ItemID:         itemID,
-			SubjectType:    "movie",
+			SubjectType:    subjectType,
 			DisplayName:    title,
 			State:          state,
 			Version:        0,
@@ -50,6 +55,25 @@ func seedFlow(t *testing.T, store *bboltrepo.Store, itemID string, title string,
 	})
 	if err != nil {
 		t.Fatalf("seed flow: %v", err)
+	}
+}
+
+func seedMedia(t *testing.T, store *bboltrepo.Store, itemID string, seasonID string, seriesID string, seriesName string) {
+	t.Helper()
+	now := time.Date(2026, 4, 8, 10, 0, 0, 0, time.UTC)
+	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID:     itemID,
+			ItemType:   "Episode",
+			SeasonID:   seasonID,
+			SeriesID:   seriesID,
+			SeriesName: seriesName,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		})
+	})
+	if err != nil {
+		t.Fatalf("seed media: %v", err)
 	}
 }
 
@@ -325,5 +349,57 @@ func TestRememberAliasToolStoresCustomPhrase(t *testing.T) {
 	resolved := h.resolveAlias(threadID, "neo movie")
 	if resolved != "m-41" {
 		t.Fatalf("expected alias to resolve to m-41, got %s", resolved)
+	}
+}
+
+func TestScheduleDeleteProjection_SeriesSchedulesAllSeasonTargets(t *testing.T) {
+	store := newTestStore(t)
+	seedFlow(t, store, "target:season:s-1", "Season 1 of The Office", domain.FlowStateActive)
+	seedFlow(t, store, "target:season:s-2", "Season 2 of The Office", domain.FlowStateActive)
+	seedMedia(t, store, "ep-1", "s-1", "series-1", "The Office")
+	seedMedia(t, store, "ep-2", "s-2", "series-1", "The Office")
+
+	h := NewHarness(store, "", "")
+	h.SetDecisionService(app.NewService(store, nil, nil))
+	threadID := "thread-series-delete"
+
+	out, _, err := h.setDeleteProjectionState(context.Background(), threadID, "the office", "series")
+	if err != nil {
+		t.Fatalf("set delete projection: %v", err)
+	}
+	if !strings.Contains(out, "\"status\":\"needs_confirmation\"") {
+		t.Fatalf("expected confirmation status, got: %s", out)
+	}
+
+	out, _, err = h.handleFollowUp(context.Background(), threadID, "yes")
+	if err != nil {
+		t.Fatalf("confirm delete projection: %v", err)
+	}
+	if !strings.Contains(out, "scheduled_delete_projection") {
+		t.Fatalf("expected projection delete done output, got: %s", out)
+	}
+
+	flow1 := mustGetFlow(t, store, "target:season:s-1")
+	flow2 := mustGetFlow(t, store, "target:season:s-2")
+	if flow1.State != domain.FlowStateDeleteQueued || flow2.State != domain.FlowStateDeleteQueued {
+		t.Fatalf("expected both season flows delete_queued, got %s and %s", flow1.State, flow2.State)
+	}
+}
+
+func TestFuzzySearchTargets_FiltersBySubjectType(t *testing.T) {
+	store := newTestStore(t)
+	seedFlow(t, store, "target:movie:m-1", "Dune", domain.FlowStateActive)
+	seedFlow(t, store, "target:season:s-9", "Season 1 of Dune Series", domain.FlowStateActive)
+
+	h := NewHarness(store, "", "")
+	out, _, err := h.fuzzySearchTargets(context.Background(), "dune", "movie", 10)
+	if err != nil {
+		t.Fatalf("fuzzy search targets: %v", err)
+	}
+	if !strings.Contains(out, "\"count\":1") {
+		t.Fatalf("expected one movie result, got: %s", out)
+	}
+	if !strings.Contains(out, "\"item_id\":\"target:movie:m-1\"") {
+		t.Fatalf("expected movie target in search results, got: %s", out)
 	}
 }

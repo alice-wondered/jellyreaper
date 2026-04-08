@@ -113,6 +113,8 @@ go generate ./api
 - Enabled when `OPENAI_API_KEY` is set.
 - Runs on Discord mention messages and responds in a thread (creates one when needed).
 - Uses tool-calling with `auto` tool choice so the model can decide whether to call tools or respond directly.
+- Includes discovery and control tools for fuzzy target search, target-state inspection, alias memory, and delete/archive scheduling.
+- Supports projection-level delete scheduling (season/series targets) so series cleanup can fan out through normal service workflows.
 - Receives serialized thread context each turn (selected target, pending action, candidate targets, known aliases).
 - Context memory is in-process and LRU-capped by thread to avoid unbounded growth; cache misses can restore recent thread messages from Discord.
 - Responses are designed to stay user-facing (Discord markdown, human-readable wording, no internal IDs).

@@ -25,6 +25,8 @@ const (
 
 	historyLineCapacity = 20
 	maxThreadContexts   = 256
+
+	storageSkill = "Storage/projection skill: flows are stored as targets with ids like target:<subject_type>:<subject_id> and states such as active, pending_review, archived, delete_queued. Media records hold item metadata and projection linkage (season/series ids and names). Season/series projections represent grouped cleanup scope; deleting a season/series projection deletes child items in normal workflow. Discovery strategy: first fuzzy-search targets by title text and optional subject type; inspect target state for specific candidates; when query suggests a series-level action, prefer projection targets (season/series) over individual episode items so scheduling can fan out correctly. Preserve follow-up semantics by asking for clarification when multiple candidates match, then confirm before destructive actions."
 )
 
 type Harness struct {
@@ -87,6 +89,11 @@ type threadState struct {
 	CandidateIDs     []string
 	PendingAction    string
 	AliasToItemID    map[string]string
+
+	ProjectionCandidateKeys []string
+	ProjectionCandidateSet  map[string][]string
+	PendingProjectionIDs    []string
+	PendingProjectionLabel  string
 }
 
 type intent struct {
@@ -154,8 +161,9 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 	system := strings.Join([]string{
 		"You are JellyReaper, a best-effort assistant for one media server.",
 		"Only handle requests related to this media server and its review/archive workflow.",
+		storageSkill,
 		"Use tools to gather data and take actions.",
-		"Tool usage guide: list_ready for queue overviews; query_target_state to inspect one target; remember_alias to bind user phrases to a target; archive_target for archive/unarchive intents; choose_candidate when user provides a numbered option; confirm_pending for yes/no confirmations; set_review_days and set_defer_days for policy tuning.",
+		"Tool usage guide: list_ready for queue overviews; fuzzy_search_targets for discovery; query_target_state to inspect one target; remember_alias to bind user phrases to a target; archive_target for archive/unarchive intents; schedule_delete_target for single-target deletes; schedule_delete_projection for series/season projection deletes; choose_candidate when user provides a numbered option; confirm_pending for yes/no confirmations; set_review_days and set_defer_days for policy tuning.",
 		"Use schedule_delete_target when the user asks to schedule a title for deletion; keep follow-up confirmation semantics consistent.",
 		"Natural-language target resolution guide: prefer known aliases from thread memory first, then exact title, then partial title, and ask clarifying follow-up when ambiguous.",
 		"When multiple targets are possible, present concise choices and invite a short follow-up reply (for example: `title a`, `title b`, or a clearer title).",
@@ -178,9 +186,11 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 	tools := []openai.ChatCompletionToolParam{
 		{Function: shared.FunctionDefinitionParam{Name: "response", Description: openai.String("Send a Discord markdown response back to the user."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"message": map[string]any{"type": "string"}}, "required": []string{"message"}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "list_ready", Description: openai.String("List targets currently ready for review."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 20}}}}},
+		{Function: shared.FunctionDefinitionParam{Name: "fuzzy_search_targets", Description: openai.String("Find targets by fuzzy title/series/season text, optionally filtered by subject type."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "subject_type": map[string]any{"type": "string", "enum": []string{"", "item", "movie", "season", "series"}}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 30}}, "required": []string{"query"}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "query_target_state", Description: openai.String("Inspect state for a target by title text, or current selection when query omitted."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "remember_alias", Description: openai.String("Store a natural-language alias for a specific target so future follow-ups can resolve quickly."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"alias": map[string]any{"type": "string"}, "target_ref": map[string]any{"type": "string"}}, "required": []string{"alias"}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "schedule_delete_target", Description: openai.String("Start schedule-for-deletion flow for a target title."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}}}},
+		{Function: shared.FunctionDefinitionParam{Name: "schedule_delete_projection", Description: openai.String("Schedule deletion for projection targets (season or series), useful for series-level cleanup."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "projection_scope": map[string]any{"type": "string", "enum": []string{"season", "series", "auto"}}}, "required": []string{"query"}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "archive_target", Description: openai.String("Start archive or unarchive flow for a target title."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "archived": map[string]any{"type": "boolean"}}, "required": []string{"archived"}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "choose_candidate", Description: openai.String("Choose one of the numbered candidates from the last disambiguation list."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"number": map[string]any{"type": "integer", "minimum": 1}}, "required": []string{"number"}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "confirm_pending", Description: openai.String("Confirm or cancel the pending archive/unarchive action."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"confirmed": map[string]any{"type": "boolean"}}, "required": []string{"confirmed"}}}},
@@ -281,12 +291,16 @@ func (h *Harness) executeToolCall(ctx context.Context, threadID string, tc opena
 		return `{"ok":true}`, msg, nil
 	case "list_ready":
 		return h.listReady(ctx)
+	case "fuzzy_search_targets":
+		return h.fuzzySearchTargets(ctx, asString(args["query"]), asString(args["subject_type"]), asInt(args["limit"], 12))
 	case "query_target_state":
 		return h.queryTargetState(ctx, threadID, asString(args["query"]))
 	case "remember_alias":
 		return h.rememberAlias(ctx, threadID, asString(args["alias"]), asString(args["target_ref"]))
 	case "schedule_delete_target":
 		return h.setDeleteState(ctx, threadID, asString(args["query"]))
+	case "schedule_delete_projection":
+		return h.setDeleteProjectionState(ctx, threadID, asString(args["query"]), asString(args["projection_scope"]))
 	case "archive_target":
 		archived := asBool(args["archived"], true)
 		return h.setArchiveState(ctx, threadID, asString(args["query"]), archived)
@@ -448,6 +462,7 @@ func (h *Harness) setArchiveState(ctx context.Context, threadID string, query st
 		} else {
 			state.PendingAction = "unarchive"
 		}
+		h.clearProjectionPending(&state)
 		h.setThreadState(threadID, state)
 		flow, ok, _ := h.getFlowByID(ctx, selected)
 		payload := map[string]any{"status": "needs_confirmation", "action": state.PendingAction}
@@ -472,6 +487,7 @@ func (h *Harness) setArchiveState(ctx context.Context, threadID string, query st
 		} else {
 			state.PendingAction = "unarchive"
 		}
+		h.clearProjectionPending(&state)
 		for _, m := range matches {
 			state.CandidateIDs = append(state.CandidateIDs, m.ItemID)
 			h.rememberFlowAlias(&state, m, "")
@@ -501,6 +517,7 @@ func (h *Harness) setArchiveState(ctx context.Context, threadID string, query st
 	} else {
 		state.PendingAction = "unarchive"
 	}
+	h.clearProjectionPending(&state)
 	state.CandidateIDs = nil
 	h.setThreadState(threadID, state)
 
@@ -524,6 +541,7 @@ func (h *Harness) setDeleteState(ctx context.Context, threadID string, query str
 		}
 		state := h.getThreadState(threadID)
 		state.PendingAction = "schedule_delete"
+		h.clearProjectionPending(&state)
 		h.setThreadState(threadID, state)
 		flow, ok, _ := h.getFlowByID(ctx, selected)
 		payload := map[string]any{"status": "needs_confirmation", "action": state.PendingAction}
@@ -544,6 +562,7 @@ func (h *Harness) setDeleteState(ctx context.Context, threadID string, query str
 		state := h.getThreadState(threadID)
 		state.CandidateIDs = make([]string, 0, len(matches))
 		state.PendingAction = "schedule_delete"
+		h.clearProjectionPending(&state)
 		for _, m := range matches {
 			state.CandidateIDs = append(state.CandidateIDs, m.ItemID)
 			h.rememberFlowAlias(&state, m, "")
@@ -569,10 +588,72 @@ func (h *Harness) setDeleteState(ctx context.Context, threadID string, query str
 	state.SelectedTargetID = flow.ItemID
 	h.rememberFlowAlias(&state, flow, "")
 	state.PendingAction = "schedule_delete"
+	h.clearProjectionPending(&state)
 	state.CandidateIDs = nil
 	h.setThreadState(threadID, state)
 
 	return marshalToolResult(map[string]any{"status": "needs_confirmation", "action": state.PendingAction, "target": h.flowToolPayload(ctx, flow)}), "", nil
+}
+
+func (h *Harness) setDeleteProjectionState(ctx context.Context, threadID string, query string, scope string) (string, string, error) {
+	query = strings.TrimSpace(strings.ToLower(query))
+	if query == "" {
+		return marshalToolResult(map[string]any{"status": "needs_query"}), "", nil
+	}
+	scope = strings.TrimSpace(strings.ToLower(scope))
+	if scope == "" {
+		scope = "auto"
+	}
+
+	candidates, err := h.findProjectionDeleteCandidates(ctx, query, scope)
+	if err != nil {
+		return "", "", err
+	}
+	if len(candidates) == 0 {
+		return marshalToolResult(map[string]any{"status": "not_found"}), "", nil
+	}
+	if len(candidates) > 1 {
+		state := h.getThreadState(threadID)
+		state.PendingAction = "schedule_delete_projection"
+		state.CandidateIDs = nil
+		state.ProjectionCandidateSet = map[string][]string{}
+		state.ProjectionCandidateKeys = make([]string, 0, len(candidates))
+		for _, c := range candidates {
+			state.ProjectionCandidateKeys = append(state.ProjectionCandidateKeys, c.Label)
+			state.ProjectionCandidateSet[c.Label] = c.ItemIDs
+		}
+		h.setThreadState(threadID, state)
+
+		options := make([]map[string]any, 0, len(candidates))
+		for i, c := range candidates {
+			options = append(options, map[string]any{
+				"choice":       i + 1,
+				"label":        c.Label,
+				"target_count": len(c.ItemIDs),
+				"subject_type": c.SubjectType,
+			})
+		}
+		return marshalToolResult(map[string]any{"status": "needs_selection", "options": options}), "", nil
+	}
+
+	state := h.getThreadState(threadID)
+	state.PendingAction = "schedule_delete_projection"
+	state.CandidateIDs = nil
+	state.PendingProjectionIDs = candidates[0].ItemIDs
+	state.PendingProjectionLabel = candidates[0].Label
+	state.ProjectionCandidateKeys = nil
+	state.ProjectionCandidateSet = nil
+	h.setThreadState(threadID, state)
+
+	return marshalToolResult(map[string]any{
+		"status": "needs_confirmation",
+		"action": state.PendingAction,
+		"projection": map[string]any{
+			"label":        candidates[0].Label,
+			"target_count": len(candidates[0].ItemIDs),
+			"subject_type": candidates[0].SubjectType,
+		},
+	}), "", nil
 }
 
 func (h *Harness) queryTargetState(ctx context.Context, threadID string, query string) (string, string, error) {
@@ -643,6 +724,26 @@ func (h *Harness) handleFollowUp(ctx context.Context, threadID string, input str
 	trimmed := strings.TrimSpace(strings.ToLower(input))
 	state := h.getThreadState(threadID)
 
+	if len(state.ProjectionCandidateKeys) > 0 {
+		if idx, err := strconv.Atoi(trimmed); err == nil && idx >= 1 && idx <= len(state.ProjectionCandidateKeys) {
+			label := state.ProjectionCandidateKeys[idx-1]
+			ids := state.ProjectionCandidateSet[label]
+			state.PendingProjectionIDs = ids
+			state.PendingProjectionLabel = label
+			state.ProjectionCandidateKeys = nil
+			state.ProjectionCandidateSet = nil
+			h.setThreadState(threadID, state)
+			return marshalToolResult(map[string]any{
+				"status": "needs_confirmation",
+				"action": "schedule_delete_projection",
+				"projection": map[string]any{
+					"label":        label,
+					"target_count": len(ids),
+				},
+			}), "", nil
+		}
+	}
+
 	if len(state.CandidateIDs) > 0 {
 		if idx, err := strconv.Atoi(trimmed); err == nil && idx >= 1 && idx <= len(state.CandidateIDs) {
 			chosenID := state.CandidateIDs[idx-1]
@@ -684,9 +785,11 @@ func (h *Harness) handleFollowUp(ctx context.Context, threadID string, input str
 
 	if trimmed == "yes" && state.PendingAction != "" {
 		if state.SelectedTargetID == "" {
-			state.PendingAction = ""
-			h.setThreadState(threadID, state)
-			return marshalToolResult(map[string]any{"status": "needs_selection"}), "", nil
+			if state.PendingAction != "schedule_delete_projection" || len(state.PendingProjectionIDs) == 0 {
+				state.PendingAction = ""
+				h.setThreadState(threadID, state)
+				return marshalToolResult(map[string]any{"status": "needs_selection"}), "", nil
+			}
 		}
 		var (
 			out string
@@ -699,10 +802,14 @@ func (h *Harness) handleFollowUp(ctx context.Context, threadID string, input str
 			out, err = h.applyArchiveToID(ctx, state.SelectedTargetID, false)
 		case "schedule_delete":
 			out, err = h.applyScheduleDeleteToID(ctx, state.SelectedTargetID)
+		case "schedule_delete_projection":
+			out, err = h.applyScheduleDeleteProjection(ctx, state.PendingProjectionIDs, state.PendingProjectionLabel)
 		default:
 			err = fmt.Errorf("unsupported pending action %q", state.PendingAction)
 		}
 		state.PendingAction = ""
+		state.PendingProjectionIDs = nil
+		state.PendingProjectionLabel = ""
 		h.setThreadState(threadID, state)
 		if err != nil {
 			return "", "", err
@@ -711,6 +818,10 @@ func (h *Harness) handleFollowUp(ctx context.Context, threadID string, input str
 	}
 	if trimmed == "no" && state.PendingAction != "" {
 		state.PendingAction = ""
+		state.PendingProjectionIDs = nil
+		state.PendingProjectionLabel = ""
+		state.ProjectionCandidateKeys = nil
+		state.ProjectionCandidateSet = nil
 		h.setThreadState(threadID, state)
 		return marshalToolResult(map[string]any{"status": "cancelled"}), "", nil
 	}
@@ -771,6 +882,159 @@ func (h *Harness) applyScheduleDeleteToID(ctx context.Context, itemID string) (s
 	return marshalToolResult(map[string]any{"status": "done", "action": "scheduled_delete", "title": name}), nil
 }
 
+func (h *Harness) applyScheduleDeleteProjection(ctx context.Context, itemIDs []string, label string) (string, error) {
+	decision := h.getDecisionService()
+	if decision == nil {
+		return "", fmt.Errorf("decision service is not configured")
+	}
+	if len(itemIDs) == 0 {
+		return marshalToolResult(map[string]any{"status": "not_found"}), nil
+	}
+	applied := 0
+	for _, itemID := range itemIDs {
+		if strings.TrimSpace(itemID) == "" {
+			continue
+		}
+		if err := decision.ApplyAIDecision(ctx, itemID, "delete"); err != nil {
+			return "", err
+		}
+		applied++
+	}
+	if strings.TrimSpace(label) == "" {
+		label = "projection"
+	}
+	return marshalToolResult(map[string]any{"status": "done", "action": "scheduled_delete_projection", "label": label, "target_count": applied}), nil
+}
+
+type projectionCandidate struct {
+	Label       string
+	SubjectType string
+	ItemIDs     []string
+}
+
+func (h *Harness) findProjectionDeleteCandidates(ctx context.Context, query string, scope string) ([]projectionCandidate, error) {
+	query = strings.TrimSpace(strings.ToLower(query))
+	results := make([]projectionCandidate, 0)
+	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		flows, err := tx.ListFlows(ctx)
+		if err != nil {
+			return err
+		}
+
+		if scope == "series" || scope == "auto" {
+			groups := map[string]projectionCandidate{}
+			for _, f := range flows {
+				if strings.ToLower(strings.TrimSpace(f.SubjectType)) != "season" {
+					continue
+				}
+				seasonID := projectionSubjectID(f.ItemID)
+				if seasonID == "" {
+					continue
+				}
+				episodes, err := tx.ListMediaBySubject(ctx, "season", seasonID)
+				if err != nil {
+					return err
+				}
+				seriesName := ""
+				seriesID := ""
+				for _, ep := range episodes {
+					if strings.TrimSpace(ep.SeriesName) != "" {
+						seriesName = strings.TrimSpace(ep.SeriesName)
+					}
+					if strings.TrimSpace(ep.SeriesID) != "" {
+						seriesID = strings.TrimSpace(ep.SeriesID)
+					}
+					if seriesName != "" && seriesID != "" {
+						break
+					}
+				}
+				if seriesName == "" {
+					continue
+				}
+				hay := strings.ToLower(seriesName + " " + f.DisplayName)
+				if !strings.Contains(hay, query) {
+					continue
+				}
+				key := strings.ToLower(seriesID)
+				if key == "" {
+					key = strings.ToLower(seriesName)
+				}
+				group := groups[key]
+				if group.Label == "" {
+					group.Label = seriesName
+					group.SubjectType = "season"
+				}
+				group.ItemIDs = append(group.ItemIDs, f.ItemID)
+				groups[key] = group
+			}
+			for _, g := range groups {
+				results = append(results, g)
+			}
+			if len(results) > 0 {
+				return nil
+			}
+		}
+
+		for _, f := range flows {
+			subject := strings.ToLower(strings.TrimSpace(f.SubjectType))
+			if scope == "season" && subject != "season" {
+				continue
+			}
+			if scope == "series" && subject != "series" {
+				continue
+			}
+			if scope == "auto" && subject != "season" && subject != "series" {
+				continue
+			}
+			hay := strings.ToLower(strings.TrimSpace(f.DisplayName + " " + f.ItemID))
+			if strings.Contains(hay, query) {
+				results = append(results, projectionCandidate{Label: strings.TrimSpace(f.DisplayName), SubjectType: subject, ItemIDs: []string{f.ItemID}})
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return strings.ToLower(results[i].Label) < strings.ToLower(results[j].Label)
+	})
+	return results, nil
+}
+
+func projectionSubjectID(targetID string) string {
+	parts := strings.SplitN(strings.TrimSpace(targetID), ":", 3)
+	if len(parts) != 3 || parts[0] != "target" {
+		return ""
+	}
+	return parts[2]
+}
+
+func (h *Harness) fuzzySearchTargets(ctx context.Context, query string, subjectType string, limit int) (string, string, error) {
+	query = strings.TrimSpace(strings.ToLower(query))
+	subjectType = strings.TrimSpace(strings.ToLower(subjectType))
+	if query == "" {
+		return marshalToolResult(map[string]any{"status": "needs_query"}), "", nil
+	}
+	if limit <= 0 || limit > 30 {
+		limit = 12
+	}
+	matches, err := h.findFlowMatchesFiltered(ctx, query, subjectType)
+	if err != nil {
+		return "", "", err
+	}
+	if len(matches) > limit {
+		matches = matches[:limit]
+	}
+	out := make([]map[string]any, 0, len(matches))
+	for _, f := range matches {
+		p := h.flowToolPayload(ctx, f)
+		p["item_id"] = f.ItemID
+		out = append(out, p)
+	}
+	return marshalToolResult(map[string]any{"status": "ok", "count": len(out), "results": out}), "", nil
+}
+
 func (h *Harness) getDecisionService() DecisionService {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -814,13 +1078,22 @@ func (h *Harness) flowToolPayload(ctx context.Context, flow domain.Flow) map[str
 }
 
 func (h *Harness) findFlowMatches(ctx context.Context, query string) ([]domain.Flow, error) {
+	return h.findFlowMatchesFiltered(ctx, query, "")
+}
+
+func (h *Harness) findFlowMatchesFiltered(ctx context.Context, query string, subjectType string) ([]domain.Flow, error) {
 	matches := make([]domain.Flow, 0)
+	query = strings.TrimSpace(strings.ToLower(query))
+	subjectType = strings.TrimSpace(strings.ToLower(subjectType))
 	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
 		flows, err := tx.ListFlows(ctx)
 		if err != nil {
 			return err
 		}
 		for _, f := range flows {
+			if subjectType != "" && strings.ToLower(strings.TrimSpace(f.SubjectType)) != subjectType {
+				continue
+			}
 			hay := strings.ToLower(strings.TrimSpace(f.DisplayName + " " + f.ItemID))
 			if strings.Contains(hay, query) {
 				matches = append(matches, f)
@@ -973,6 +1246,16 @@ func (h *Harness) rememberFlowAlias(state *threadState, flow domain.Flow, extraA
 	}
 }
 
+func (h *Harness) clearProjectionPending(state *threadState) {
+	if state == nil {
+		return
+	}
+	state.PendingProjectionIDs = nil
+	state.PendingProjectionLabel = ""
+	state.ProjectionCandidateKeys = nil
+	state.ProjectionCandidateSet = nil
+}
+
 func (h *Harness) rememberCandidateLabels(state *threadState, matches []domain.Flow) {
 	if state == nil || len(matches) == 0 {
 		return
@@ -1097,6 +1380,33 @@ func (h *Harness) serializeThreadContext(ctx context.Context, state threadState)
 		}
 	} else {
 		b.WriteString("candidate_targets=none\n")
+	}
+
+	if len(state.ProjectionCandidateKeys) > 0 {
+		b.WriteString("projection_candidates=\n")
+		for i, label := range state.ProjectionCandidateKeys {
+			b.WriteString("- ")
+			b.WriteString(strconv.Itoa(i + 1))
+			b.WriteString(": ")
+			b.WriteString(label)
+			b.WriteString(" (")
+			b.WriteString(strconv.Itoa(len(state.ProjectionCandidateSet[label])))
+			b.WriteString(" targets)\n")
+		}
+	} else {
+		b.WriteString("projection_candidates=none\n")
+	}
+	if len(state.PendingProjectionIDs) > 0 {
+		b.WriteString("pending_projection=")
+		b.WriteString(strings.TrimSpace(state.PendingProjectionLabel))
+		if strings.TrimSpace(state.PendingProjectionLabel) == "" {
+			b.WriteString("projection")
+		}
+		b.WriteString(" (")
+		b.WriteString(strconv.Itoa(len(state.PendingProjectionIDs)))
+		b.WriteString(" targets)\n")
+	} else {
+		b.WriteString("pending_projection=none\n")
 	}
 
 	if len(state.AliasToItemID) == 0 {
