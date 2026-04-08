@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -35,6 +36,9 @@ const backfillCheckpointKey = "backfill.last_success_at"
 const (
 	backfillRetryBaseDelay = time.Second
 	backfillRetryMaxDelay  = 2 * time.Minute
+	fetchRetryMaxAttempts  = 5
+	fetchRetryBaseDelay    = 250 * time.Millisecond
+	fetchRetryMaxDelay     = 30 * time.Second
 )
 
 func main() {
@@ -207,6 +211,9 @@ func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.R
 		for {
 			err := runBackfillOnce(ctx, logger, repository, appService, discordService, cfg, backfillSvc, isStartup)
 			if err == nil {
+				if attempt > 0 {
+					logger.Info("backfill recovered after retries", "failed_attempts", attempt)
+				}
 				return
 			}
 			if ctx.Err() != nil {
@@ -252,12 +259,12 @@ func runBackfillOnce(ctx context.Context, logger *slog.Logger, repository repo.R
 
 	startedAt := time.Now().UTC()
 	logger.Info("backfill fetch started", "since", since, "page_limit", cfg.BackfillLimit)
-	plays, err := fetchPlaybackWithRetry(ctx, backfillSvc, since, cfg.BackfillLimit)
+	plays, err := fetchPlaybackWithRetry(ctx, logger, backfillSvc, since, cfg.BackfillLimit)
 	if err != nil {
 		return fmt.Errorf("backfill playback fetch failed (since=%s): %w", since.Format(time.RFC3339), err)
 	}
 	logger.Info("backfill playback fetch complete", "fetched", len(plays), "since", since)
-	items, err := fetchChangedItemsWithRetry(ctx, backfillSvc, since, cfg.BackfillLimit)
+	items, err := fetchChangedItemsWithRetry(ctx, logger, backfillSvc, since, cfg.BackfillLimit)
 	if err != nil {
 		return fmt.Errorf("backfill item fetch failed (since=%s): %w", since.Format(time.RFC3339), err)
 	}
@@ -399,36 +406,72 @@ func saveBackfillCheckpoint(ctx context.Context, repository repo.Repository, at 
 	})
 }
 
-func fetchPlaybackWithRetry(ctx context.Context, backfillSvc *jellyfin.BackfillService, since time.Time, limit int32) ([]jellyfin.PlaybackEvent, error) {
+func fetchPlaybackWithRetry(ctx context.Context, logger *slog.Logger, backfillSvc *jellyfin.BackfillService, since time.Time, limit int32) ([]jellyfin.PlaybackEvent, error) {
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < fetchRetryMaxAttempts; attempt++ {
 		plays, err := backfillSvc.FetchPlaybackEventsSince(ctx, since, limit)
 		if err == nil {
+			if attempt > 0 {
+				logger.Info("backfill playback fetch recovered", "attempt", attempt+1, "since", since)
+			}
 			return plays, nil
 		}
 		lastErr = err
+
+		delay := retryBackoffDelay(attempt, fetchRetryBaseDelay, fetchRetryMaxDelay)
+		logger.Warn("backfill playback fetch retrying",
+			"attempt", attempt+1,
+			"max_attempts", fetchRetryMaxAttempts,
+			"retry_in", delay,
+			"since", since,
+			"rate_limited", isRateLimitErr(err),
+			"error", err,
+		)
+
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(time.Duration(attempt+1) * time.Second):
+		case <-time.After(delay):
 		}
 	}
 	return nil, lastErr
 }
 
-func fetchChangedItemsWithRetry(ctx context.Context, backfillSvc *jellyfin.BackfillService, since time.Time, limit int32) ([]jellyfin.ItemSnapshot, error) {
+func fetchChangedItemsWithRetry(ctx context.Context, logger *slog.Logger, backfillSvc *jellyfin.BackfillService, since time.Time, limit int32) ([]jellyfin.ItemSnapshot, error) {
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < fetchRetryMaxAttempts; attempt++ {
 		items, err := backfillSvc.FetchChangedItemsSince(ctx, since, limit)
 		if err == nil {
+			if attempt > 0 {
+				logger.Info("backfill item fetch recovered", "attempt", attempt+1, "since", since)
+			}
 			return items, nil
 		}
 		lastErr = err
+
+		delay := retryBackoffDelay(attempt, fetchRetryBaseDelay, fetchRetryMaxDelay)
+		logger.Warn("backfill item fetch retrying",
+			"attempt", attempt+1,
+			"max_attempts", fetchRetryMaxAttempts,
+			"retry_in", delay,
+			"since", since,
+			"rate_limited", isRateLimitErr(err),
+			"error", err,
+		)
+
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(time.Duration(attempt+1) * time.Second):
+		case <-time.After(delay):
 		}
 	}
 	return nil, lastErr
+}
+
+func isRateLimitErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "429") || strings.Contains(msg, "rate limit") || strings.Contains(msg, "too many requests")
 }

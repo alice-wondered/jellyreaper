@@ -78,3 +78,15 @@ func TestRetryBackoffDelayCapsAtMaximum(t *testing.T) {
 		t.Fatalf("attempt 20: got=%s want=%s", got, 8*time.Second)
 	}
 }
+
+func TestIsRateLimitErr(t *testing.T) {
+	if !isRateLimitErr(errors.New("items query returned status 429")) {
+		t.Fatal("expected 429 errors to be treated as rate limited")
+	}
+	if !isRateLimitErr(errors.New("Too Many Requests from upstream")) {
+		t.Fatal("expected too-many-requests errors to be treated as rate limited")
+	}
+	if isRateLimitErr(errors.New("connection reset by peer")) {
+		t.Fatal("did not expect unrelated errors to be rate limited")
+	}
+}
