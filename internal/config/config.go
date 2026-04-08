@@ -30,6 +30,7 @@ const (
 	defaultBackfillWriteQueueCapacity = 2000
 	defaultDelayWindow                = 15 * 24 * time.Hour
 	defaultLastPlayedThresholdDays    = 60
+	defaultHITLTimeoutHours           = 48
 )
 
 type Config struct {
@@ -65,6 +66,7 @@ type Config struct {
 
 	DefaultDelayWindow             time.Duration
 	DefaultLastPlayedThresholdDays int
+	DefaultHITLTimeoutHours        int
 }
 
 func LoadFromEnv() (Config, error) {
@@ -179,6 +181,15 @@ func LoadFromEnv() (Config, error) {
 		defaultLastPlayedThresholdDays = parsed
 	}
 
+	defaultHITLTimeoutHours := defaultHITLTimeoutHours
+	if raw := strings.TrimSpace(os.Getenv("DEFAULT_HITL_TIMEOUT_HOURS")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			return Config{}, fmt.Errorf("parse DEFAULT_HITL_TIMEOUT_HOURS: must be a positive integer")
+		}
+		defaultHITLTimeoutHours = parsed
+	}
+
 	cfg := Config{
 		HTTPAddr: httpAddr,
 		HTTPPort: httpPort,
@@ -210,6 +221,7 @@ func LoadFromEnv() (Config, error) {
 
 		DefaultDelayWindow:             defaultDelayWindow,
 		DefaultLastPlayedThresholdDays: defaultLastPlayedThresholdDays,
+		DefaultHITLTimeoutHours:        defaultHITLTimeoutHours,
 	}
 
 	if raw := os.Getenv("DISCORD_PUBLIC_KEY_HEX"); raw != "" {

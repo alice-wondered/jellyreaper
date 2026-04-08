@@ -746,6 +746,59 @@ func TestSendHITLPromptHandlerAppliesMinimumResponseWindow(t *testing.T) {
 	}
 }
 
+func TestSendHITLPromptHandlerUsesPolicyTimeoutHoursForDeadline(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID: "flow:item-timeout-hours",
+			ItemID: "item-timeout-hours",
+			State:  domain.FlowStatePendingReview,
+			PolicySnapshot: domain.PolicySnapshot{
+				ExpireAfterDays: 30,
+				HITLTimeoutHrs:  72,
+				TimeoutAction:   "delete",
+			},
+			Version:   0,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	pub, _, _ := ed25519.GenerateKey(nil)
+	discordSvc, err := discord.NewService("", pub)
+	if err != nil {
+		t.Fatalf("discord service: %v", err)
+	}
+	discordSvc.SetSendPromptHookForTest(func(context.Context, string, string, int64, string, string, string) (string, error) {
+		return "msg-timeout-hours", nil
+	})
+
+	h := NewSendHITLPromptHandler(store, nil, discordSvc, "channel-1", 24*time.Hour)
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "prompt-timeout-hours", ItemID: "item-timeout-hours"}); err != nil {
+		t.Fatalf("handle prompt: %v", err)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(context.Background(), "item-timeout-hours")
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatal("expected flow")
+		}
+		if flow.DecisionDeadlineAt.Before(now.Add(71 * time.Hour)) {
+			t.Fatalf("expected deadline to honor policy timeout hours, got %s", flow.DecisionDeadlineAt)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify flow: %v", err)
+	}
+}
+
 func TestSendHITLPromptHandlerIncludesLastPlayedStatusLine(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()

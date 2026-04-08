@@ -554,6 +554,9 @@ func TestSetGlobalPolicyDefaultsUpdateMetaOnly(t *testing.T) {
 	if err := svc.SetGlobalDeferDays(context.Background(), 15); err != nil {
 		t.Fatalf("set global defer days: %v", err)
 	}
+	if err := svc.SetGlobalHITLTimeoutHours(context.Background(), 72); err != nil {
+		t.Fatalf("set global hitl timeout hours: %v", err)
+	}
 
 	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
 		raw, ok, err := tx.GetMeta(context.Background(), metaReviewDays)
@@ -569,6 +572,13 @@ func TestSetGlobalPolicyDefaultsUpdateMetaOnly(t *testing.T) {
 		}
 		if !ok || raw != "15" {
 			return fmt.Errorf("unexpected defer meta value: ok=%v raw=%q", ok, raw)
+		}
+		raw, ok, err = tx.GetMeta(context.Background(), metaHITLTimeoutHours)
+		if err != nil {
+			return err
+		}
+		if !ok || raw != "72" {
+			return fmt.Errorf("unexpected hitl timeout meta value: ok=%v raw=%q", ok, raw)
 		}
 
 		flowA, found, err := tx.GetFlow(context.Background(), "target:season:s-g1")

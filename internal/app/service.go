@@ -26,6 +26,7 @@ const (
 	defaultHITLTimeoutH          = 48
 	metaReviewDays               = "settings.review_days"
 	metaDeferDays                = "settings.defer_days"
+	metaHITLTimeoutHours         = "settings.hitl_timeout_hours"
 	backfillReviewDelay          = 24 * time.Hour
 	ingestProgressEvery          = 200
 	defaultBackfillBatchSize     = 100
@@ -55,6 +56,7 @@ type Service struct {
 	now                   func() time.Time
 	defaultDelayWindow    time.Duration
 	defaultExpireDays     int
+	defaultHITLTimeoutHrs int
 	backfillBatchSize     int
 	backfillBatchTimeout  time.Duration
 	backfillQueueCapacity int
@@ -74,6 +76,7 @@ func NewService(repository repo.Repository, logger *slog.Logger, wake func(time.
 		now:                   time.Now,
 		defaultDelayWindow:    defaultDelayDuration,
 		defaultExpireDays:     defaultExpireDays,
+		defaultHITLTimeoutHrs: defaultHITLTimeoutH,
 		backfillBatchSize:     defaultBackfillBatchSize,
 		backfillBatchTimeout:  defaultBackfillBatchTimeout,
 		backfillQueueCapacity: defaultBackfillQueueCapacity,
@@ -86,6 +89,12 @@ func (s *Service) SetPolicyDefaults(defaultExpireDays int, defaultDelayWindow ti
 	}
 	if defaultDelayWindow > 0 {
 		s.defaultDelayWindow = defaultDelayWindow
+	}
+}
+
+func (s *Service) SetDefaultHITLTimeoutHours(hours int) {
+	if hours > 0 {
+		s.defaultHITLTimeoutHrs = hours
 	}
 }
 
@@ -107,12 +116,22 @@ func (s *Service) SetGlobalDeferDays(ctx context.Context, days int) error {
 	})
 }
 
-func (s *Service) currentDefaultsFromMeta(ctx context.Context, tx repo.TxRepository) (int, time.Duration, error) {
+func (s *Service) SetGlobalHITLTimeoutHours(ctx context.Context, hours int) error {
+	if hours <= 0 || hours > 8760 {
+		return fmt.Errorf("hitl timeout hours must be between 1 and 8760")
+	}
+	return s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		return tx.SetMeta(ctx, metaHITLTimeoutHours, strconv.Itoa(hours))
+	})
+}
+
+func (s *Service) currentDefaultsFromMeta(ctx context.Context, tx repo.TxRepository) (int, time.Duration, int, error) {
 	reviewDays := s.defaultExpireDays
 	deferWindow := s.defaultDelayWindow
+	hitlTimeoutHours := s.defaultHITLTimeoutHrs
 
 	if raw, ok, err := tx.GetMeta(ctx, metaReviewDays); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	} else if ok {
 		if parsed, convErr := strconv.Atoi(strings.TrimSpace(raw)); convErr == nil && parsed > 0 {
 			reviewDays = parsed
@@ -120,14 +139,22 @@ func (s *Service) currentDefaultsFromMeta(ctx context.Context, tx repo.TxReposit
 	}
 
 	if raw, ok, err := tx.GetMeta(ctx, metaDeferDays); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	} else if ok {
 		if parsed, convErr := strconv.Atoi(strings.TrimSpace(raw)); convErr == nil && parsed > 0 {
 			deferWindow = time.Duration(parsed) * 24 * time.Hour
 		}
 	}
 
-	return reviewDays, deferWindow, nil
+	if raw, ok, err := tx.GetMeta(ctx, metaHITLTimeoutHours); err != nil {
+		return 0, 0, 0, err
+	} else if ok {
+		if parsed, convErr := strconv.Atoi(strings.TrimSpace(raw)); convErr == nil && parsed > 0 {
+			hitlTimeoutHours = parsed
+		}
+	}
+
+	return reviewDays, deferWindow, hitlTimeoutHours, nil
 }
 
 func (s *Service) SetBackfillWriteBatching(size int, timeout time.Duration, queueCapacity int) {
@@ -206,7 +233,7 @@ func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.Web
 }
 
 func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxRepository, event jellyfin.WebhookEvent, now, eventAt time.Time, playbackEvent, catalogIndexEvent, removalEvent bool, dedupeKey, itemID string, targets []targetRef, finalizations *[]hitlFinalizeRequest) error {
-	defaultReviewDays, _, err := s.currentDefaultsFromMeta(ctx, tx)
+	defaultReviewDays, _, defaultHITLTimeoutHours, err := s.currentDefaultsFromMeta(ctx, tx)
 	if err != nil {
 		return err
 	}
@@ -384,7 +411,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 				Version:     0,
 				PolicySnapshot: domain.PolicySnapshot{
 					ExpireAfterDays: defaultReviewDays,
-					HITLTimeoutHrs:  defaultHITLTimeoutH,
+					HITLTimeoutHrs:  defaultHITLTimeoutHours,
 					TimeoutAction:   "delete",
 				},
 				LastCatalogEventAt: eventAt,
@@ -543,7 +570,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 	resolvedAction := parsed.Action
 
 	err = s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
-		_, defaultDeferWindow, err := s.currentDefaultsFromMeta(ctx, tx)
+		_, defaultDeferWindow, _, err := s.currentDefaultsFromMeta(ctx, tx)
 		if err != nil {
 			return err
 		}

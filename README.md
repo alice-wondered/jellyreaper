@@ -183,6 +183,7 @@ Behavior:
 |---|---:|---|---|
 | `DEFAULT_DELAY_WINDOW` | no | `15d` | default delay window for Delay actions (supports `d` suffix, e.g. `15d`) |
 | `DEFAULT_LAST_PLAYED_THRESHOLD_DAYS` | no | `60` | default review threshold when policy is unset/new |
+| `DEFAULT_HITL_TIMEOUT_HOURS` | no | `48` | default HITL review window in hours before timeout enqueues delete |
 
 Notes:
 - Global AI policy updates are meta-based and lazy by design.

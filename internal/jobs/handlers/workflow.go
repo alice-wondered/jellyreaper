@@ -18,23 +18,31 @@ import (
 
 const minHITLResponseWindow = 24 * time.Hour
 const metaReviewDays = "settings.review_days"
+const metaHITLTimeoutHours = "settings.hitl_timeout_hours"
 
 type EvaluatePolicyHandler struct {
 	repository        repo.Repository
 	logger            *slog.Logger
 	defaultExpireDays int
+	defaultHITLHours  int
 }
 
 func NewEvaluatePolicyHandler(repository repo.Repository, logger *slog.Logger) *EvaluatePolicyHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &EvaluatePolicyHandler{repository: repository, logger: logger, defaultExpireDays: 30}
+	return &EvaluatePolicyHandler{repository: repository, logger: logger, defaultExpireDays: 30, defaultHITLHours: 48}
 }
 
 func (h *EvaluatePolicyHandler) SetDefaultExpireDays(days int) {
 	if days > 0 {
 		h.defaultExpireDays = days
+	}
+}
+
+func (h *EvaluatePolicyHandler) SetDefaultHITLTimeoutHours(hours int) {
+	if hours > 0 {
+		h.defaultHITLHours = hours
 	}
 }
 
@@ -77,6 +85,22 @@ func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord
 		}
 		if expireDays <= 0 {
 			expireDays = h.defaultExpireDays
+		}
+
+		hitlTimeoutHours := flow.PolicySnapshot.HITLTimeoutHrs
+		if raw, ok, err := tx.GetMeta(ctx, metaHITLTimeoutHours); err != nil {
+			return err
+		} else if ok {
+			if parsed, convErr := strconv.Atoi(strings.TrimSpace(raw)); convErr == nil && parsed > 0 {
+				hitlTimeoutHours = parsed
+			}
+		}
+		if hitlTimeoutHours <= 0 {
+			hitlTimeoutHours = h.defaultHITLHours
+		}
+		flow.PolicySnapshot.HITLTimeoutHrs = hitlTimeoutHours
+		if strings.TrimSpace(flow.PolicySnapshot.TimeoutAction) == "" {
+			flow.PolicySnapshot.TimeoutAction = "delete"
 		}
 
 		lastPlayed, known, err := mostRecentPlayForFlow(ctx, tx, flow)
@@ -354,7 +378,11 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 
 		expected := current.Version
 		current.State = domain.FlowStatePendingReview
-		deadline := now.Add(h.hitlTimeout)
+		timeoutWindow := h.hitlTimeout
+		if hours := current.PolicySnapshot.HITLTimeoutHrs; hours > 0 {
+			timeoutWindow = time.Duration(hours) * time.Hour
+		}
+		deadline := now.Add(timeoutWindow)
 		minDeadline := now.Add(minHITLResponseWindow)
 		if deadline.Before(minDeadline) {
 			deadline = minDeadline

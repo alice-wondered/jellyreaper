@@ -115,11 +115,13 @@ func main() {
 
 	evaluatePolicyHandler := handlers.NewEvaluatePolicyHandler(store, logger)
 	evaluatePolicyHandler.SetDefaultExpireDays(cfg.DefaultLastPlayedThresholdDays)
+	evaluatePolicyHandler.SetDefaultHITLTimeoutHours(cfg.DefaultHITLTimeoutHours)
 	executeDeleteHandler := handlers.NewExecuteDeleteHandler(store, jellyfin.NewClient(cfg.JellyfinURL, cfg.JellyfinAPIKey, nil))
 	executeDeleteHandler.SetDiscordService(discordService)
+	hitlTimeout := time.Duration(cfg.DefaultHITLTimeoutHours) * time.Hour
 	handlerList := []jobs.JobHandler{
 		evaluatePolicyHandler,
-		handlers.NewSendHITLPromptHandler(store, logger, discordService, cfg.DiscordChannelID, 48*time.Hour),
+		handlers.NewSendHITLPromptHandler(store, logger, discordService, cfg.DiscordChannelID, hitlTimeout),
 		handlers.NewHITLTimeoutHandler(store, discordService, logger),
 		executeDeleteHandler,
 		handlers.NewNoopHandler(domain.JobKindVerifyDelete, logger),
@@ -142,6 +144,7 @@ func main() {
 	appService := app.NewService(store, logger, wake)
 	appService.SetDiscordService(discordService)
 	appService.SetPolicyDefaults(cfg.DefaultLastPlayedThresholdDays, cfg.DefaultDelayWindow)
+	appService.SetDefaultHITLTimeoutHours(cfg.DefaultHITLTimeoutHours)
 	if assistant != nil {
 		assistant.SetDecisionService(appService)
 	}

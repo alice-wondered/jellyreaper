@@ -23,7 +23,7 @@ const (
 	historyLineCapacity = 20
 	maxThreadContexts   = 256
 
-	storageSkill = "Domain skill: A flow is the scheduler-owned lifecycle record for a projection target. Flows have ids like target:<subject_type>:<subject_id>, policy state (active, pending_review, archived, delete_queued), scheduling fields (next_action_at/deadlines), and Discord/HITL context. Scheduler/HITL operational subject types are movie and season only. A movie projection maps one movie; a season projection maps all episodes in that season. Higher-level user intents (for example series-level requests) should be translated into movie/season operations before handoff. Media items are catalog/playback records and are not direct AI operation targets. The assistant should discover projection flows, then hand off actions to domain services (which enqueue jobs, drive scheduler transitions, and perform cleanup fanout). For deletion, only schedule projection flow deletes; do not attempt individual item-level deletes."
+	storageSkill = "Domain skill: A flow is the scheduler-owned lifecycle record for a projection target. Flows have ids like target:<subject_type>:<subject_id>, policy state (active, pending_review, archived, delete_queued), policy knobs (review days, defer days, HITL timeout hours), scheduling fields (next_action_at/deadlines), and Discord/HITL context. Scheduler/HITL operational subject types are movie and season only. A movie projection maps one movie; a season projection maps all episodes in that season. Higher-level user intents (for example series-level requests) should be translated into movie/season operations before handoff. Media items are catalog/playback records and are not direct AI operation targets. The assistant should discover projection flows, then hand off actions to domain services (which enqueue jobs, drive scheduler transitions, and perform cleanup fanout). For deletion, only schedule projection flow deletes; do not attempt individual item-level deletes."
 )
 
 type Harness struct {
@@ -47,6 +47,7 @@ type DecisionService interface {
 	ApplyAIDelayDays(context.Context, string, int) error
 	SetGlobalReviewDays(context.Context, int) error
 	SetGlobalDeferDays(context.Context, int) error
+	SetGlobalHITLTimeoutHours(context.Context, int) error
 }
 
 type ringBuffer struct {
@@ -159,8 +160,9 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 		"Only handle requests related to this media server and its review/archive workflow.",
 		storageSkill,
 		"Use tools to gather data and take actions.",
-		"Tool usage guide: list_ready for queue overviews; fuzzy_search_targets for discovery; query_target_state to inspect one target; remember_alias to bind user phrases to a target; archive_target for archive/unarchive intents; schedule_delete for deletion scheduling on one projection target; schedule_delete_many for show-level intents mapped to multiple season targets; delay_target_days to defer a target by an explicit number of days; choose_candidate when user provides a numbered option; confirm_pending for yes/no confirmations; set_review_days and set_defer_days for policy tuning.",
+		"Tool usage guide: list_ready for queue overviews; fuzzy_search_targets for discovery; query_target_state to inspect one target; remember_alias to bind user phrases to a target; archive_target for archive/unarchive intents; schedule_delete for deletion scheduling on one projection target; schedule_delete_many for show-level intents mapped to multiple season targets; delay_target_days to defer a target by an explicit number of days; choose_candidate when user provides a numbered option; confirm_pending for yes/no confirmations; set_review_days, set_defer_days, and set_hitl_timeout_hours for policy tuning.",
 		"Use schedule_delete for deletion requests; rely on domain logic for item vs projection delete semantics.",
+		"When asked to change how long HITL waits before timeout, use set_hitl_timeout_hours.",
 		"Natural-language target resolution guide: prefer known aliases from thread memory first, then exact title, then partial title, and ask clarifying follow-up when ambiguous.",
 		"When multiple targets are possible, present concise choices and invite a short follow-up reply (for example: `title a`, `title b`, or a clearer title).",
 		"When you reply, use Discord markdown and keep it conversational and concise.",
@@ -193,6 +195,7 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 		{Function: shared.FunctionDefinitionParam{Name: "confirm_pending", Description: openai.String("Confirm or cancel the pending archive/unarchive action."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"confirmed": map[string]any{"type": "boolean"}}, "required": []string{"confirmed"}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "set_review_days", Description: openai.String("Set policy review period in days for active flows."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"days": map[string]any{"type": "integer", "minimum": 1, "maximum": 3650}}, "required": []string{"days"}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "set_defer_days", Description: openai.String("Set default defer period in days."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"days": map[string]any{"type": "integer", "minimum": 1, "maximum": 365}}, "required": []string{"days"}}}},
+		{Function: shared.FunctionDefinitionParam{Name: "set_hitl_timeout_hours", Description: openai.String("Set default HITL review timeout in hours before timeout action."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"hours": map[string]any{"type": "integer", "minimum": 1, "maximum": 8760}}, "required": []string{"hours"}}}},
 	}
 
 	for i := 0; i < 6; i++ {
@@ -319,6 +322,8 @@ func (h *Harness) executeToolCall(ctx context.Context, threadID string, tc opena
 		return h.setReviewDays(ctx, asInt(args["days"], 0))
 	case "set_defer_days":
 		return h.setDeferDays(ctx, asInt(args["days"], 0))
+	case "set_hitl_timeout_hours":
+		return h.setHITLTimeoutHours(ctx, asInt(args["hours"], 0))
 	default:
 		return "", "", fmt.Errorf("unknown tool: %s", tc.Function.Name)
 	}
@@ -437,6 +442,21 @@ func (h *Harness) setDeferDays(ctx context.Context, days int) (string, string, e
 		return "", "", err
 	}
 	return marshalToolResult(map[string]any{"status": "ok", "days": days}), "", nil
+}
+
+func (h *Harness) setHITLTimeoutHours(ctx context.Context, hours int) (string, string, error) {
+	if hours <= 0 || hours > 8760 {
+		return "", "", fmt.Errorf("hours must be between 1 and 8760")
+	}
+	decision := h.getDecisionService()
+	if decision == nil {
+		return "", "", fmt.Errorf("decision service is not configured")
+	}
+	err := decision.SetGlobalHITLTimeoutHours(ctx, hours)
+	if err != nil {
+		return "", "", err
+	}
+	return marshalToolResult(map[string]any{"status": "ok", "hours": hours}), "", nil
 }
 
 func (h *Harness) setArchiveState(ctx context.Context, threadID string, query string, archived bool) (string, string, error) {
