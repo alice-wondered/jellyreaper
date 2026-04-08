@@ -59,6 +59,9 @@ func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.Webh
 	if !event.OccurredAt.IsZero() {
 		eventAt = event.OccurredAt.UTC()
 	}
+	playbackEvent := isPlaybackEvent(event.EventType)
+	catalogIndexEvent := isCatalogIndexEvent(event.EventType)
+	removalEvent := isRemovalEvent(event.EventType)
 	dedupeKey := event.DedupeKey
 	itemID := event.ItemID
 	targets := deriveTargets(event)
@@ -86,59 +89,102 @@ func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.Webh
 			return err
 		}
 
+		seasonChildIDs := make([]string, 0)
+		if removalEvent && strings.EqualFold(strings.TrimSpace(event.Payload.ItemType), "season") {
+			seasonID := strings.TrimSpace(event.Payload.SeasonID)
+			if seasonID == "" {
+				seasonID = strings.TrimSpace(itemID)
+			}
+			if seasonID != "" {
+				children, err := tx.ListMediaBySubject(ctx, "season", seasonID)
+				if err != nil {
+					return err
+				}
+				for _, child := range children {
+					if child.ItemID != "" {
+						seasonChildIDs = append(seasonChildIDs, child.ItemID)
+					}
+				}
+			}
+		}
+
 		if itemID != "" {
 			existing, found, err := tx.GetMedia(ctx, itemID)
 			if err != nil {
 				return err
 			}
-			media := domain.MediaItem{
-				ItemID:     itemID,
-				Name:       event.Payload.Name,
-				Title:      event.Payload.Name,
-				ItemType:   event.Payload.ItemType,
-				SeasonID:   event.Payload.SeasonID,
-				SeasonName: event.Payload.SeasonName,
-				SeriesID:   event.Payload.SeriesID,
-				SeriesName: event.Payload.SeriesName,
-				ImageURL:   event.Payload.PrimaryImageURL,
-				UpdatedAt:  now,
-			}
+			media := domain.MediaItem{ItemID: itemID, UpdatedAt: now}
 			if found {
-				if media.Name == "" {
-					media.Name = existing.Name
-				}
-				if media.Title == "" {
-					media.Title = existing.Title
-				}
-				if media.ItemType == "" {
-					media.ItemType = existing.ItemType
-				}
-				if media.SeasonID == "" {
-					media.SeasonID = existing.SeasonID
-				}
-				if media.SeasonName == "" {
-					media.SeasonName = existing.SeasonName
-				}
-				if media.SeriesID == "" {
-					media.SeriesID = existing.SeriesID
-				}
-				if media.SeriesName == "" {
-					media.SeriesName = existing.SeriesName
-				}
-				if media.ImageURL == "" {
-					media.ImageURL = existing.ImageURL
-				}
+				media.Name = existing.Name
+				media.Title = existing.Title
+				media.ItemType = existing.ItemType
+				media.SeasonID = existing.SeasonID
+				media.SeasonName = existing.SeasonName
+				media.SeriesID = existing.SeriesID
+				media.SeriesName = existing.SeriesName
+				media.ImageURL = existing.ImageURL
 				media.LastPlayedAt = existing.LastPlayedAt
 				media.PlayCountTotal = existing.PlayCountTotal
 			}
-			if isPlaybackEvent(event.EventType) {
+
+			if catalogIndexEvent {
+				if event.Payload.Name != "" {
+					media.Name = event.Payload.Name
+					media.Title = event.Payload.Name
+				}
+				if event.Payload.ItemType != "" {
+					media.ItemType = event.Payload.ItemType
+				}
+				if event.Payload.SeasonID != "" {
+					media.SeasonID = event.Payload.SeasonID
+				}
+				if event.Payload.SeasonName != "" {
+					media.SeasonName = event.Payload.SeasonName
+				}
+				if event.Payload.SeriesID != "" {
+					media.SeriesID = event.Payload.SeriesID
+				}
+				if event.Payload.SeriesName != "" {
+					media.SeriesName = event.Payload.SeriesName
+				}
+				if event.Payload.PrimaryImageURL != "" {
+					media.ImageURL = event.Payload.PrimaryImageURL
+				}
+			}
+
+			if playbackEvent {
 				if eventAt.After(media.LastPlayedAt) {
 					media.LastPlayedAt = eventAt
 				}
 				media.PlayCountTotal++
 			}
-			if err := tx.UpsertMedia(ctx, media); err != nil {
-				return err
+			if !removalEvent {
+				if err := tx.UpsertMedia(ctx, media); err != nil {
+					return err
+				}
+			}
+		}
+
+		if removalEvent {
+			if itemID != "" {
+				if err := tx.DeleteMedia(ctx, itemID); err != nil {
+					return err
+				}
+				if err := tx.DeleteFlow(ctx, targetKey("item", itemID)); err != nil {
+					return err
+				}
+				if err := tx.DeleteFlow(ctx, targetKey("movie", itemID)); err != nil {
+					return err
+				}
+			}
+
+			for _, childID := range seasonChildIDs {
+				if err := tx.DeleteMedia(ctx, childID); err != nil {
+					return err
+				}
+				if err := tx.DeleteFlow(ctx, targetKey("item", childID)); err != nil {
+					return err
+				}
 			}
 		}
 
@@ -148,6 +194,9 @@ func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.Webh
 				return err
 			}
 			if !found {
+				if !catalogIndexEvent {
+					continue
+				}
 				flow = domain.Flow{
 					FlowID:      flowIDFromItem(target.Canonical),
 					ItemID:      target.Canonical,
@@ -167,15 +216,34 @@ func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.Webh
 					return err
 				}
 			} else {
-				flow.DisplayName = target.Name
-				flow.ImageURL = target.ImageURL
-				flow.SubjectType = target.Type
+				if catalogIndexEvent {
+					if target.Name != "" {
+						flow.DisplayName = target.Name
+					}
+					if target.ImageURL != "" {
+						flow.ImageURL = target.ImageURL
+					}
+					if target.Type != "" {
+						flow.SubjectType = target.Type
+					}
+				}
 				expected := flow.Version
 				flow.Version = expected + 1
 				flow.UpdatedAt = now
 				if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
 					return err
 				}
+			}
+
+			if removalEvent {
+				if err := tx.DeleteFlow(ctx, target.Canonical); err != nil {
+					return err
+				}
+				continue
+			}
+
+			if !catalogIndexEvent && !playbackEvent {
+				continue
 			}
 
 			if flow.State == domain.FlowStatePendingReview || flow.State == domain.FlowStateArchived || flow.State == domain.FlowStateDeleted {
@@ -367,7 +435,7 @@ func (s *Service) IngestBackfillPlayback(ctx context.Context, events []jellyfin.
 		if err := s.HandleJellyfinWebhook(ctx, jellyfin.WebhookEvent{
 			Payload: jellyfin.WebhookPayload{
 				ItemID:           e.ItemID,
-				Name:             e.Name,
+				Name:             "",
 				NotificationType: e.Type,
 			},
 			Raw:        map[string]any{"source": "backfill", "type": e.Type, "item_id": e.ItemID, "name": e.Name},
@@ -814,6 +882,28 @@ func chooseName(values ...string) string {
 func isPlaybackEvent(eventType string) bool {
 	t := strings.ToLower(strings.TrimSpace(eventType))
 	return strings.Contains(t, "playback") || strings.Contains(t, "played")
+}
+
+func isCatalogIndexEvent(eventType string) bool {
+	t := strings.ToLower(strings.TrimSpace(eventType))
+	if t == "" {
+		return false
+	}
+	if strings.Contains(t, "itemadded") || strings.Contains(t, "itemupdated") || strings.Contains(t, "newitem") {
+		return true
+	}
+	if strings.Contains(t, "library") && strings.Contains(t, "item") {
+		return true
+	}
+	return false
+}
+
+func isRemovalEvent(eventType string) bool {
+	t := strings.ToLower(strings.TrimSpace(eventType))
+	if t == "" {
+		return false
+	}
+	return strings.Contains(t, "removed") || strings.Contains(t, "deleted")
 }
 
 func formatSeasonLabel(seasonName string, seriesName string, fallback string) string {
