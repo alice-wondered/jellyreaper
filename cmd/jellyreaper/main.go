@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	stdhttp "net/http"
@@ -30,6 +31,11 @@ import (
 )
 
 const backfillCheckpointKey = "backfill.last_success_at"
+
+const (
+	backfillRetryBaseDelay = time.Second
+	backfillRetryMaxDelay  = 2 * time.Minute
+)
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -182,44 +188,28 @@ func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.R
 	}
 
 	run := func(isStartup bool) {
-		since, err := resolveBackfillStart(ctx, repository, cfg)
-		if err != nil {
-			logger.Error("resolve backfill checkpoint", "error", err)
-			return
-		}
+		attempt := 0
+		for {
+			err := runBackfillOnce(ctx, logger, repository, appService, discordService, cfg, backfillSvc, isStartup)
+			if err == nil {
+				return
+			}
+			if ctx.Err() != nil {
+				return
+			}
 
-		startedAt := time.Now().UTC()
-		plays, err := fetchPlaybackWithRetry(ctx, backfillSvc, since, cfg.BackfillLimit)
-		if err != nil {
-			logger.Error("backfill playback fetch failed", "error", err, "since", since)
-			return
-		}
-		items, err := fetchChangedItemsWithRetry(ctx, backfillSvc, since, cfg.BackfillLimit)
-		if err != nil {
-			logger.Error("backfill item fetch failed", "error", err, "since", since)
-			return
-		}
+			delay := retryBackoffDelay(attempt, backfillRetryBaseDelay, backfillRetryMaxDelay)
+			attempt++
+			logger.Warn("backfill run failed; retrying",
+				"error", err,
+				"attempt", attempt,
+				"retry_in", delay,
+			)
 
-		if err := appService.IngestBackfillPlayback(ctx, plays); err != nil {
-			logger.Error("backfill playback ingest failed", "error", err)
-			return
-		}
-		if err := appService.IngestBackfillItems(ctx, items); err != nil {
-			logger.Error("backfill item ingest failed", "error", err)
-			return
-		}
-
-		completedAt := time.Now().UTC()
-		checkpoint := computeBackfillCheckpoint(startedAt, plays, items)
-		if err := saveBackfillCheckpoint(ctx, repository, checkpoint); err != nil {
-			logger.Error("save backfill checkpoint failed", "error", err)
-		}
-
-		logger.Info("backfill completed", "since", since, "plays_fetched", len(plays), "items_fetched", len(items), "duration", completedAt.Sub(startedAt).String())
-		if isStartup && cfg.DiscordChannelID != "" {
-			msg := "Backfill complete: plays=" + strconv.Itoa(len(plays)) + ", items=" + strconv.Itoa(len(items))
-			if err := discordService.SendSystemMessage(cfg.DiscordChannelID, msg); err != nil {
-				logger.Warn("failed to send backfill completion announcement", "error", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
 			}
 		}
 	}
@@ -237,6 +227,82 @@ func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.R
 			run(false)
 		}
 	}
+}
+
+func runBackfillOnce(ctx context.Context, logger *slog.Logger, repository repo.Repository, appService *app.Service, discordService *discord.Service, cfg config.Config, backfillSvc *jellyfin.BackfillService, isStartup bool) error {
+	since, err := resolveBackfillStart(ctx, repository, cfg)
+	if err != nil {
+		return fmt.Errorf("resolve backfill checkpoint: %w", err)
+	}
+
+	startedAt := time.Now().UTC()
+	plays, err := fetchPlaybackWithRetry(ctx, backfillSvc, since, cfg.BackfillLimit)
+	if err != nil {
+		return fmt.Errorf("backfill playback fetch failed (since=%s): %w", since.Format(time.RFC3339), err)
+	}
+	items, err := fetchChangedItemsWithRetry(ctx, backfillSvc, since, cfg.BackfillLimit)
+	if err != nil {
+		return fmt.Errorf("backfill item fetch failed (since=%s): %w", since.Format(time.RFC3339), err)
+	}
+
+	if err := ingestBackfillBatch(ctx, appService.IngestBackfillItems, appService.IngestBackfillPlayback, items, plays); err != nil {
+		return err
+	}
+
+	completedAt := time.Now().UTC()
+	checkpoint := computeBackfillCheckpoint(startedAt, plays, items)
+	if err := saveBackfillCheckpoint(ctx, repository, checkpoint); err != nil {
+		logger.Error("save backfill checkpoint failed", "error", err)
+	}
+
+	logger.Info("backfill completed", "since", since, "plays_fetched", len(plays), "items_fetched", len(items), "duration", completedAt.Sub(startedAt).String())
+	if isStartup && cfg.DiscordChannelID != "" {
+		msg := "Backfill complete: plays=" + strconv.Itoa(len(plays)) + ", items=" + strconv.Itoa(len(items))
+		if err := discordService.SendSystemMessage(cfg.DiscordChannelID, msg); err != nil {
+			logger.Warn("failed to send backfill completion announcement", "error", err)
+		}
+	}
+	return nil
+}
+
+func retryBackoffDelay(attempt int, base time.Duration, max time.Duration) time.Duration {
+	if base <= 0 {
+		base = time.Second
+	}
+	if max < base {
+		max = base
+	}
+	if attempt <= 0 {
+		return base
+	}
+
+	delay := base
+	for i := 0; i < attempt; i++ {
+		if delay >= max/2 {
+			return max
+		}
+		delay *= 2
+	}
+	if delay > max {
+		return max
+	}
+	return delay
+}
+
+func ingestBackfillBatch(
+	ctx context.Context,
+	ingestItems func(context.Context, []jellyfin.ItemSnapshot) error,
+	ingestPlayback func(context.Context, []jellyfin.PlaybackEvent) error,
+	items []jellyfin.ItemSnapshot,
+	plays []jellyfin.PlaybackEvent,
+) error {
+	if err := ingestItems(ctx, items); err != nil {
+		return fmt.Errorf("item ingest: %w", err)
+	}
+	if err := ingestPlayback(ctx, plays); err != nil {
+		return fmt.Errorf("playback ingest: %w", err)
+	}
+	return nil
 }
 
 func logNextQueuedJob(ctx context.Context, logger *slog.Logger, repository repo.Repository) {
