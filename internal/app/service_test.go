@@ -92,6 +92,116 @@ func TestHITLDeleteQueuesImmediateDeleteJob(t *testing.T) {
 	}
 }
 
+func TestStaleInteractionPointsToLatestPrompt(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 7, 12, 45, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	targetID := "target:item:item-stale-link"
+	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:" + targetID,
+			ItemID:      targetID,
+			SubjectType: "item",
+			DisplayName: "Stale Link Item",
+			State:       domain.FlowStatePendingReview,
+			HITLOutcome: "",
+			Discord:     domain.DiscordContext{ChannelID: "ch-new", MessageID: "msg-new"},
+			Version:     2,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0)
+	})
+	if err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	interaction := discord.IncomingInteraction{
+		Raw:           &discordgo.Interaction{Message: &discordgo.Message{ID: "msg-old"}},
+		Type:          discordgo.InteractionMessageComponent,
+		InteractionID: snowflakeIDFor(now),
+		GuildID:       "guild-1",
+		ChannelID:     "ch-new",
+		CustomID:      "jr:v1:archive:" + targetID + ":1",
+	}
+
+	resp, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction)
+	if err != nil {
+		t.Fatalf("handle stale interaction: %v", err)
+	}
+	if resp == nil || resp.Data == nil {
+		t.Fatal("expected response data")
+	}
+	if len(resp.Data.Components) != 0 {
+		t.Fatalf("expected stale update to clear components, got %d", len(resp.Data.Components))
+	}
+	wantLink := "https://discord.com/channels/guild-1/ch-new/msg-new"
+	if !strings.Contains(resp.Data.Content, wantLink) {
+		t.Fatalf("expected stale response to include latest prompt link %q, got %q", wantLink, resp.Data.Content)
+	}
+	if strings.Contains(resp.Data.Content, "Resolved: DELAYED") {
+		t.Fatalf("stale prompt without decision should not claim DELAYED, got %q", resp.Data.Content)
+	}
+	if !strings.Contains(resp.Data.Content, "No decision") {
+		t.Fatalf("expected stale response to indicate no recorded decision, got %q", resp.Data.Content)
+	}
+}
+
+func TestStaleInteractionWithoutNewPromptClosesCurrentMessage(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 7, 12, 50, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	targetID := "target:item:item-stale-no-new"
+	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:" + targetID,
+			ItemID:      targetID,
+			SubjectType: "item",
+			DisplayName: "No New Prompt Item",
+			State:       domain.FlowStateActive,
+			HITLOutcome: "delay",
+			Discord: domain.DiscordContext{
+				ChannelID:         "ch-1",
+				MessageID:         "",
+				PreviousChannelID: "ch-1",
+				PreviousMessageID: "msg-old",
+			},
+			Version:   2,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0)
+	})
+	if err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	interaction := discord.IncomingInteraction{
+		Raw:           &discordgo.Interaction{Message: &discordgo.Message{ID: "msg-old"}},
+		Type:          discordgo.InteractionMessageComponent,
+		InteractionID: snowflakeIDFor(now),
+		GuildID:       "guild-1",
+		ChannelID:     "ch-1",
+		CustomID:      "jr:v1:delay:" + targetID + ":1",
+	}
+
+	resp, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction)
+	if err != nil {
+		t.Fatalf("handle stale interaction: %v", err)
+	}
+	if resp == nil || resp.Data == nil {
+		t.Fatal("expected response data")
+	}
+	if len(resp.Data.Components) != 0 {
+		t.Fatalf("expected stale update to clear components, got %d", len(resp.Data.Components))
+	}
+	if !strings.Contains(resp.Data.Content, "No newer prompt exists yet") {
+		t.Fatalf("expected stale response to explain no newer prompt, got %q", resp.Data.Content)
+	}
+}
+
 func TestApplyAIDecisionDeleteQueuesImmediateDeleteJob(t *testing.T) {
 	store := newTestStore(t)
 	var wokeAt time.Time
@@ -255,6 +365,9 @@ func TestApplyAIDecisionUnarchiveEnqueuesEvaluateNow(t *testing.T) {
 	if flow.Discord.MessageID != "" {
 		t.Fatalf("expected unarchive to clear stale discord message id, got %q", flow.Discord.MessageID)
 	}
+	if flow.Discord.PreviousMessageID != "msg-unarchive" {
+		t.Fatalf("expected unarchive to retain previous message id, got %q", flow.Discord.PreviousMessageID)
+	}
 
 	jobs, err := store.LeaseDueJobs(context.Background(), now, 10, "test", time.Minute)
 	if err != nil {
@@ -390,6 +503,9 @@ func TestApplyAIDelayDaysDefersLazilyAndFinalizesHITLPrompt(t *testing.T) {
 	if flow.Discord.MessageID != "" {
 		t.Fatalf("expected ai delay to clear discord message id, got %q", flow.Discord.MessageID)
 	}
+	if flow.Discord.PreviousMessageID != "msg-delay" {
+		t.Fatalf("expected ai delay to retain previous message id, got %q", flow.Discord.PreviousMessageID)
+	}
 
 	jobsEarly, err := store.LeaseDueJobs(context.Background(), now.Add(6*24*time.Hour), 20, "test", time.Minute)
 	if err != nil {
@@ -438,6 +554,9 @@ func TestSetGlobalPolicyDefaultsUpdateMetaOnly(t *testing.T) {
 	if err := svc.SetGlobalDeferDays(context.Background(), 15); err != nil {
 		t.Fatalf("set global defer days: %v", err)
 	}
+	if err := svc.SetGlobalHITLTimeoutHours(context.Background(), 72); err != nil {
+		t.Fatalf("set global hitl timeout hours: %v", err)
+	}
 
 	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
 		raw, ok, err := tx.GetMeta(context.Background(), metaReviewDays)
@@ -453,6 +572,13 @@ func TestSetGlobalPolicyDefaultsUpdateMetaOnly(t *testing.T) {
 		}
 		if !ok || raw != "15" {
 			return fmt.Errorf("unexpected defer meta value: ok=%v raw=%q", ok, raw)
+		}
+		raw, ok, err = tx.GetMeta(context.Background(), metaHITLTimeoutHours)
+		if err != nil {
+			return err
+		}
+		if !ok || raw != "72" {
+			return fmt.Errorf("unexpected hitl timeout meta value: ok=%v raw=%q", ok, raw)
 		}
 
 		flowA, found, err := tx.GetFlow(context.Background(), "target:season:s-g1")

@@ -26,6 +26,7 @@ const (
 	defaultHITLTimeoutH          = 48
 	metaReviewDays               = "settings.review_days"
 	metaDeferDays                = "settings.defer_days"
+	metaHITLTimeoutHours         = "settings.hitl_timeout_hours"
 	backfillReviewDelay          = 24 * time.Hour
 	ingestProgressEvery          = 200
 	defaultBackfillBatchSize     = 100
@@ -55,6 +56,7 @@ type Service struct {
 	now                   func() time.Time
 	defaultDelayWindow    time.Duration
 	defaultExpireDays     int
+	defaultHITLTimeoutHrs int
 	backfillBatchSize     int
 	backfillBatchTimeout  time.Duration
 	backfillQueueCapacity int
@@ -74,6 +76,7 @@ func NewService(repository repo.Repository, logger *slog.Logger, wake func(time.
 		now:                   time.Now,
 		defaultDelayWindow:    defaultDelayDuration,
 		defaultExpireDays:     defaultExpireDays,
+		defaultHITLTimeoutHrs: defaultHITLTimeoutH,
 		backfillBatchSize:     defaultBackfillBatchSize,
 		backfillBatchTimeout:  defaultBackfillBatchTimeout,
 		backfillQueueCapacity: defaultBackfillQueueCapacity,
@@ -86,6 +89,12 @@ func (s *Service) SetPolicyDefaults(defaultExpireDays int, defaultDelayWindow ti
 	}
 	if defaultDelayWindow > 0 {
 		s.defaultDelayWindow = defaultDelayWindow
+	}
+}
+
+func (s *Service) SetDefaultHITLTimeoutHours(hours int) {
+	if hours > 0 {
+		s.defaultHITLTimeoutHrs = hours
 	}
 }
 
@@ -107,12 +116,22 @@ func (s *Service) SetGlobalDeferDays(ctx context.Context, days int) error {
 	})
 }
 
-func (s *Service) currentDefaultsFromMeta(ctx context.Context, tx repo.TxRepository) (int, time.Duration, error) {
+func (s *Service) SetGlobalHITLTimeoutHours(ctx context.Context, hours int) error {
+	if hours <= 0 || hours > 8760 {
+		return fmt.Errorf("hitl timeout hours must be between 1 and 8760")
+	}
+	return s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		return tx.SetMeta(ctx, metaHITLTimeoutHours, strconv.Itoa(hours))
+	})
+}
+
+func (s *Service) currentDefaultsFromMeta(ctx context.Context, tx repo.TxRepository) (int, time.Duration, int, error) {
 	reviewDays := s.defaultExpireDays
 	deferWindow := s.defaultDelayWindow
+	hitlTimeoutHours := s.defaultHITLTimeoutHrs
 
 	if raw, ok, err := tx.GetMeta(ctx, metaReviewDays); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	} else if ok {
 		if parsed, convErr := strconv.Atoi(strings.TrimSpace(raw)); convErr == nil && parsed > 0 {
 			reviewDays = parsed
@@ -120,14 +139,22 @@ func (s *Service) currentDefaultsFromMeta(ctx context.Context, tx repo.TxReposit
 	}
 
 	if raw, ok, err := tx.GetMeta(ctx, metaDeferDays); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	} else if ok {
 		if parsed, convErr := strconv.Atoi(strings.TrimSpace(raw)); convErr == nil && parsed > 0 {
 			deferWindow = time.Duration(parsed) * 24 * time.Hour
 		}
 	}
 
-	return reviewDays, deferWindow, nil
+	if raw, ok, err := tx.GetMeta(ctx, metaHITLTimeoutHours); err != nil {
+		return 0, 0, 0, err
+	} else if ok {
+		if parsed, convErr := strconv.Atoi(strings.TrimSpace(raw)); convErr == nil && parsed > 0 {
+			hitlTimeoutHours = parsed
+		}
+	}
+
+	return reviewDays, deferWindow, hitlTimeoutHours, nil
 }
 
 func (s *Service) SetBackfillWriteBatching(size int, timeout time.Duration, queueCapacity int) {
@@ -206,7 +233,7 @@ func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.Web
 }
 
 func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxRepository, event jellyfin.WebhookEvent, now, eventAt time.Time, playbackEvent, catalogIndexEvent, removalEvent bool, dedupeKey, itemID string, targets []targetRef, finalizations *[]hitlFinalizeRequest) error {
-	defaultReviewDays, _, err := s.currentDefaultsFromMeta(ctx, tx)
+	defaultReviewDays, _, defaultHITLTimeoutHours, err := s.currentDefaultsFromMeta(ctx, tx)
 	if err != nil {
 		return err
 	}
@@ -384,7 +411,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 				Version:     0,
 				PolicySnapshot: domain.PolicySnapshot{
 					ExpireAfterDays: defaultReviewDays,
-					HITLTimeoutHrs:  defaultHITLTimeoutH,
+					HITLTimeoutHrs:  defaultHITLTimeoutHours,
 					TimeoutAction:   "delete",
 				},
 				LastCatalogEventAt: eventAt,
@@ -543,7 +570,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 	resolvedAction := parsed.Action
 
 	err = s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
-		_, defaultDeferWindow, err := s.currentDefaultsFromMeta(ctx, tx)
+		_, defaultDeferWindow, _, err := s.currentDefaultsFromMeta(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -560,7 +587,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 					if display == "" {
 						display = decisionDisplayName
 					}
-					processedMessage = staleDecisionMessage(flow, display)
+					processedMessage = staleDecisionMessage(flow, display, interaction)
 				} else {
 					processedMessage = fmt.Sprintf("Resolved: %s for %s (target no longer exists)", interactionDecisionLabel(parsed.Action), decisionDisplayName)
 				}
@@ -584,7 +611,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 		expectedVersion := flow.Version
 		if parsed.Version != expectedVersion {
 			staleVersion = true
-			staleMessage = staleDecisionMessage(flow, decisionDisplayName)
+			staleMessage = staleDecisionMessage(flow, decisionDisplayName, interaction)
 			return nil
 		}
 
@@ -600,7 +627,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 			flow.State = domain.FlowStateActive
 			flow.NextActionAt = now.Add(defaultDeferWindow)
 			flow.DecisionDeadlineAt = time.Time{}
-			flow.Discord.MessageID = ""
+			clearDiscordPromptLink(&flow.Discord)
 			if err := enqueueEvaluatePolicy(ctx, tx, flow, now, "discord_delay", flow.NextActionAt); err != nil {
 				return err
 			}
@@ -712,7 +739,7 @@ func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action str
 		case "unarchive":
 			flow.State = domain.FlowStateActive
 			flow.DecisionDeadlineAt = time.Time{}
-			flow.Discord.MessageID = ""
+			clearDiscordPromptLink(&flow.Discord)
 			if err := enqueueEvaluatePolicy(ctx, tx, flow, now, "ai_unarchive", now); err != nil {
 				return err
 			}
@@ -820,7 +847,7 @@ func (s *Service) ApplyAIDelayDays(ctx context.Context, itemID string, days int)
 			flow.PolicySnapshot.ExpireAfterDays = s.defaultExpireDays
 		}
 		flow.PolicySnapshot.ExpireAfterDays = days
-		flow.Discord.MessageID = ""
+		clearDiscordPromptLink(&flow.Discord)
 		flow.UpdatedAt = now
 		flow.Version = expectedVersion + 1
 		if err := tx.UpsertFlowCAS(ctx, flow, expectedVersion); err != nil {
@@ -1175,29 +1202,87 @@ func interactionDecisionUpdateResponse(action string, itemDisplay string) *disco
 	return interactionMessageUpdateResponse(fmt.Sprintf("Resolved: %s for %s", decision, item))
 }
 
-func staleDecisionMessage(flow domain.Flow, itemDisplay string) string {
+func staleDecisionMessage(flow domain.Flow, itemDisplay string, interaction discord.IncomingInteraction) string {
 	item := strings.TrimSpace(itemDisplay)
 	if item == "" {
 		item = "item"
 	}
 	decision := strings.TrimSpace(strings.ToLower(flow.HITLOutcome))
-	if decision == "" {
+	hasDecision := decision != ""
+	if !hasDecision {
 		switch flow.State {
 		case domain.FlowStateArchived:
 			decision = "archive"
+			hasDecision = true
+		case domain.FlowStateDeleteInProgress:
+			decision = "delete_requested"
+			hasDecision = true
 		case domain.FlowStateDeleteQueued:
 			decision = "delete_requested"
+			hasDecision = true
 		case domain.FlowStateDeleted:
 			decision = "delete"
-		case domain.FlowStateActive:
-			decision = "resolved"
-		case domain.FlowStatePendingReview:
-			decision = "delay"
-		default:
-			decision = "resolved"
+			hasDecision = true
 		}
 	}
-	return fmt.Sprintf("Resolved: %s for %s", interactionDecisionLabel(decision), item)
+	message := ""
+	if hasDecision {
+		message = fmt.Sprintf("Resolved: %s for %s", interactionDecisionLabel(decision), item)
+	} else {
+		message = fmt.Sprintf("This prompt is stale for %s. No decision has been recorded yet.", item)
+	}
+	if reference := latestPromptReference(flow, interaction); reference != "" {
+		return message + "\n\n" + reference
+	}
+	return message
+}
+
+func latestPromptReference(flow domain.Flow, interaction discord.IncomingInteraction) string {
+	clickedMessageID := ""
+	if interaction.Raw != nil && interaction.Raw.Message != nil {
+		clickedMessageID = strings.TrimSpace(interaction.Raw.Message.ID)
+	}
+	currentChannelID := strings.TrimSpace(flow.Discord.ChannelID)
+	currentMessageID := strings.TrimSpace(flow.Discord.MessageID)
+	previousChannelID := strings.TrimSpace(flow.Discord.PreviousChannelID)
+	previousMessageID := strings.TrimSpace(flow.Discord.PreviousMessageID)
+
+	if clickedMessageID != "" {
+		if currentMessageID != "" && clickedMessageID == currentMessageID {
+			return ""
+		}
+		if currentMessageID == "" && previousMessageID != "" && clickedMessageID == previousMessageID {
+			return "No newer prompt exists yet; this message is now closed."
+		}
+	}
+
+	targetChannelID := currentChannelID
+	targetMessageID := currentMessageID
+	if targetChannelID == "" || targetMessageID == "" {
+		targetChannelID = previousChannelID
+		targetMessageID = previousMessageID
+	}
+	if targetChannelID == "" || targetMessageID == "" {
+		return ""
+	}
+
+	guildID := strings.TrimSpace(interaction.GuildID)
+	if guildID != "" {
+		return fmt.Sprintf("This prompt is stale. Use the latest one: https://discord.com/channels/%s/%s/%s", guildID, targetChannelID, targetMessageID)
+	}
+	return fmt.Sprintf("This prompt is stale. Use the latest one in channel %s (message %s).", targetChannelID, targetMessageID)
+}
+
+func clearDiscordPromptLink(ctx *domain.DiscordContext) {
+	if ctx == nil {
+		return
+	}
+	msg := strings.TrimSpace(ctx.MessageID)
+	if msg != "" {
+		ctx.PreviousChannelID = strings.TrimSpace(ctx.ChannelID)
+		ctx.PreviousMessageID = msg
+	}
+	ctx.MessageID = ""
 }
 
 func interactionDecisionLabel(action string) string {
