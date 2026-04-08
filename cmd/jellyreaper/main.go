@@ -17,6 +17,7 @@ import (
 	"time"
 
 	bbolt "go.etcd.io/bbolt"
+	"jellyreaper/internal/ai"
 	"jellyreaper/internal/app"
 	"jellyreaper/internal/discord"
 	"jellyreaper/internal/jellyfin"
@@ -91,6 +92,25 @@ func main() {
 	}
 	discordService.SetEmbedPersistenceDir(cfg.EmbedDir)
 	discordService.SetJellyfinImageSource(cfg.JellyfinURL, cfg.JellyfinAPIKey)
+	if strings.TrimSpace(cfg.OpenAIAPIKey) != "" {
+		assistant := ai.NewHarness(store, cfg.OpenAIAPIKey, cfg.OpenAIModel)
+		assistant.SetHistoryRestorer(func(ctx context.Context, threadID string, limit int) ([]string, error) {
+			return discordService.LoadThreadHistory(ctx, threadID, limit)
+		})
+		discordService.SetMentionCallback(func(ctx context.Context, mention discord.MentionMessage) (string, error) {
+			thread := mention.ThreadID
+			if strings.TrimSpace(thread) == "" {
+				thread = mention.ChannelID + ":msg:" + mention.MessageID
+			}
+			return assistant.HandleMention(ctx, thread, mention.Author, mention.Content)
+		})
+		logger.Info("ai mention assistant enabled", "model", cfg.OpenAIModel)
+	}
+	if err := discordService.OpenGateway(); err != nil {
+		logger.Warn("failed to open discord gateway", "error", err)
+	} else {
+		defer func() { _ = discordService.CloseGateway() }()
+	}
 
 	handlerList := []jobs.JobHandler{
 		handlers.NewEvaluatePolicyHandler(store, logger),

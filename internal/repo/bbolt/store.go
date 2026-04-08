@@ -337,6 +337,32 @@ func (t *txRepo) GetFlow(ctx context.Context, itemID string) (domain.Flow, bool,
 	return flow, true, nil
 }
 
+func (t *txRepo) ListFlows(ctx context.Context) ([]domain.Flow, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	b, err := requireBucket(t.tx, bucketFlows)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]domain.Flow, 0)
+	err = b.ForEach(func(_, v []byte) error {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		var flow domain.Flow
+		if err := json.Unmarshal(v, &flow); err != nil {
+			return err
+		}
+		out = append(out, flow)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list flows: %w", err)
+	}
+	return out, nil
+}
+
 func (t *txRepo) UpsertFlowCAS(ctx context.Context, flow domain.Flow, expectedVersion int64) error {
 	if err := checkContext(ctx); err != nil {
 		return err

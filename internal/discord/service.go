@@ -21,6 +21,17 @@ import (
 
 type InteractionCallback func(context.Context, IncomingInteraction) (*discordgo.InteractionResponse, error)
 
+type MentionCallback func(context.Context, MentionMessage) (string, error)
+
+type MentionMessage struct {
+	ChannelID string
+	ThreadID  string
+	MessageID string
+	AuthorID  string
+	Author    string
+	Content   string
+}
+
 type Service struct {
 	publicKey ed25519.PublicKey
 	session   *discordgo.Session
@@ -31,6 +42,8 @@ type Service struct {
 	imagePersistDir string
 	jellyfinBaseURL string
 	jellyfinAPIKey  string
+	botUserID       string
+	mentionCallback MentionCallback
 }
 
 func NewService(botToken string, publicKey ed25519.PublicKey) (*Service, error) {
@@ -44,10 +57,39 @@ func NewService(botToken string, publicKey ed25519.PublicKey) (*Service, error) 
 	if err != nil {
 		return nil, fmt.Errorf("create discord session: %w", err)
 	}
-	session.Identify.Intents = 0
+	session.Identify.Intents = discordgo.IntentsGuildMessages | discordgo.IntentsDirectMessages | discordgo.IntentsMessageContent
 	service.session = session
 
+	session.AddHandler(func(ses *discordgo.Session, msg *discordgo.MessageCreate) {
+		service.handleMentionMessage(ses, msg)
+	})
+
 	return service, nil
+}
+
+func (s *Service) OpenGateway() error {
+	if s.session == nil {
+		return nil
+	}
+	if err := s.session.Open(); err != nil {
+		return fmt.Errorf("open discord gateway: %w", err)
+	}
+	me, err := s.session.User("@me")
+	if err == nil && me != nil {
+		s.botUserID = me.ID
+	}
+	return nil
+}
+
+func (s *Service) CloseGateway() error {
+	if s.session == nil {
+		return nil
+	}
+	return s.session.Close()
+}
+
+func (s *Service) SetMentionCallback(cb MentionCallback) {
+	s.mentionCallback = cb
 }
 
 func (s *Service) VerifyRequest(r *http.Request) bool {
@@ -186,6 +228,74 @@ func (s *Service) SetJellyfinImageSource(baseURL string, apiKey string) {
 	s.jellyfinAPIKey = strings.TrimSpace(apiKey)
 }
 
+func (s *Service) handleMentionMessage(session *discordgo.Session, msg *discordgo.MessageCreate) {
+	if s.mentionCallback == nil || msg == nil || msg.Author == nil || msg.Author.Bot {
+		return
+	}
+	if s.botUserID == "" {
+		if me, err := session.User("@me"); err == nil && me != nil {
+			s.botUserID = me.ID
+		}
+	}
+	if s.botUserID == "" {
+		return
+	}
+
+	mentioned := false
+	for _, mentionedUser := range msg.Mentions {
+		if mentionedUser != nil && mentionedUser.ID == s.botUserID {
+			mentioned = true
+			break
+		}
+	}
+	if !mentioned {
+		return
+	}
+
+	content := strings.TrimSpace(stripBotMention(msg.Content, s.botUserID))
+	if content == "" {
+		return
+	}
+
+	replyChannel := msg.ChannelID
+	threadID := ""
+	if msg.Message != nil && msg.Message.Thread != nil && msg.Message.Thread.ID != "" {
+		replyChannel = msg.Message.Thread.ID
+		threadID = msg.Message.Thread.ID
+	} else {
+		thread, err := session.MessageThreadStart(msg.ChannelID, msg.ID, "jellyreaper-ai", 60)
+		if err == nil && thread != nil && thread.ID != "" {
+			replyChannel = thread.ID
+			threadID = thread.ID
+		}
+	}
+
+	out, err := s.mentionCallback(context.Background(), MentionMessage{
+		ChannelID: msg.ChannelID,
+		ThreadID:  threadID,
+		MessageID: msg.ID,
+		AuthorID:  msg.Author.ID,
+		Author:    msg.Author.Username,
+		Content:   content,
+	})
+	if err != nil {
+		out = "Sorry, I hit an error while handling that request."
+	}
+	if strings.TrimSpace(out) == "" {
+		return
+	}
+	_, _ = session.ChannelMessageSend(replyChannel, out)
+}
+
+func stripBotMention(content string, botUserID string) string {
+	if strings.TrimSpace(content) == "" || strings.TrimSpace(botUserID) == "" {
+		return content
+	}
+	content = strings.ReplaceAll(content, "<@"+botUserID+">", "")
+	content = strings.ReplaceAll(content, "<@!"+botUserID+">", "")
+	return strings.TrimSpace(content)
+}
+
 func (s *Service) SendSystemMessage(channelID, content string) error {
 	if strings.TrimSpace(channelID) == "" || strings.TrimSpace(content) == "" {
 		return nil
@@ -198,6 +308,69 @@ func (s *Service) SendSystemMessage(channelID, content string) error {
 		return fmt.Errorf("send system message: %w", err)
 	}
 	return nil
+}
+
+func (s *Service) LoadThreadHistory(ctx context.Context, threadID string, limit int) ([]string, error) {
+	if strings.TrimSpace(threadID) == "" || limit <= 0 {
+		return nil, nil
+	}
+	if !isSnowflake(threadID) {
+		return nil, nil
+	}
+	if s.session == nil {
+		return nil, fmt.Errorf("discord bot token is not configured")
+	}
+	if s.botUserID == "" {
+		if me, err := s.session.User("@me"); err == nil && me != nil {
+			s.botUserID = me.ID
+		}
+	}
+
+	msgs, err := s.session.ChannelMessages(threadID, limit, "", "", "")
+	if err != nil {
+		return nil, fmt.Errorf("load thread history: %w", err)
+	}
+	if len(msgs) == 0 {
+		return nil, nil
+	}
+
+	lines := make([]string, 0, len(msgs))
+	for i := len(msgs) - 1; i >= 0; i-- {
+		msg := msgs[i]
+		if msg == nil || msg.Author == nil {
+			continue
+		}
+		content := strings.TrimSpace(stripBotMention(msg.Content, s.botUserID))
+		if content == "" {
+			continue
+		}
+		role := msg.Author.Username
+		if msg.Author.ID == s.botUserID {
+			role = "assistant"
+		}
+		lines = append(lines, role+": "+content)
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	return lines, nil
+}
+
+func isSnowflake(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return false
+	}
+	for _, r := range trimmed {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func customID(action, itemID string, version int64) string {
