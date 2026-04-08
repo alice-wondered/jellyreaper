@@ -136,6 +136,21 @@ func TestIntegrationDiscordArchiveNoDeleteJob(t *testing.T) {
 	}
 
 	appSvc := app.NewService(store, nil, nil)
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:         "flow:target:item:item-arc",
+			ItemID:         "target:item:item-arc",
+			SubjectType:    "item",
+			DisplayName:    "Archive Target",
+			State:          domain.FlowStatePendingReview,
+			Version:        0,
+			PolicySnapshot: domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 48, TimeoutAction: "delete"},
+			CreatedAt:      time.Now().UTC(),
+			UpdatedAt:      time.Now().UTC(),
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
 	mux, err := api.NewMux(api.Config{
 		Addr:                     ":0",
 		Jellyfin:                 appSvc.HandleJellyfinWebhook,

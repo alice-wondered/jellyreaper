@@ -23,7 +23,7 @@ const (
 	historyLineCapacity = 20
 	maxThreadContexts   = 256
 
-	storageSkill = "Domain skill: A flow is the scheduler-owned lifecycle record for a projection target. Flows have ids like target:<subject_type>:<subject_id>, policy state (active, pending_review, archived, delete_queued), scheduling fields (next_action_at/deadlines), and Discord/HITL context. A projection is the atomic unit of operations the assistant can act on. Projection subject types are movie, season, and series. Projections map many media items into one target: movie maps to one title, season maps all episodes in a season, series maps all episodes/seasons in a show. Media items are catalog/playback records and are not direct AI operation targets. The assistant should discover projection flows, then hand off actions to domain services (which enqueue jobs, drive scheduler transitions, and perform cleanup fanout). For deletion, only schedule projection flow deletes; do not attempt individual item-level deletes."
+	storageSkill = "Domain skill: A flow is the scheduler-owned lifecycle record for a projection target. Flows have ids like target:<subject_type>:<subject_id>, policy state (active, pending_review, archived, delete_queued), scheduling fields (next_action_at/deadlines), and Discord/HITL context. Scheduler/HITL operational subject types are movie and season only. A movie projection maps one movie; a season projection maps all episodes in that season. Higher-level user intents (for example series-level requests) should be translated into movie/season operations before handoff. Media items are catalog/playback records and are not direct AI operation targets. The assistant should discover projection flows, then hand off actions to domain services (which enqueue jobs, drive scheduler transitions, and perform cleanup fanout). For deletion, only schedule projection flow deletes; do not attempt individual item-level deletes."
 )
 
 type Harness struct {
@@ -43,6 +43,7 @@ type Harness struct {
 
 type DecisionService interface {
 	ApplyAIDecision(context.Context, string, string) error
+	ApplyAIDecisionBatch(context.Context, []string, string) error
 	ApplyAIDelayDays(context.Context, string, int) error
 	SetGlobalReviewDays(context.Context, int) error
 	SetGlobalDeferDays(context.Context, int) error
@@ -158,7 +159,7 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 		"Only handle requests related to this media server and its review/archive workflow.",
 		storageSkill,
 		"Use tools to gather data and take actions.",
-		"Tool usage guide: list_ready for queue overviews; fuzzy_search_targets for discovery; query_target_state to inspect one target; remember_alias to bind user phrases to a target; archive_target for archive/unarchive intents; schedule_delete for deletion scheduling on projection targets; delay_target_days to defer a target by an explicit number of days; choose_candidate when user provides a numbered option; confirm_pending for yes/no confirmations; set_review_days and set_defer_days for policy tuning.",
+		"Tool usage guide: list_ready for queue overviews; fuzzy_search_targets for discovery; query_target_state to inspect one target; remember_alias to bind user phrases to a target; archive_target for archive/unarchive intents; schedule_delete for deletion scheduling on one projection target; schedule_delete_many for show-level intents mapped to multiple season targets; delay_target_days to defer a target by an explicit number of days; choose_candidate when user provides a numbered option; confirm_pending for yes/no confirmations; set_review_days and set_defer_days for policy tuning.",
 		"Use schedule_delete for deletion requests; rely on domain logic for item vs projection delete semantics.",
 		"Natural-language target resolution guide: prefer known aliases from thread memory first, then exact title, then partial title, and ask clarifying follow-up when ambiguous.",
 		"When multiple targets are possible, present concise choices and invite a short follow-up reply (for example: `title a`, `title b`, or a clearer title).",
@@ -181,10 +182,11 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 	tools := []openai.ChatCompletionToolParam{
 		{Function: shared.FunctionDefinitionParam{Name: "response", Description: openai.String("Send a Discord markdown response back to the user."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"message": map[string]any{"type": "string"}}, "required": []string{"message"}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "list_ready", Description: openai.String("List targets currently ready for review."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 20}}}}},
-		{Function: shared.FunctionDefinitionParam{Name: "fuzzy_search_targets", Description: openai.String("Find projection targets by fuzzy title/series/season text, optionally filtered by subject type."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "subject_type": map[string]any{"type": "string", "enum": []string{"", "movie", "season", "series"}}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 30}}, "required": []string{"query"}}}},
+		{Function: shared.FunctionDefinitionParam{Name: "fuzzy_search_targets", Description: openai.String("Find projection targets by fuzzy title/series/season text, optionally filtered by subject type."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "subject_type": map[string]any{"type": "string", "enum": []string{"", "movie", "season"}}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 30}}, "required": []string{"query"}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "query_target_state", Description: openai.String("Inspect state for a target by title text, or current selection when query omitted."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "remember_alias", Description: openai.String("Store a natural-language alias for a specific target so future follow-ups can resolve quickly."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"alias": map[string]any{"type": "string"}, "target_ref": map[string]any{"type": "string"}}, "required": []string{"alias"}}}},
-		{Function: shared.FunctionDefinitionParam{Name: "schedule_delete", Description: openai.String("Schedule deletion for any target (item/movie/season/series) by title text, alias, or target id."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"target_ref": map[string]any{"type": "string"}}}}},
+		{Function: shared.FunctionDefinitionParam{Name: "schedule_delete", Description: openai.String("Schedule deletion for operational targets (movie/season) by title text, alias, or target id."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"target_ref": map[string]any{"type": "string"}}}}},
+		{Function: shared.FunctionDefinitionParam{Name: "schedule_delete_many", Description: openai.String("Schedule deletion for many projection targets at once (useful for deleting all seasons in a show)."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"target_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}}, "required": []string{"target_ids"}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "delay_target_days", Description: openai.String("Delay a projection target by a specific number of days by updating flow policy/schedule."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"target_ref": map[string]any{"type": "string"}, "days": map[string]any{"type": "integer", "minimum": 1, "maximum": 3650}}, "required": []string{"days"}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "archive_target", Description: openai.String("Start archive or unarchive flow for a target title."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "archived": map[string]any{"type": "boolean"}}, "required": []string{"archived"}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "choose_candidate", Description: openai.String("Choose one of the numbered candidates from the last disambiguation list."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"number": map[string]any{"type": "integer", "minimum": 1}}, "required": []string{"number"}}}},
@@ -294,6 +296,8 @@ func (h *Harness) executeToolCall(ctx context.Context, threadID string, tc opena
 		return h.rememberAlias(ctx, threadID, asString(args["alias"]), asString(args["target_ref"]))
 	case "schedule_delete":
 		return h.setDeleteState(ctx, threadID, asString(args["target_ref"]))
+	case "schedule_delete_many":
+		return h.scheduleDeleteMany(ctx, asStringSlice(args["target_ids"]))
 	case "delay_target_days":
 		return h.delayTargetDays(ctx, threadID, asString(args["target_ref"]), asInt(args["days"], 0))
 	case "archive_target":
@@ -342,6 +346,25 @@ func asBool(v any, fallback bool) bool {
 		return fallback
 	}
 	return b
+}
+
+func asStringSlice(v any) []string {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, raw := range arr {
+		s, ok := raw.(string)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(s) == "" {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 func (h *Harness) listReady(ctx context.Context) (string, string, error) {
@@ -798,6 +821,43 @@ func (h *Harness) applyScheduleDeleteToID(ctx context.Context, itemID string) (s
 	return marshalToolResult(map[string]any{"status": "done", "action": "scheduled_delete", "title": name}), nil
 }
 
+func (h *Harness) scheduleDeleteMany(ctx context.Context, targetIDs []string) (string, string, error) {
+	if len(targetIDs) == 0 {
+		return marshalToolResult(map[string]any{"status": "needs_targets"}), "", nil
+	}
+	decision := h.getDecisionService()
+	if decision == nil {
+		return "", "", fmt.Errorf("decision service is not configured")
+	}
+	unique := make([]string, 0, len(targetIDs))
+	seen := map[string]struct{}{}
+	for _, id := range targetIDs {
+		trimmed := strings.TrimSpace(id)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		flow, found, err := h.getFlowByID(ctx, trimmed)
+		if err != nil {
+			return "", "", err
+		}
+		if !found || !isProjectionSubjectType(flow.SubjectType) {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		unique = append(unique, trimmed)
+	}
+	if len(unique) == 0 {
+		return marshalToolResult(map[string]any{"status": "needs_projection_target"}), "", nil
+	}
+	if err := decision.ApplyAIDecisionBatch(ctx, unique, "delete"); err != nil {
+		return "", "", err
+	}
+	return marshalToolResult(map[string]any{"status": "done", "action": "scheduled_delete_many", "count": len(unique)}), "", nil
+}
+
 func (h *Harness) fuzzySearchTargets(ctx context.Context, query string, subjectType string, limit int) (string, string, error) {
 	query = strings.TrimSpace(strings.ToLower(query))
 	subjectType = strings.TrimSpace(strings.ToLower(subjectType))
@@ -846,7 +906,7 @@ func (h *Harness) findProjectionFlowMatchesFiltered(ctx context.Context, query s
 
 func isProjectionSubjectType(subjectType string) bool {
 	s := strings.ToLower(strings.TrimSpace(subjectType))
-	return s == "movie" || s == "season" || s == "series"
+	return s == "movie" || s == "season"
 }
 
 func (h *Harness) getDecisionService() DecisionService {

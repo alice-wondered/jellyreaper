@@ -3,53 +3,17 @@ package app
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
-	bbolt "go.etcd.io/bbolt"
 
 	"jellyreaper/internal/discord"
 	"jellyreaper/internal/domain"
 	"jellyreaper/internal/jellyfin"
 	"jellyreaper/internal/repo"
-	bboltrepo "jellyreaper/internal/repo/bbolt"
 )
-
-func newTestStore(t *testing.T) *bboltrepo.Store {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "test.db")
-	store, err := bboltrepo.Open(path, 0o600, &bbolt.Options{Timeout: time.Second})
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { _ = store.Close(); _ = os.Remove(path) })
-	return store
-}
-
-func interaction(action, itemID string, version int64, id string) discord.IncomingInteraction {
-	return discord.IncomingInteraction{
-		Raw:           &discordgo.Interaction{},
-		Type:          discordgo.InteractionMessageComponent,
-		InteractionID: id,
-		Token:         "tok",
-		CustomID:      "jr:v1:" + action + ":" + itemID + ":" + strconv.FormatInt(version, 10),
-	}
-}
-
-func snowflakeIDFor(t time.Time) string {
-	const discordEpochMs = int64(1420070400000)
-	ms := t.UTC().UnixMilli()
-	if ms < discordEpochMs {
-		ms = discordEpochMs
-	}
-	id := (ms - discordEpochMs) << 22
-	return strconv.FormatInt(id, 10)
-}
 
 func TestHITLArchiveLeavesNoDeletionJob(t *testing.T) {
 	store := newTestStore(t)
@@ -58,6 +22,7 @@ func TestHITLArchiveLeavesNoDeletionJob(t *testing.T) {
 	svc.now = func() time.Time { return now }
 
 	targetID := "target:item:item-archive"
+	seedFlowForInteraction(t, store, targetID, now)
 	resp, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction("archive", targetID, 0, snowflakeIDFor(now)))
 	if err != nil {
 		t.Fatalf("handle interaction: %v", err)
@@ -98,6 +63,7 @@ func TestHITLDeleteQueuesImmediateDeleteJob(t *testing.T) {
 	svc.now = func() time.Time { return now }
 
 	targetID := "target:item:item-delete"
+	seedFlowForInteraction(t, store, targetID, now)
 	_, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction("delete", targetID, 0, snowflakeIDFor(now)))
 	if err != nil {
 		t.Fatalf("handle interaction: %v", err)
@@ -498,6 +464,7 @@ func TestGlobalDeferDaysAppliesLazilyOnNextDelayAction(t *testing.T) {
 	}
 
 	targetID := "target:season:season-lazy-defer"
+	seedFlowForInteraction(t, store, targetID, now)
 	_, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction("delay", targetID, 0, snowflakeIDFor(now)))
 	if err != nil {
 		t.Fatalf("handle delay interaction: %v", err)
@@ -533,6 +500,7 @@ func TestHITLDelaySchedulesFutureEvaluation(t *testing.T) {
 	svc.now = func() time.Time { return now }
 
 	targetID := "target:item:item-delay"
+	seedFlowForInteraction(t, store, targetID, now)
 	_, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction("delay", targetID, 0, snowflakeIDFor(now)))
 	if err != nil {
 		t.Fatalf("handle interaction: %v", err)
@@ -1250,6 +1218,93 @@ func TestPlaybackStaleEventDoesNotIncrementPlayCount(t *testing.T) {
 	}
 }
 
+func TestPlaybackEventClosesOpenHITLAndReschedulesEvaluation(t *testing.T) {
+	store := newTestStore(t)
+	discordSvc, err := discord.NewService("", nil)
+	if err != nil {
+		t.Fatalf("new discord service: %v", err)
+	}
+
+	svc := NewService(store, nil, nil)
+	svc.SetDiscordService(discordSvc)
+	now := time.Date(2026, 4, 12, 9, 30, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID:       "movie-hitl-play",
+			Name:         "Playback Recovery Movie",
+			Title:        "Playback Recovery Movie",
+			ItemType:     "Movie",
+			LastPlayedAt: now.Add(-48 * time.Hour),
+			UpdatedAt:    now,
+		}); err != nil {
+			return err
+		}
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:             "flow:target:movie:movie-hitl-play",
+			ItemID:             "target:movie:movie-hitl-play",
+			SubjectType:        "movie",
+			DisplayName:        "Playback Recovery Movie",
+			State:              domain.FlowStatePendingReview,
+			Version:            0,
+			PolicySnapshot:     domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 48, TimeoutAction: "delete"},
+			Discord:            domain.DiscordContext{ChannelID: "ch-play", MessageID: "msg-play"},
+			DecisionDeadlineAt: now.Add(6 * time.Hour),
+			NextActionAt:       now.Add(6 * time.Hour),
+			CreatedAt:          now.Add(-7 * 24 * time.Hour),
+			UpdatedAt:          now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed hitl flow/media: %v", err)
+	}
+
+	finalized := false
+	discordSvc.SetEditPromptHookForTest(func(ctx context.Context, channelID, messageID, content string) error {
+		if channelID != "ch-play" || messageID != "msg-play" {
+			t.Fatalf("unexpected finalize target: %s/%s", channelID, messageID)
+		}
+		if !strings.Contains(content, "Decision: KEEP for Playback Recovery Movie (auto via new playback).") {
+			t.Fatalf("unexpected finalize content: %s", content)
+		}
+		finalized = true
+		return nil
+	})
+
+	err = svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:           "movie-hitl-play",
+			ItemType:         "Movie",
+			Name:             "alice is playing Playback Recovery Movie",
+			NotificationType: "PlaybackStart",
+			EventID:          "evt-hitl-play",
+		},
+		Raw:        map[string]any{"EventId": "evt-hitl-play"},
+		ItemID:     "movie-hitl-play",
+		EventID:    "evt-hitl-play",
+		EventType:  "PlaybackStart",
+		DedupeKey:  "jellyfin:evt-hitl-play",
+		OccurredAt: now,
+	})
+	if err != nil {
+		t.Fatalf("handle playback webhook: %v", err)
+	}
+	if !finalized {
+		t.Fatal("expected open HITL prompt finalized after playback")
+	}
+
+	flow := mustGetFlow(t, store, "target:movie:movie-hitl-play")
+	if flow.State != domain.FlowStateActive {
+		t.Fatalf("expected flow active after playback recovery, got %s", flow.State)
+	}
+	if !flow.DecisionDeadlineAt.IsZero() {
+		t.Fatalf("expected decision deadline cleared, got %s", flow.DecisionDeadlineAt)
+	}
+	if flow.NextActionAt.Before(now.Add(29 * 24 * time.Hour)) {
+		t.Fatalf("expected next action deferred based on playback, got %s", flow.NextActionAt)
+	}
+}
+
 func TestCatalogEventUsesPayloadTimestampNotServiceClock(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)
@@ -1284,6 +1339,84 @@ func TestCatalogEventUsesPayloadTimestampNotServiceClock(t *testing.T) {
 	}
 }
 
+func TestCollectionWebhookDoesNotCreateOperationalFlow(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 12, 10, 30, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:           "collection-1",
+			ItemType:         "BoxSet",
+			Name:             "My Action Collection",
+			NotificationType: "ItemUpdated",
+			EventID:          "evt-collection-1",
+		},
+		Raw:       map[string]any{"EventId": "evt-collection-1"},
+		ItemID:    "collection-1",
+		EventID:   "evt-collection-1",
+		EventType: "ItemUpdated",
+		DedupeKey: "jellyfin:evt-collection-1",
+	})
+	if err != nil {
+		t.Fatalf("handle collection webhook: %v", err)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		flows, err := tx.ListFlows(context.Background())
+		if err != nil {
+			return err
+		}
+		for _, flow := range flows {
+			if strings.Contains(flow.ItemID, "collection-1") {
+				return fmt.Errorf("expected no operational flow for collection, found %s", flow.ItemID)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify no collection flow created: %v", err)
+	}
+}
+
+func TestSeriesWebhookDoesNotCreateOperationalFlow(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 12, 10, 45, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:           "series-123",
+			ItemType:         "Series",
+			Name:             "Series Only Event",
+			NotificationType: "ItemUpdated",
+			EventID:          "evt-series-123",
+		},
+		Raw:       map[string]any{"EventId": "evt-series-123"},
+		ItemID:    "series-123",
+		EventID:   "evt-series-123",
+		EventType: "ItemUpdated",
+		DedupeKey: "jellyfin:evt-series-123",
+	})
+	if err != nil {
+		t.Fatalf("handle series webhook: %v", err)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		flows, err := tx.ListFlows(context.Background())
+		if err != nil {
+			return err
+		}
+		if len(flows) != 0 {
+			return fmt.Errorf("expected no operational flows from series-only webhook, got %d", len(flows))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify no series flow created: %v", err)
+	}
+}
+
 func TestDiscordInteractionUsesSnowflakeTimestamp(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)
@@ -1295,6 +1428,7 @@ func TestDiscordInteractionUsesSnowflakeTimestamp(t *testing.T) {
 		t.Fatalf("snowflake timestamp: %v", err)
 	}
 
+	seedFlowForInteraction(t, store, "target:item:item-snowflake", ts.UTC())
 	_, err = svc.HandleDiscordComponentInteraction(context.Background(), interaction("keep", "target:item:item-snowflake", 0, id))
 	if err != nil {
 		t.Fatalf("handle interaction: %v", err)
@@ -1304,45 +1438,4 @@ func TestDiscordInteractionUsesSnowflakeTimestamp(t *testing.T) {
 	if !flow.UpdatedAt.Equal(ts.UTC()) {
 		t.Fatalf("expected flow updated from discord snowflake timestamp, got=%s want=%s", flow.UpdatedAt, ts.UTC())
 	}
-}
-
-func mustGetFlow(t *testing.T, store *bboltrepo.Store, itemID string) domain.Flow {
-	t.Helper()
-	var flow domain.Flow
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
-		var found bool
-		var err error
-		flow, found, err = tx.GetFlow(context.Background(), itemID)
-		if err != nil {
-			return err
-		}
-		if !found {
-			t.Fatalf("flow %s not found", itemID)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("get flow %s: %v", itemID, err)
-	}
-	return flow
-}
-
-func mustGetMedia(t *testing.T, store *bboltrepo.Store, itemID string) domain.MediaItem {
-	t.Helper()
-	var media domain.MediaItem
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
-		item, found, err := tx.GetMedia(context.Background(), itemID)
-		if err != nil {
-			return err
-		}
-		if !found {
-			t.Fatalf("media %s not found", itemID)
-		}
-		media = item
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("get media %s: %v", itemID, err)
-	}
-	return media
 }
