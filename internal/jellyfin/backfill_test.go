@@ -194,7 +194,7 @@ func TestBackfillFetchChangedItemsSinceEnrichesPlaybackAcrossUsers(t *testing.T)
 		switch r.URL.Path {
 		case "/Items":
 			// Base item query has no useful user playback data.
-			res := gen.BaseItemDtoQueryResult{Items: &[]gen.BaseItemDto{{Id: &itemID, Name: strPtr("The Matrix")}}}
+			res := gen.BaseItemDtoQueryResult{Items: &[]gen.BaseItemDto{{Id: &itemID, Name: strPtr("Sample Movie")}}}
 			_ = json.NewEncoder(w).Encode(res)
 		case "/Users":
 			_, _ = w.Write([]byte(`[{"Id":"u1"},{"Id":"u2"}]`))
