@@ -41,9 +41,10 @@ JellyReaper is a Go service that listens to Jellyfin and Discord webhooks, persi
 | `JELLYFIN_API_KEY` | yes | - | Jellyfin API key |
 | `BACKFILL_ENABLED` | no | `true` | enables startup + periodic backfill |
 | `BACKFILL_INTERVAL` | no | `15m` | periodic backfill interval |
-| `BACKFILL_LOOKBACK` | no | `24h` | startup lookback if no checkpoint exists |
+| `BACKFILL_FULL_SWEEP_ON_STARTUP` | no | `true` | on first run (no checkpoint), sweep full Jellyfin history |
+| `BACKFILL_LOOKBACK` | no | `24h` | startup lookback if full sweep is disabled and no checkpoint exists |
 | `BACKFILL_OVERLAP` | no | `2m` | overlap from last checkpoint to avoid missing events |
-| `BACKFILL_LIMIT` | no | `500` | max records per Jellyfin backfill request |
+| `BACKFILL_LIMIT` | no | `500` | page size per Jellyfin backfill request (all pages are fetched) |
 
 ## Run
 ```bash
@@ -89,11 +90,16 @@ go generate ./api
 - Jellyfin webhook ingress is mapped from documented Jellyfin webhook/plugin field names (`EventId`, `NotificationId`, `NotificationType`, `ItemId`, `UserId`, `ServerId`, `Name`).
 
 ### Target Projection Behavior
-- TV episode events project to season and series targets.
+- TV episode events project to season targets.
 - Scheduler/HITL runs on targets to reduce per-episode Discord noise.
 - Aggregate target deletion resolves child items and deletes each supported media item.
 - Discord prompts use human-readable names and include image embeds when available.
 - On startup the bot announces online status and that backfill has started.
+
+### Backfill Behavior
+- Backfill is paginated and performs a full sweep from the checkpoint boundary (not just the first page).
+- First startup defaults to a full historical sweep; later runs sweep from the saved checkpoint with overlap.
+- Backfill reuses the same typed orchestration path as webhooks to keep flow/job behavior consistent.
 
 ## Notes On Provider Payloads
 - Discord ingress is validated and decoded using `discordgo` payload semantics.

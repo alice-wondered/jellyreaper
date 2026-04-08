@@ -24,6 +24,9 @@ func (f *fakeRepo) LeaseDueJobs(context.Context, time.Time, int, string, time.Du
 func (f *fakeRepo) GetNextDueAt(context.Context) (time.Time, bool, error) {
 	return time.Time{}, false, nil
 }
+func (f *fakeRepo) GetNextQueuedJob(context.Context) (domain.JobRecord, bool, error) {
+	return domain.JobRecord{}, false, nil
+}
 func (f *fakeRepo) CompleteJob(context.Context, string, time.Time) error {
 	f.completeCalls++
 	return nil

@@ -79,6 +79,34 @@ func TestFailJobRequeuesPending(t *testing.T) {
 	}
 }
 
+func TestGetNextQueuedJobReturnsEarliestPendingJob(t *testing.T) {
+	store := testStore(t)
+	now := time.Date(2026, 4, 8, 12, 0, 0, 0, time.UTC)
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.EnqueueJob(context.Background(), domain.JobRecord{JobID: "job-late", ItemID: "i-late", Kind: domain.JobKindEvaluatePolicy, Status: domain.JobStatusPending, RunAt: now.Add(2 * time.Hour)}); err != nil {
+			return err
+		}
+		if err := tx.EnqueueJob(context.Background(), domain.JobRecord{JobID: "job-early", ItemID: "i-early", Kind: domain.JobKindEvaluatePolicy, Status: domain.JobStatusPending, RunAt: now.Add(time.Hour)}); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed jobs: %v", err)
+	}
+
+	job, found, err := store.GetNextQueuedJob(context.Background())
+	if err != nil {
+		t.Fatalf("get next queued job: %v", err)
+	}
+	if !found {
+		t.Fatal("expected next queued job")
+	}
+	if job.JobID != "job-early" {
+		t.Fatalf("expected earliest job, got %s", job.JobID)
+	}
+}
+
 func TestLeaseDueJobsReclaimsExpiredLeases(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()

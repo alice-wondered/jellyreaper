@@ -33,6 +33,7 @@ type Repository interface {
 
 	LeaseDueJobs(ctx context.Context, now time.Time, limit int, leaseOwner string, leaseTTL time.Duration) ([]domain.JobRecord, error)
 	GetNextDueAt(ctx context.Context) (time.Time, bool, error)
+	GetNextQueuedJob(ctx context.Context) (domain.JobRecord, bool, error)
 
 	CompleteJob(ctx context.Context, jobID string, completedAt time.Time) error
 	FailJob(ctx context.Context, jobID string, errMsg string, retryAt time.Time, markTerminal bool) error

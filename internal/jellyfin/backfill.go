@@ -79,102 +79,149 @@ func NewBackfillServiceWithClient(client BackfillClient) *BackfillService {
 }
 
 func (s *BackfillService) FetchPlaybackEventsSince(ctx context.Context, since time.Time, limit int32) ([]PlaybackEvent, error) {
-	params := &gen.GetLogEntriesParams{MinDate: &since, Limit: &limit}
-	resp, err := s.client.GetLogEntriesWithResponse(ctx, params)
-	if err != nil {
-		return nil, fmt.Errorf("fetch jellyfin activity log: %w", err)
-	}
-	if resp.StatusCode() != http.StatusOK {
-		return nil, fmt.Errorf("activity log returned status %d", resp.StatusCode())
+	pageSize := limit
+	if pageSize <= 0 {
+		pageSize = 500
 	}
 
-	body := resp.JSON200
-	if body == nil {
-		body = resp.ApplicationjsonProfileCamelCase200
-	}
-	if body == nil {
-		body = resp.ApplicationjsonProfilePascalCase200
-	}
-	if body == nil && len(resp.Body) > 0 {
-		var parsed gen.ActivityLogEntryQueryResult
-		if err := json.Unmarshal(resp.Body, &parsed); err == nil {
-			body = &parsed
-		} else if looksLikeHTML(resp.Body) {
-			return nil, htmlResponseError("activity log", resp.HTTPResponse, resp.Body)
+	out := make([]PlaybackEvent, 0, pageSize)
+	startIndex := int32(0)
+
+	for {
+		params := &gen.GetLogEntriesParams{StartIndex: &startIndex, Limit: &pageSize}
+		if !since.IsZero() {
+			params.MinDate = &since
 		}
-	}
-	if body == nil || body.Items == nil {
-		return nil, nil
+
+		resp, err := s.client.GetLogEntriesWithResponse(ctx, params)
+		if err != nil {
+			return nil, fmt.Errorf("fetch jellyfin activity log: %w", err)
+		}
+		if resp.StatusCode() != http.StatusOK {
+			return nil, fmt.Errorf("activity log returned status %d", resp.StatusCode())
+		}
+
+		body := resp.JSON200
+		if body == nil {
+			body = resp.ApplicationjsonProfileCamelCase200
+		}
+		if body == nil {
+			body = resp.ApplicationjsonProfilePascalCase200
+		}
+		if body == nil && len(resp.Body) > 0 {
+			var parsed gen.ActivityLogEntryQueryResult
+			if err := json.Unmarshal(resp.Body, &parsed); err == nil {
+				body = &parsed
+			} else if looksLikeHTML(resp.Body) {
+				return nil, htmlResponseError("activity log", resp.HTTPResponse, resp.Body)
+			}
+		}
+		if body == nil || body.Items == nil || len(*body.Items) == 0 {
+			break
+		}
+
+		for _, entry := range *body.Items {
+			t := safeString(entry.Type)
+			if t == "" {
+				continue
+			}
+			out = append(out, PlaybackEvent{
+				ItemID: safeString(entry.ItemId),
+				UserID: uuidString(entry.UserId),
+				Type:   t,
+				Name:   safeString(entry.Name),
+				Date:   safeTime(entry.Date),
+			})
+		}
+
+		if int32(len(*body.Items)) < pageSize {
+			break
+		}
+		startIndex += int32(len(*body.Items))
 	}
 
-	out := make([]PlaybackEvent, 0, len(*body.Items))
-	for _, entry := range *body.Items {
-		t := safeString(entry.Type)
-		if t == "" {
-			continue
-		}
-		out = append(out, PlaybackEvent{
-			ItemID: safeString(entry.ItemId),
-			UserID: uuidString(entry.UserId),
-			Type:   t,
-			Name:   safeString(entry.Name),
-			Date:   safeTime(entry.Date),
-		})
-	}
 	return out, nil
 }
 
 func (s *BackfillService) FetchChangedItemsSince(ctx context.Context, since time.Time, limit int32) ([]ItemSnapshot, error) {
 	recursive := true
 	enableUserData := true
-	params := &gen.GetItemsParams{MinDateLastSaved: &since, Limit: &limit, Recursive: &recursive, EnableUserData: &enableUserData}
-	resp, err := s.client.GetItemsWithResponse(ctx, params)
-	if err != nil {
-		return nil, fmt.Errorf("fetch jellyfin changed items: %w", err)
-	}
-	if resp.StatusCode() != http.StatusOK {
-		return nil, fmt.Errorf("items query returned status %d", resp.StatusCode())
+	sortBy := []gen.ItemSortBy{gen.ItemSortByDateCreated}
+	sortOrder := []gen.SortOrder{gen.SortOrder("Ascending")}
+	pageSize := limit
+	if pageSize <= 0 {
+		pageSize = 500
 	}
 
-	body := resp.JSON200
-	if body == nil {
-		body = resp.ApplicationjsonProfileCamelCase200
-	}
-	if body == nil {
-		body = resp.ApplicationjsonProfilePascalCase200
-	}
-	if body == nil && len(resp.Body) > 0 {
-		var parsed gen.BaseItemDtoQueryResult
-		if err := json.Unmarshal(resp.Body, &parsed); err == nil {
-			body = &parsed
-		} else if looksLikeHTML(resp.Body) {
-			return nil, htmlResponseError("items endpoint", resp.HTTPResponse, resp.Body)
+	out := make([]ItemSnapshot, 0, pageSize)
+	startIndex := int32(0)
+
+	for {
+		params := &gen.GetItemsParams{
+			Recursive:      &recursive,
+			EnableUserData: &enableUserData,
+			SortBy:         &sortBy,
+			SortOrder:      &sortOrder,
+			Limit:          &pageSize,
+			StartIndex:     &startIndex,
 		}
-	}
-	if body == nil || body.Items == nil {
-		return nil, nil
+		if !since.IsZero() {
+			params.MinDateLastSaved = &since
+		}
+
+		resp, err := s.client.GetItemsWithResponse(ctx, params)
+		if err != nil {
+			return nil, fmt.Errorf("fetch jellyfin changed items: %w", err)
+		}
+		if resp.StatusCode() != http.StatusOK {
+			return nil, fmt.Errorf("items query returned status %d", resp.StatusCode())
+		}
+
+		body := resp.JSON200
+		if body == nil {
+			body = resp.ApplicationjsonProfileCamelCase200
+		}
+		if body == nil {
+			body = resp.ApplicationjsonProfilePascalCase200
+		}
+		if body == nil && len(resp.Body) > 0 {
+			var parsed gen.BaseItemDtoQueryResult
+			if err := json.Unmarshal(resp.Body, &parsed); err == nil {
+				body = &parsed
+			} else if looksLikeHTML(resp.Body) {
+				return nil, htmlResponseError("items endpoint", resp.HTTPResponse, resp.Body)
+			}
+		}
+		if body == nil || body.Items == nil || len(*body.Items) == 0 {
+			break
+		}
+
+		for _, item := range *body.Items {
+			itemID := uuidString(item.Id)
+			itemType := stringValueFromKind(item.Type)
+			imageURL := buildPrimaryImageURL(s.baseURL, itemID, item.ImageTags)
+			out = append(out, ItemSnapshot{
+				ItemID:             itemID,
+				ItemType:           itemType,
+				SeasonID:           uuidString(item.SeasonId),
+				SeasonName:         safeString(item.SeasonName),
+				SeriesID:           uuidString(item.SeriesId),
+				SeriesName:         safeString(item.SeriesName),
+				Name:               safeString(item.Name),
+				ImageURL:           imageURL,
+				LastPlayedAt:       safeNestedLastPlayed(item.UserData),
+				PlayCount:          safeNestedPlayCount(item.UserData),
+				DateCreated:        safeTime(item.DateCreated),
+				DateLastMediaAdded: safeTime(item.DateLastMediaAdded),
+			})
+		}
+
+		if int32(len(*body.Items)) < pageSize {
+			break
+		}
+		startIndex += int32(len(*body.Items))
 	}
 
-	out := make([]ItemSnapshot, 0, len(*body.Items))
-	for _, item := range *body.Items {
-		itemID := uuidString(item.Id)
-		itemType := stringValueFromKind(item.Type)
-		imageURL := buildPrimaryImageURL(s.baseURL, itemID, item.ImageTags)
-		out = append(out, ItemSnapshot{
-			ItemID:             itemID,
-			ItemType:           itemType,
-			SeasonID:           uuidString(item.SeasonId),
-			SeasonName:         safeString(item.SeasonName),
-			SeriesID:           uuidString(item.SeriesId),
-			SeriesName:         safeString(item.SeriesName),
-			Name:               safeString(item.Name),
-			ImageURL:           imageURL,
-			LastPlayedAt:       safeNestedLastPlayed(item.UserData),
-			PlayCount:          safeNestedPlayCount(item.UserData),
-			DateCreated:        safeTime(item.DateCreated),
-			DateLastMediaAdded: safeTime(item.DateLastMediaAdded),
-		})
-	}
 	return out, nil
 }
 
