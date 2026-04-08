@@ -352,7 +352,7 @@ func TestRememberAliasToolStoresCustomPhrase(t *testing.T) {
 	}
 }
 
-func TestScheduleDeleteProjection_SeriesSchedulesAllSeasonTargets(t *testing.T) {
+func TestScheduleDeleteProjection_UsesProjectionSelectionFlow(t *testing.T) {
 	store := newTestStore(t)
 	seedFlow(t, store, "target:season:s-1", "Season 1 of The Office", domain.FlowStateActive)
 	seedFlow(t, store, "target:season:s-2", "Season 2 of The Office", domain.FlowStateActive)
@@ -367,22 +367,33 @@ func TestScheduleDeleteProjection_SeriesSchedulesAllSeasonTargets(t *testing.T) 
 	if err != nil {
 		t.Fatalf("set delete projection: %v", err)
 	}
+	if !strings.Contains(out, "\"status\":\"needs_selection\"") {
+		t.Fatalf("expected selection status, got: %s", out)
+	}
+
+	out, _, err = h.handleFollowUp(context.Background(), threadID, "1")
+	if err != nil {
+		t.Fatalf("select projection candidate: %v", err)
+	}
 	if !strings.Contains(out, "\"status\":\"needs_confirmation\"") {
-		t.Fatalf("expected confirmation status, got: %s", out)
+		t.Fatalf("expected confirmation after selection, got: %s", out)
 	}
 
 	out, _, err = h.handleFollowUp(context.Background(), threadID, "yes")
 	if err != nil {
 		t.Fatalf("confirm delete projection: %v", err)
 	}
-	if !strings.Contains(out, "scheduled_delete_projection") {
-		t.Fatalf("expected projection delete done output, got: %s", out)
+	if !strings.Contains(out, "scheduled_delete") {
+		t.Fatalf("expected scheduled delete output, got: %s", out)
 	}
 
 	flow1 := mustGetFlow(t, store, "target:season:s-1")
 	flow2 := mustGetFlow(t, store, "target:season:s-2")
-	if flow1.State != domain.FlowStateDeleteQueued || flow2.State != domain.FlowStateDeleteQueued {
-		t.Fatalf("expected both season flows delete_queued, got %s and %s", flow1.State, flow2.State)
+	if flow1.State != domain.FlowStateDeleteQueued {
+		t.Fatalf("expected selected season flow delete_queued, got %s", flow1.State)
+	}
+	if flow2.State != domain.FlowStateActive {
+		t.Fatalf("expected non-selected season flow unchanged, got %s", flow2.State)
 	}
 }
 
