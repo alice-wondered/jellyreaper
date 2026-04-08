@@ -186,3 +186,80 @@ func TestBackfillFetchPlaybackEventsSincePaginatesAllResults(t *testing.T) {
 		t.Fatalf("expected 5 events, got %d", len(events))
 	}
 }
+
+func TestBackfillFetchChangedItemsSinceEnrichesPlaybackAcrossUsers(t *testing.T) {
+	itemID := uuid.New()
+	recentPlay := time.Date(2026, 4, 5, 0, 29, 37, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/Items":
+			// Base item query has no useful user playback data.
+			res := gen.BaseItemDtoQueryResult{Items: &[]gen.BaseItemDto{{Id: &itemID, Name: strPtr("Sample Movie")}}}
+			_ = json.NewEncoder(w).Encode(res)
+		case "/Users":
+			_, _ = w.Write([]byte(`[{"Id":"u1"},{"Id":"u2"}]`))
+		case "/Users/u1/Items":
+			_, _ = w.Write([]byte(`{"Items":[{"Id":"` + itemID.String() + `","UserData":{"PlayCount":0}}]}`))
+		case "/Users/u2/Items":
+			_, _ = w.Write([]byte(`{"Items":[{"Id":"` + itemID.String() + `","UserData":{"LastPlayedDate":"` + recentPlay.Format(time.RFC3339Nano) + `","PlayCount":4}}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	b, err := NewBackfillService(server.URL, "token", server.Client())
+	if err != nil {
+		t.Fatalf("new backfill service: %v", err)
+	}
+
+	items, err := b.FetchChangedItemsSince(context.Background(), time.Now().Add(-24*time.Hour), 100)
+	if err != nil {
+		t.Fatalf("fetch changed items: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	if !items[0].LastPlayedAt.Equal(recentPlay) {
+		t.Fatalf("expected cross-user last played date to be enriched, got=%s want=%s", items[0].LastPlayedAt, recentPlay)
+	}
+	if items[0].PlayCount != 4 {
+		t.Fatalf("expected cross-user play count 4, got %d", items[0].PlayCount)
+	}
+}
+
+func TestBackfillFetchChangedItemsSinceCachesUsersList(t *testing.T) {
+	itemID := uuid.New()
+	now := time.Now().UTC()
+	usersCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/Items":
+			res := gen.BaseItemDtoQueryResult{Items: &[]gen.BaseItemDto{{Id: &itemID, Name: strPtr("Sample Movie")}}}
+			_ = json.NewEncoder(w).Encode(res)
+		case "/Users":
+			usersCalls++
+			_, _ = w.Write([]byte(`[{"Id":"u1"}]`))
+		case "/Users/u1/Items":
+			_, _ = w.Write([]byte(`{"Items":[{"Id":"` + itemID.String() + `","UserData":{"LastPlayedDate":"` + now.Format(time.RFC3339Nano) + `","PlayCount":1}}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	b, err := NewBackfillService(server.URL, "token", server.Client())
+	if err != nil {
+		t.Fatalf("new backfill service: %v", err)
+	}
+
+	if _, err := b.FetchChangedItemsSince(context.Background(), time.Now().Add(-24*time.Hour), 100); err != nil {
+		t.Fatalf("first fetch changed items: %v", err)
+	}
+	if _, err := b.FetchChangedItemsSince(context.Background(), time.Now().Add(-24*time.Hour), 100); err != nil {
+		t.Fatalf("second fetch changed items: %v", err)
+	}
+	if usersCalls != 1 {
+		t.Fatalf("expected /Users to be fetched once from cache, got %d", usersCalls)
+	}
+}
