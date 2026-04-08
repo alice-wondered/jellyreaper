@@ -51,9 +51,11 @@ func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord
 		}
 
 		if flow.State == domain.FlowStateArchived || flow.State == domain.FlowStateDeleted || flow.State == domain.FlowStateDeleteQueued || flow.State == domain.FlowStateDeleteInProgress {
+			h.logger.Info("policy evaluation skipped", "lex", "POLICY-EVAL", "item_id", job.ItemID, "reason", "terminal_or_archived_state", "flow_state", flow.State)
 			return nil
 		}
 		if flow.State == domain.FlowStatePendingReview {
+			h.logger.Info("policy evaluation skipped", "lex", "POLICY-EVAL", "item_id", job.ItemID, "reason", "already_pending_review", "flow_state", flow.State)
 			return nil
 		}
 
@@ -65,6 +67,21 @@ func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord
 		lastPlayed, known, err := mostRecentPlayForFlow(ctx, tx, flow)
 		if err != nil {
 			return err
+		}
+		if !known {
+			createdAt, createdKnown, err := mostRecentCreatedForFlow(ctx, tx, flow)
+			if err != nil {
+				return err
+			}
+			if createdKnown {
+				lastPlayed = createdAt
+				known = true
+				h.logger.Info("policy evaluation fallback timestamp", "lex", "POLICY-EVAL", "item_id", job.ItemID, "reason", "use_created_at", "fallback_at", lastPlayed)
+			} else {
+				lastPlayed = time.Unix(0, 0).UTC()
+				known = true
+				h.logger.Info("policy evaluation fallback timestamp", "lex", "POLICY-EVAL", "item_id", job.ItemID, "reason", "use_epoch", "fallback_at", lastPlayed)
+			}
 		}
 		if known {
 			dueAt := lastPlayed.Add(time.Duration(expireDays) * 24 * time.Hour)
@@ -81,22 +98,9 @@ func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord
 				if err != nil {
 					return err
 				}
+				h.logger.Info("policy evaluation deferred", "lex", "POLICY-EVAL", "item_id", job.ItemID, "reason", "not_due_yet", "last_played_at", lastPlayed, "due_at", dueAt)
 				return upsertScheduledEvaluateJob(ctx, tx, flow, now, dueAt, payload)
 			}
-		} else {
-			expected := flow.Version
-			flow.NextActionAt = now.Add(24 * time.Hour)
-			flow.UpdatedAt = now
-			flow.Version = expected + 1
-			if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
-				return err
-			}
-
-			payload, err := json.Marshal(jobs.EvaluatePolicyPayload{Reason: "await_play_metrics"})
-			if err != nil {
-				return err
-			}
-			return upsertScheduledEvaluateJob(ctx, tx, flow, now, flow.NextActionAt, payload)
 		}
 
 		expected := flow.Version
@@ -129,6 +133,7 @@ func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord
 			CreatedAt:      now,
 			UpdatedAt:      now,
 		}
+		h.logger.Info("policy evaluation queued hitl", "lex", "POLICY-EVAL", "item_id", job.ItemID, "reason", "stale_due", "flow_state", flow.State)
 		return tx.EnqueueJob(ctx, promptJob)
 	})
 }
@@ -160,6 +165,35 @@ func mostRecentPlayForFlow(ctx context.Context, tx repo.TxRepository, flow domai
 		return time.Time{}, false, nil
 	}
 	return item.LastPlayedAt, true, nil
+}
+
+func mostRecentCreatedForFlow(ctx context.Context, tx repo.TxRepository, flow domain.Flow) (time.Time, bool, error) {
+	parts := strings.SplitN(flow.ItemID, ":", 3)
+	if len(parts) == 3 && parts[0] == "target" {
+		items, err := tx.ListMediaBySubject(ctx, parts[1], parts[2])
+		if err != nil {
+			return time.Time{}, false, err
+		}
+		latest := time.Time{}
+		for _, item := range items {
+			if item.CreatedAt.After(latest) {
+				latest = item.CreatedAt
+			}
+		}
+		if latest.IsZero() {
+			return time.Time{}, false, nil
+		}
+		return latest, true, nil
+	}
+
+	item, found, err := tx.GetMedia(ctx, flow.ItemID)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if !found || item.CreatedAt.IsZero() {
+		return time.Time{}, false, nil
+	}
+	return item.CreatedAt, true, nil
 }
 
 type SendHITLPromptHandler struct {

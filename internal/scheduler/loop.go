@@ -77,7 +77,7 @@ func (l *Loop) Run(ctx context.Context) error {
 
 		now := l.now()
 		if err := l.leaseAndDispatch(ctx, now); err != nil {
-			l.logger.Error("lease/dispatch cycle failed", "error", err)
+			l.logger.Error("lease/dispatch cycle failed", "lex", "SCHEDULER", "error", err)
 		}
 
 		nextWake := l.computeNextWake(ctx, now)
@@ -95,7 +95,7 @@ func (l *Loop) leaseAndDispatch(ctx context.Context, now time.Time) error {
 
 	for _, job := range jobs {
 		if err := l.dispatch(ctx, job); err != nil {
-			l.logger.Error("dispatch failed", "job_id", job.JobID, "kind", job.Kind, "error", err)
+			l.logger.Error("dispatch failed", "lex", "SCHEDULER-DISPATCH", "job_id", job.JobID, "kind", job.Kind, "error", err)
 		}
 	}
 
@@ -107,7 +107,7 @@ func (l *Loop) computeNextWake(ctx context.Context, now time.Time) time.Time {
 
 	dueAt, ok, err := l.repository.GetNextDueAt(ctx)
 	if err != nil {
-		l.logger.Error("get next due job failed", "error", err)
+		l.logger.Error("get next due job failed", "lex", "SCHEDULER-QUEUE", "error", err)
 	} else if ok && dueAt.Before(nextWake) {
 		nextWake = dueAt
 	}
