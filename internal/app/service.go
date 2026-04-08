@@ -251,7 +251,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		}
 	}
 
-	if itemID != "" {
+	if itemID != "" && (supportsMediaIndexType(event.Payload.ItemType) || playbackEvent) {
 		existing, found, err := tx.GetMedia(ctx, itemID)
 		if err != nil {
 			return err
@@ -1179,7 +1179,6 @@ func flowIDFromItem(itemID string) string {
 
 func deriveTargets(event jellyfin.WebhookEvent) []targetRef {
 	p := event.Payload
-	allowFallback := true
 	push := func(out []targetRef, t targetRef) []targetRef {
 		if t.ID == "" {
 			return out
@@ -1199,21 +1198,13 @@ func deriveTargets(event jellyfin.WebhookEvent) []targetRef {
 	case "episode":
 		seasonLabel := formatSeasonLabel(p.SeasonName, p.SeriesName, p.Name)
 		out = push(out, targetRef{Type: "season", ID: p.SeasonID, Name: seasonLabel, ImageURL: p.PrimaryImageURL})
-		allowFallback = false
 	case "season":
 		seasonLabel := formatSeasonLabel(chooseName(p.Name, p.SeasonName), p.SeriesName, p.Name)
 		out = push(out, targetRef{Type: "season", ID: p.ItemID, Name: seasonLabel, ImageURL: p.PrimaryImageURL})
-		allowFallback = false
 	case "series":
-		allowFallback = false
 	case "movie":
 		out = push(out, targetRef{Type: "movie", ID: p.ItemID, Name: p.Name, ImageURL: p.PrimaryImageURL})
-		allowFallback = false
 	default:
-		allowFallback = false
-	}
-	if allowFallback && len(out) == 0 && event.ItemID != "" {
-		out = push(out, targetRef{Type: "item", ID: event.ItemID, Name: chooseName(p.Name, event.ItemID), ImageURL: p.PrimaryImageURL})
 	}
 	return out
 }
@@ -1458,6 +1449,11 @@ func normalizeMediaType(itemType string) string {
 		return "UNKNOWN"
 	}
 	return t
+}
+
+func supportsMediaIndexType(itemType string) bool {
+	t := strings.ToLower(strings.TrimSpace(itemType))
+	return t == "movie" || t == "episode"
 }
 
 func backfillItemDedupeKey(item jellyfin.ItemSnapshot, ordinal int) string {
