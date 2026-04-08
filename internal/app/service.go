@@ -536,6 +536,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 	}
 	dedupeKey := discordDedupeKey(interaction)
 	alreadyProcessed := false
+	processedMessage := ""
 	staleVersion := false
 	staleMessage := ""
 	decisionDisplayName := parsed.ItemID
@@ -552,6 +553,17 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 		}
 		if processed {
 			alreadyProcessed = true
+			if flow, found, err := tx.GetFlow(ctx, parsed.ItemID); err == nil {
+				if found {
+					display := strings.TrimSpace(flow.DisplayName)
+					if display == "" {
+						display = decisionDisplayName
+					}
+					processedMessage = staleDecisionMessage(flow, display)
+				} else {
+					processedMessage = fmt.Sprintf("Resolved: %s for %s (target no longer exists)", strings.ToUpper(strings.TrimSpace(parsed.Action)), decisionDisplayName)
+				}
+			}
 			return nil
 		}
 
@@ -561,7 +573,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 		}
 		if !found {
 			staleVersion = true
-			staleMessage = "Resolved: target no longer exists."
+			staleMessage = fmt.Sprintf("Resolved: %s for %s (target no longer exists)", strings.ToUpper(strings.TrimSpace(parsed.Action)), decisionDisplayName)
 			return nil
 		}
 		if strings.TrimSpace(flow.DisplayName) != "" {
@@ -636,7 +648,10 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 	}
 
 	if alreadyProcessed {
-		return interactionMessageUpdateResponse("Decision already recorded."), nil
+		if strings.TrimSpace(processedMessage) == "" {
+			processedMessage = fmt.Sprintf("Resolved: %s for %s", strings.ToUpper(strings.TrimSpace(parsed.Action)), decisionDisplayName)
+		}
+		return interactionMessageUpdateResponse(processedMessage), nil
 	}
 	if staleVersion {
 		if strings.TrimSpace(staleMessage) == "" {
