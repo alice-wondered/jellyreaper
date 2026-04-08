@@ -438,9 +438,11 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 
 		if playbackEvent && flow.State == domain.FlowStatePendingReview {
 			runAt := now
+			resolvedPlayedAt := time.Time{}
 			if playAt, known, err := mostRecentPlayForTarget(ctx, tx, flow); err != nil {
 				return err
 			} else if known {
+				resolvedPlayedAt = playAt
 				expireDays := flow.PolicySnapshot.ExpireAfterDays
 				if expireDays <= 0 {
 					expireDays = defaultExpireDays
@@ -472,7 +474,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 				*finalizations = append(*finalizations, hitlFinalizeRequest{
 					channelID: flow.Discord.ChannelID,
 					messageID: flow.Discord.MessageID,
-					content:   fmt.Sprintf("Decision: KEEP for %s (auto via new playback).", display),
+					content:   fmt.Sprintf("Resolved: PLAYED at %s for %s", humanTimeLabel(resolvedPlayedAt), display),
 				})
 			}
 			continue
@@ -535,6 +537,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 	dedupeKey := discordDedupeKey(interaction)
 	alreadyProcessed := false
 	staleVersion := false
+	staleMessage := ""
 	decisionDisplayName := parsed.ItemID
 
 	err = s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
@@ -558,16 +561,18 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 		}
 		if !found {
 			staleVersion = true
+			staleMessage = "Resolved: target no longer exists."
 			return nil
+		}
+		if strings.TrimSpace(flow.DisplayName) != "" {
+			decisionDisplayName = strings.TrimSpace(flow.DisplayName)
 		}
 
 		expectedVersion := flow.Version
 		if parsed.Version != expectedVersion {
 			staleVersion = true
+			staleMessage = staleDecisionMessage(flow, decisionDisplayName)
 			return nil
-		}
-		if strings.TrimSpace(flow.DisplayName) != "" {
-			decisionDisplayName = strings.TrimSpace(flow.DisplayName)
 		}
 
 		flow.UpdatedAt = now
@@ -634,7 +639,10 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 		return interactionMessageUpdateResponse("Decision already recorded."), nil
 	}
 	if staleVersion {
-		return interactionMessageUpdateResponse("This decision is stale. Please refresh and try again."), nil
+		if strings.TrimSpace(staleMessage) == "" {
+			staleMessage = "Resolved: this prompt has already been handled."
+		}
+		return interactionMessageUpdateResponse(staleMessage), nil
 	}
 
 	s.wake(now)
@@ -1152,6 +1160,29 @@ func interactionDecisionUpdateResponse(action string, itemDisplay string) *disco
 	return interactionMessageUpdateResponse(fmt.Sprintf("Decision: %s for %s", strings.ToUpper(decision), item))
 }
 
+func staleDecisionMessage(flow domain.Flow, itemDisplay string) string {
+	item := strings.TrimSpace(itemDisplay)
+	if item == "" {
+		item = "item"
+	}
+	decision := strings.TrimSpace(strings.ToLower(flow.HITLOutcome))
+	if decision == "" {
+		switch flow.State {
+		case domain.FlowStateArchived:
+			decision = "archive"
+		case domain.FlowStateDeleteQueued, domain.FlowStateDeleted:
+			decision = "delete"
+		case domain.FlowStateActive:
+			decision = "keep"
+		case domain.FlowStatePendingReview:
+			decision = "delay"
+		default:
+			decision = "resolved"
+		}
+	}
+	return fmt.Sprintf("Resolved: %s for %s", strings.ToUpper(decision), item)
+}
+
 func jellyfinEventType(t string) string {
 	t = strings.TrimSpace(t)
 	if t == "" {
@@ -1480,6 +1511,13 @@ func formatSeasonLabel(seasonName string, seriesName string, fallback string) st
 		return season + " of " + series
 	}
 	return chooseName(seasonName, seriesName, fallback)
+}
+
+func humanTimeLabel(t time.Time) string {
+	if t.IsZero() {
+		return "unknown"
+	}
+	return t.UTC().Format("2006-01-02 15:04 UTC")
 }
 
 func shortHash(value string) string {

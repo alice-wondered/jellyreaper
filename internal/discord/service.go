@@ -35,7 +35,7 @@ type MentionMessage struct {
 type Service struct {
 	publicKey ed25519.PublicKey
 	session   *discordgo.Session
-	sendHook  func(context.Context, string, string, int64, string, string) (string, error)
+	sendHook  func(context.Context, string, string, int64, string, string, string) (string, error)
 	editHook  func(context.Context, string, string, string) error
 
 	httpClient      *http.Client
@@ -146,9 +146,9 @@ func (s *Service) HandleIncomingInteraction(ctx context.Context, interaction Inc
 	}
 }
 
-func (s *Service) SendHITLPrompt(ctx context.Context, channelID, itemID string, version int64, displayName string, imageURL string) (string, error) {
+func (s *Service) SendHITLPrompt(ctx context.Context, channelID, itemID string, version int64, displayName string, imageURL string, statusLine string) (string, error) {
 	if s.sendHook != nil {
-		return s.sendHook(ctx, channelID, itemID, version, displayName, imageURL)
+		return s.sendHook(ctx, channelID, itemID, version, displayName, imageURL, statusLine)
 	}
 
 	if s.session == nil {
@@ -163,8 +163,13 @@ func (s *Service) SendHITLPrompt(ctx context.Context, channelID, itemID string, 
 		contentName = itemID
 	}
 
+	content := fmt.Sprintf("Review needed: **%s**\nChoose an action for this media group.", contentName)
+	if strings.TrimSpace(statusLine) != "" {
+		content = fmt.Sprintf("Review needed: **%s**\n%s\nChoose an action for this media group.", contentName, strings.TrimSpace(statusLine))
+	}
+
 	send := &discordgo.MessageSend{
-		Content: fmt.Sprintf("Review needed: **%s**\nChoose an action for this media group.", contentName),
+		Content: content,
 		Components: []discordgo.MessageComponent{
 			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
 				discordgo.Button{Label: "Archive", Style: discordgo.SecondaryButton, CustomID: customID("archive", itemID, version)},
@@ -200,7 +205,7 @@ func (s *Service) SendHITLPrompt(ctx context.Context, channelID, itemID string, 
 	return msg.ID, nil
 }
 
-func (s *Service) SetSendPromptHookForTest(hook func(context.Context, string, string, int64, string, string) (string, error)) {
+func (s *Service) SetSendPromptHookForTest(hook func(context.Context, string, string, int64, string, string, string) (string, error)) {
 	s.sendHook = hook
 }
 

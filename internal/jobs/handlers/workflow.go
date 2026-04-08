@@ -251,6 +251,7 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 	var flow domain.Flow
 	var found bool
 	shouldSend := true
+	statusLine := ""
 	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
 		var err error
 		flow, found, err = tx.GetFlow(ctx, job.ItemID)
@@ -267,6 +268,11 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 		if flow.Discord.MessageID != "" {
 			shouldSend = false
 			return nil
+		}
+		if lastPlayedAt, ok, err := mostRecentPlayForFlow(ctx, tx, flow); err != nil {
+			return err
+		} else if ok {
+			statusLine = "Last played at: " + humanTimeLabel(lastPlayedAt)
 		}
 		return nil
 	})
@@ -289,7 +295,7 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 	}
 
 	version := flow.Version
-	messageID, err := h.discord.SendHITLPrompt(ctx, channelID, job.ItemID, version, flow.DisplayName, flow.ImageURL)
+	messageID, err := h.discord.SendHITLPrompt(ctx, channelID, job.ItemID, version, flow.DisplayName, flow.ImageURL, statusLine)
 	if err != nil {
 		return err
 	}
@@ -663,4 +669,11 @@ func (h *ExecuteDeleteHandler) loadFlowForDelete(ctx context.Context, itemID str
 		return domain.Flow{}, 0, false, err
 	}
 	return out, expected, ok, nil
+}
+
+func humanTimeLabel(t time.Time) string {
+	if t.IsZero() {
+		return "unknown"
+	}
+	return t.UTC().Format("2006-01-02 15:04 UTC")
 }

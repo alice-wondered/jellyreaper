@@ -1264,7 +1264,7 @@ func TestPlaybackEventClosesOpenHITLAndReschedulesEvaluation(t *testing.T) {
 		if channelID != "ch-play" || messageID != "msg-play" {
 			t.Fatalf("unexpected finalize target: %s/%s", channelID, messageID)
 		}
-		if !strings.Contains(content, "Decision: KEEP for Playback Recovery Movie (auto via new playback).") {
+		if !strings.Contains(content, "Resolved: PLAYED at") || !strings.Contains(content, "for Playback Recovery Movie") {
 			t.Fatalf("unexpected finalize content: %s", content)
 		}
 		finalized = true

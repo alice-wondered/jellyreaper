@@ -680,7 +680,7 @@ func TestSendHITLPromptHandlerAppliesMinimumResponseWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("discord service: %v", err)
 	}
-	discordSvc.SetSendPromptHookForTest(func(context.Context, string, string, int64, string, string) (string, error) {
+	discordSvc.SetSendPromptHookForTest(func(context.Context, string, string, int64, string, string, string) (string, error) {
 		return "msg-min-window", nil
 	})
 
@@ -713,5 +713,45 @@ func TestSendHITLPromptHandlerAppliesMinimumResponseWindow(t *testing.T) {
 		if job.Kind == domain.JobKindExecuteDelete {
 			t.Fatalf("unexpected execute delete job before minimum window: %#v", job)
 		}
+	}
+}
+
+func TestSendHITLPromptHandlerIncludesLastPlayedStatusLine(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:    "flow:item-last-played",
+			ItemID:    "item-last-played",
+			State:     domain.FlowStatePendingReview,
+			Version:   0,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "item-last-played", LastPlayedAt: now.Add(-6 * time.Hour), UpdatedAt: now})
+	}); err != nil {
+		t.Fatalf("seed flow/media: %v", err)
+	}
+
+	pub, _, _ := ed25519.GenerateKey(nil)
+	discordSvc, err := discord.NewService("", pub)
+	if err != nil {
+		t.Fatalf("discord service: %v", err)
+	}
+	receivedStatus := ""
+	discordSvc.SetSendPromptHookForTest(func(_ context.Context, _ string, _ string, _ int64, _ string, _ string, status string) (string, error) {
+		receivedStatus = status
+		return "msg-status", nil
+	})
+
+	h := NewSendHITLPromptHandler(store, nil, discordSvc, "channel-1", 48*time.Hour)
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "prompt-last-played", ItemID: "item-last-played"}); err != nil {
+		t.Fatalf("handle prompt: %v", err)
+	}
+	if receivedStatus == "" {
+		t.Fatal("expected status line argument to be provided for prompt send")
 	}
 }
