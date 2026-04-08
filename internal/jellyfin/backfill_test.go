@@ -227,3 +227,39 @@ func TestBackfillFetchChangedItemsSinceEnrichesPlaybackAcrossUsers(t *testing.T)
 		t.Fatalf("expected cross-user play count 4, got %d", items[0].PlayCount)
 	}
 }
+
+func TestBackfillFetchChangedItemsSinceCachesUsersList(t *testing.T) {
+	itemID := uuid.New()
+	now := time.Now().UTC()
+	usersCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/Items":
+			res := gen.BaseItemDtoQueryResult{Items: &[]gen.BaseItemDto{{Id: &itemID, Name: strPtr("Sample Movie")}}}
+			_ = json.NewEncoder(w).Encode(res)
+		case "/Users":
+			usersCalls++
+			_, _ = w.Write([]byte(`[{"Id":"u1"}]`))
+		case "/Users/u1/Items":
+			_, _ = w.Write([]byte(`{"Items":[{"Id":"` + itemID.String() + `","UserData":{"LastPlayedDate":"` + now.Format(time.RFC3339Nano) + `","PlayCount":1}}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	b, err := NewBackfillService(server.URL, "token", server.Client())
+	if err != nil {
+		t.Fatalf("new backfill service: %v", err)
+	}
+
+	if _, err := b.FetchChangedItemsSince(context.Background(), time.Now().Add(-24*time.Hour), 100); err != nil {
+		t.Fatalf("first fetch changed items: %v", err)
+	}
+	if _, err := b.FetchChangedItemsSince(context.Background(), time.Now().Add(-24*time.Hour), 100); err != nil {
+		t.Fatalf("second fetch changed items: %v", err)
+	}
+	if usersCalls != 1 {
+		t.Fatalf("expected /Users to be fetched once from cache, got %d", usersCalls)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -22,12 +23,17 @@ type BackfillClient interface {
 }
 
 type BackfillService struct {
-	client       BackfillClient
-	baseURL      string
-	apiKey       string
-	httpClient   *http.Client
-	progressHook func(FetchProgress)
+	client        BackfillClient
+	baseURL       string
+	apiKey        string
+	httpClient    *http.Client
+	progressHook  func(FetchProgress)
+	usersMu       sync.Mutex
+	cachedUsers   []userSummary
+	usersCachedAt time.Time
 }
+
+const usersCacheTTL = 30 * time.Minute
 
 type FetchProgress struct {
 	Stream           string
@@ -350,7 +356,7 @@ func (s *BackfillService) enrichItemsWithAllUsersPlayback(ctx context.Context, i
 		return items, nil
 	}
 
-	users, err := s.fetchUsers(ctx)
+	users, err := s.fetchUsersCached(ctx)
 	if err != nil || len(users) == 0 {
 		return items, err
 	}
@@ -402,6 +408,28 @@ func (s *BackfillService) enrichItemsWithAllUsersPlayback(ctx context.Context, i
 		}
 	}
 	return items, nil
+}
+
+func (s *BackfillService) fetchUsersCached(ctx context.Context) ([]userSummary, error) {
+	s.usersMu.Lock()
+	if len(s.cachedUsers) > 0 && time.Since(s.usersCachedAt) < usersCacheTTL {
+		out := append([]userSummary(nil), s.cachedUsers...)
+		s.usersMu.Unlock()
+		return out, nil
+	}
+	s.usersMu.Unlock()
+
+	users, err := s.fetchUsers(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	s.usersMu.Lock()
+	s.cachedUsers = append(s.cachedUsers[:0], users...)
+	s.usersCachedAt = time.Now().UTC()
+	out := append([]userSummary(nil), s.cachedUsers...)
+	s.usersMu.Unlock()
+	return out, nil
 }
 
 func (s *BackfillService) fetchUsers(ctx context.Context) ([]userSummary, error) {
