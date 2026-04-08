@@ -753,7 +753,7 @@ func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action str
 		if display == "" {
 			display = "item"
 		}
-		content := fmt.Sprintf("Decision: %s for %s (AI).", strings.ToUpper(action), display)
+		content := fmt.Sprintf("Resolved: %s for %s (AI).", interactionDecisionLabel(action), display)
 		if err := s.discord.FinalizeHITLPrompt(ctx, finalizeChannelID, finalizeMessageID, content); err != nil {
 			s.logger.Warn("failed to finalize ai decision HITL message", "item_id", itemID, "error", err)
 		}
@@ -848,7 +848,7 @@ func (s *Service) ApplyAIDelayDays(ctx context.Context, itemID string, days int)
 		if display == "" {
 			display = "item"
 		}
-		content := fmt.Sprintf("Decision: DELAY %d days for %s (AI).", days, display)
+		content := fmt.Sprintf("Resolved: DELAYED %d days for %s (AI).", days, display)
 		if err := s.discord.FinalizeHITLPrompt(ctx, finalizeChannelID, finalizeMessageID, content); err != nil {
 			s.logger.Warn("failed to finalize ai delay HITL message", "item_id", itemID, "error", err)
 		}

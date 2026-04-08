@@ -454,7 +454,7 @@ func (h *HITLTimeoutHandler) Handle(ctx context.Context, job domain.JobRecord) e
 		if name == "" {
 			name = strings.TrimSpace(job.ItemID)
 		}
-		content := fmt.Sprintf("Decision: DELETE for %s (timeout).", name)
+		content := fmt.Sprintf("Resolved: DELETE REQUESTED for %s (timeout).", name)
 		if err := h.discord.FinalizeHITLPrompt(ctx, finalizeChannelID, finalizeMessageID, content); err != nil {
 			h.logger.Warn("failed to finalize timeout HITL message", "item_id", job.ItemID, "error", err)
 		}

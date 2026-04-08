@@ -196,7 +196,7 @@ func TestApplyAIDecisionFinalizesOpenHITLPrompt(t *testing.T) {
 		if channelID != "chan-1" || messageID != "msg-1" {
 			t.Fatalf("unexpected finalize target: %s/%s", channelID, messageID)
 		}
-		if !strings.Contains(content, "Decision: ARCHIVE for AI Archive Target (AI).") {
+		if !strings.Contains(content, "Resolved: ARCHIVED for AI Archive Target (AI).") {
 			t.Fatalf("unexpected finalize content: %s", content)
 		}
 		finalized = true
@@ -360,7 +360,7 @@ func TestApplyAIDelayDaysDefersLazilyAndFinalizesHITLPrompt(t *testing.T) {
 		if channelID != "ch-delay" || messageID != "msg-delay" {
 			t.Fatalf("unexpected finalize target: %s/%s", channelID, messageID)
 		}
-		if !strings.Contains(content, "Decision: DELAY 7 days for Season Delay Prompt (AI).") {
+		if !strings.Contains(content, "Resolved: DELAYED 7 days for Season Delay Prompt (AI).") {
 			t.Fatalf("unexpected finalize content: %s", content)
 		}
 		finalized = true
