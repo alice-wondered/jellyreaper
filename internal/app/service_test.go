@@ -1250,6 +1250,93 @@ func TestPlaybackStaleEventDoesNotIncrementPlayCount(t *testing.T) {
 	}
 }
 
+func TestPlaybackEventClosesOpenHITLAndReschedulesEvaluation(t *testing.T) {
+	store := newTestStore(t)
+	discordSvc, err := discord.NewService("", nil)
+	if err != nil {
+		t.Fatalf("new discord service: %v", err)
+	}
+
+	svc := NewService(store, nil, nil)
+	svc.SetDiscordService(discordSvc)
+	now := time.Date(2026, 4, 12, 9, 30, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID:       "movie-hitl-play",
+			Name:         "Playback Recovery Movie",
+			Title:        "Playback Recovery Movie",
+			ItemType:     "Movie",
+			LastPlayedAt: now.Add(-48 * time.Hour),
+			UpdatedAt:    now,
+		}); err != nil {
+			return err
+		}
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:             "flow:target:movie:movie-hitl-play",
+			ItemID:             "target:movie:movie-hitl-play",
+			SubjectType:        "movie",
+			DisplayName:        "Playback Recovery Movie",
+			State:              domain.FlowStatePendingReview,
+			Version:            0,
+			PolicySnapshot:     domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 48, TimeoutAction: "delete"},
+			Discord:            domain.DiscordContext{ChannelID: "ch-play", MessageID: "msg-play"},
+			DecisionDeadlineAt: now.Add(6 * time.Hour),
+			NextActionAt:       now.Add(6 * time.Hour),
+			CreatedAt:          now.Add(-7 * 24 * time.Hour),
+			UpdatedAt:          now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed hitl flow/media: %v", err)
+	}
+
+	finalized := false
+	discordSvc.SetEditPromptHookForTest(func(ctx context.Context, channelID, messageID, content string) error {
+		if channelID != "ch-play" || messageID != "msg-play" {
+			t.Fatalf("unexpected finalize target: %s/%s", channelID, messageID)
+		}
+		if !strings.Contains(content, "Decision: KEEP for Playback Recovery Movie (auto via new playback).") {
+			t.Fatalf("unexpected finalize content: %s", content)
+		}
+		finalized = true
+		return nil
+	})
+
+	err = svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:           "movie-hitl-play",
+			ItemType:         "Movie",
+			Name:             "alice is playing Playback Recovery Movie",
+			NotificationType: "PlaybackStart",
+			EventID:          "evt-hitl-play",
+		},
+		Raw:        map[string]any{"EventId": "evt-hitl-play"},
+		ItemID:     "movie-hitl-play",
+		EventID:    "evt-hitl-play",
+		EventType:  "PlaybackStart",
+		DedupeKey:  "jellyfin:evt-hitl-play",
+		OccurredAt: now,
+	})
+	if err != nil {
+		t.Fatalf("handle playback webhook: %v", err)
+	}
+	if !finalized {
+		t.Fatal("expected open HITL prompt finalized after playback")
+	}
+
+	flow := mustGetFlow(t, store, "target:movie:movie-hitl-play")
+	if flow.State != domain.FlowStateActive {
+		t.Fatalf("expected flow active after playback recovery, got %s", flow.State)
+	}
+	if !flow.DecisionDeadlineAt.IsZero() {
+		t.Fatalf("expected decision deadline cleared, got %s", flow.DecisionDeadlineAt)
+	}
+	if flow.NextActionAt.Before(now.Add(29 * 24 * time.Hour)) {
+		t.Fatalf("expected next action deferred based on playback, got %s", flow.NextActionAt)
+	}
+}
+
 func TestCatalogEventUsesPayloadTimestampNotServiceClock(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)

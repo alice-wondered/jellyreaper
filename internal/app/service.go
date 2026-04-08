@@ -41,6 +41,12 @@ type targetRef struct {
 	Canonical string
 }
 
+type hitlFinalizeRequest struct {
+	channelID string
+	messageID string
+	content   string
+}
+
 type Service struct {
 	repository            repo.Repository
 	logger                *slog.Logger
@@ -145,9 +151,17 @@ func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.Webh
 	if sourceNow, ok := sourceTimestampForJellyfinEvent(event); ok {
 		now = sourceNow
 	}
-	itemID, targets, err := s.applyJellyfinWebhookTx(ctx, event, now)
+	itemID, targets, finalizations, err := s.applyJellyfinWebhookTx(ctx, event, now)
 	if err != nil {
 		return err
+	}
+
+	if s.discord != nil {
+		for _, f := range finalizations {
+			if err := s.discord.FinalizeHITLPrompt(ctx, f.channelID, f.messageID, f.content); err != nil {
+				s.logger.Warn("failed to finalize playback-recovered HITL message", "item_id", itemID, "error", err)
+			}
+		}
 	}
 
 	primaryTarget := ""
@@ -172,7 +186,7 @@ func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.Webh
 	return nil
 }
 
-func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.WebhookEvent, now time.Time) (string, []targetRef, error) {
+func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.WebhookEvent, now time.Time) (string, []targetRef, []hitlFinalizeRequest, error) {
 	eventAt, _ := sourceTimestampForJellyfinEvent(event)
 	playbackEvent := isPlaybackEvent(event.EventType)
 	catalogIndexEvent := isCatalogIndexEvent(event.EventType)
@@ -180,17 +194,18 @@ func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.Web
 	dedupeKey := event.DedupeKey
 	itemID := event.ItemID
 	targets := deriveTargets(event)
+	finalizations := make([]hitlFinalizeRequest, 0)
 
 	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
-		return s.applyJellyfinWebhookInTx(ctx, tx, event, now, eventAt, playbackEvent, catalogIndexEvent, removalEvent, dedupeKey, itemID, targets)
+		return s.applyJellyfinWebhookInTx(ctx, tx, event, now, eventAt, playbackEvent, catalogIndexEvent, removalEvent, dedupeKey, itemID, targets, &finalizations)
 	})
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
-	return itemID, targets, nil
+	return itemID, targets, finalizations, nil
 }
 
-func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxRepository, event jellyfin.WebhookEvent, now, eventAt time.Time, playbackEvent, catalogIndexEvent, removalEvent bool, dedupeKey, itemID string, targets []targetRef) error {
+func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxRepository, event jellyfin.WebhookEvent, now, eventAt time.Time, playbackEvent, catalogIndexEvent, removalEvent bool, dedupeKey, itemID string, targets []targetRef, finalizations *[]hitlFinalizeRequest) error {
 	defaultReviewDays, _, err := s.currentDefaultsFromMeta(ctx, tx)
 	if err != nil {
 		return err
@@ -418,6 +433,48 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		}
 
 		if !catalogIndexEvent && !playbackEvent {
+			continue
+		}
+
+		if playbackEvent && flow.State == domain.FlowStatePendingReview {
+			runAt := now
+			if playAt, known, err := mostRecentPlayForTarget(ctx, tx, flow); err != nil {
+				return err
+			} else if known {
+				expireDays := flow.PolicySnapshot.ExpireAfterDays
+				if expireDays <= 0 {
+					expireDays = defaultExpireDays
+				}
+				dueAt := playAt.Add(time.Duration(expireDays) * 24 * time.Hour)
+				if dueAt.After(runAt) {
+					runAt = dueAt
+				}
+			}
+
+			expected := flow.Version
+			flow.State = domain.FlowStateActive
+			flow.HITLOutcome = "keep"
+			flow.DecisionDeadlineAt = time.Time{}
+			flow.NextActionAt = runAt
+			flow.UpdatedAt = now
+			flow.Version = expected + 1
+			if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+				return err
+			}
+			if err := upsertEvaluatePolicyJob(ctx, tx, flow, now, runAt, "jellyfin_playback_recovered", dedupeKey+":eval"); err != nil {
+				return err
+			}
+			if finalizations != nil && strings.TrimSpace(flow.Discord.ChannelID) != "" && strings.TrimSpace(flow.Discord.MessageID) != "" {
+				display := strings.TrimSpace(flow.DisplayName)
+				if display == "" {
+					display = target.Canonical
+				}
+				*finalizations = append(*finalizations, hitlFinalizeRequest{
+					channelID: flow.Discord.ChannelID,
+					messageID: flow.Discord.MessageID,
+					content:   fmt.Sprintf("Decision: KEEP for %s (auto via new playback).", display),
+				})
+			}
 			continue
 		}
 
@@ -930,6 +987,7 @@ func (s *Service) processWebhookBatches(ctx context.Context, ops <-chan backfill
 					event.DedupeKey,
 					event.ItemID,
 					deriveTargets(event),
+					nil,
 				); err != nil {
 					return err
 				}
