@@ -1,6 +1,7 @@
 package discord
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -23,11 +25,16 @@ type Service struct {
 	publicKey ed25519.PublicKey
 	session   *discordgo.Session
 	sendHook  func(context.Context, string, string, int64, string, string) (string, error)
-	embedDir  string
+
+	httpClient      *http.Client
+	imagePersistDir string
+	jellyfinBaseURL string
+	jellyfinAPIKey  string
 }
 
 func NewService(botToken string, publicKey ed25519.PublicKey) (*Service, error) {
 	service := &Service{publicKey: publicKey}
+	service.httpClient = &http.Client{Timeout: 15 * time.Second}
 	if botToken == "" {
 		return service, nil
 	}
@@ -95,9 +102,14 @@ func (s *Service) SendHITLPrompt(ctx context.Context, channelID, itemID string, 
 			}},
 		},
 	}
-	if imageURL != "" {
-		s.persistEmbed(ctx, imageURL)
-		send.Embeds = []*discordgo.MessageEmbed{{Image: &discordgo.MessageEmbedImage{URL: imageURL}}}
+
+	if file, err := s.prepareEmbedFile(ctx, itemID, imageURL); err == nil && file != nil {
+		send.Files = []*discordgo.File{file}
+		send.Embeds = []*discordgo.MessageEmbed{{Image: &discordgo.MessageEmbedImage{URL: "attachment://" + file.Name}}}
+	} else if strings.TrimSpace(imageURL) != "" {
+		send.Embeds = []*discordgo.MessageEmbed{{
+			Image: &discordgo.MessageEmbedImage{URL: imageURL},
+		}}
 	}
 
 	msg, err := s.session.ChannelMessageSendComplex(channelID, send)
@@ -109,6 +121,15 @@ func (s *Service) SendHITLPrompt(ctx context.Context, channelID, itemID string, 
 
 func (s *Service) SetSendPromptHookForTest(hook func(context.Context, string, string, int64, string, string) (string, error)) {
 	s.sendHook = hook
+}
+
+func (s *Service) SetEmbedPersistenceDir(dir string) {
+	s.imagePersistDir = strings.TrimSpace(dir)
+}
+
+func (s *Service) SetJellyfinImageSource(baseURL string, apiKey string) {
+	s.jellyfinBaseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	s.jellyfinAPIKey = strings.TrimSpace(apiKey)
 }
 
 func (s *Service) SendSystemMessage(channelID, content string) error {
@@ -125,37 +146,87 @@ func (s *Service) SendSystemMessage(channelID, content string) error {
 	return nil
 }
 
-func (s *Service) SetEmbedPersistenceDir(dir string) {
-	s.embedDir = strings.TrimSpace(dir)
+func customID(action, itemID string, version int64) string {
+	return "jr:v1:" + action + ":" + itemID + ":" + strconv.FormatInt(version, 10)
 }
 
-func (s *Service) persistEmbed(ctx context.Context, imageURL string) {
-	if s.embedDir == "" || imageURL == "" {
-		return
+func (s *Service) prepareEmbedFile(ctx context.Context, itemID string, imageURL string) (*discordgo.File, error) {
+	resolved := s.resolveImageURL(itemID, imageURL)
+	if resolved == "" {
+		return nil, fmt.Errorf("no image URL available")
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
+
+	data, ext, err := s.fetchImage(ctx, resolved)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, fmt.Errorf("empty image payload")
+	}
+
+	name := "cover" + ext
+	if err := s.persistImage(resolved, data, ext); err != nil {
+		// best effort only
+	}
+
+	return &discordgo.File{
+		Name:        name,
+		ContentType: http.DetectContentType(data),
+		Reader:      bytes.NewReader(data),
+	}, nil
+}
+
+func (s *Service) resolveImageURL(itemID string, imageURL string) string {
+	if strings.TrimSpace(imageURL) != "" {
+		return strings.TrimSpace(imageURL)
+	}
+	if s.jellyfinBaseURL == "" || itemID == "" || strings.Contains(itemID, ":") {
+		return ""
+	}
+	return s.jellyfinBaseURL + "/Items/" + url.PathEscape(itemID) + "/Images/Primary"
+}
+
+func (s *Service) fetchImage(ctx context.Context, imageURL string) ([]byte, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, imageURL, nil)
 	if err != nil {
-		return
+		return nil, "", err
 	}
-	resp, err := client.Do(req)
+	if s.jellyfinAPIKey != "" {
+		req.Header.Set("X-Emby-Token", s.jellyfinAPIKey)
+	}
+	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return
+		return nil, "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return
+		return nil, "", fmt.Errorf("image fetch status %d", resp.StatusCode)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if err != nil || len(data) == 0 {
-		return
+	if err != nil {
+		return nil, "", err
 	}
-	_ = os.MkdirAll(s.embedDir, 0o755)
-	sum := sha256.Sum256([]byte(imageURL))
-	name := hex.EncodeToString(sum[:8]) + ".img"
-	_ = os.WriteFile(filepath.Join(s.embedDir, name), data, 0o644)
+	ctype := strings.ToLower(resp.Header.Get("Content-Type"))
+	ext := ".img"
+	switch {
+	case strings.Contains(ctype, "jpeg") || strings.Contains(ctype, "jpg"):
+		ext = ".jpg"
+	case strings.Contains(ctype, "png"):
+		ext = ".png"
+	case strings.Contains(ctype, "webp"):
+		ext = ".webp"
+	}
+	return data, ext, nil
 }
 
-func customID(action, itemID string, version int64) string {
-	return "jr:v1:" + action + ":" + itemID + ":" + strconv.FormatInt(version, 10)
+func (s *Service) persistImage(imageURL string, data []byte, ext string) error {
+	if s.imagePersistDir == "" {
+		return nil
+	}
+	if err := os.MkdirAll(s.imagePersistDir, 0o755); err != nil {
+		return err
+	}
+	sum := sha256.Sum256([]byte(imageURL))
+	name := hex.EncodeToString(sum[:8]) + ext
+	return os.WriteFile(filepath.Join(s.imagePersistDir, name), data, 0o644)
 }

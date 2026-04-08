@@ -477,11 +477,17 @@ func deriveTargets(event jellyfin.WebhookEvent) []targetRef {
 	typeLower := strings.ToLower(strings.TrimSpace(p.ItemType))
 	switch typeLower {
 	case "episode":
-		out = push(out, targetRef{Type: "season", ID: p.SeasonID, Name: chooseName(p.SeasonName, p.Name), ImageURL: p.PrimaryImageURL})
-		out = push(out, targetRef{Type: "series", ID: p.SeriesID, Name: chooseName(p.SeriesName, p.SeasonName), ImageURL: p.PrimaryImageURL})
+		seasonLabel := formatSeasonLabel(p.SeasonName, p.SeriesName, p.Name)
+		out = push(out, targetRef{Type: "season", ID: p.SeasonID, Name: seasonLabel, ImageURL: p.PrimaryImageURL})
+		if p.SeasonID == "" {
+			out = push(out, targetRef{Type: "series", ID: p.SeriesID, Name: chooseName(p.SeriesName, p.SeasonName), ImageURL: p.PrimaryImageURL})
+		}
 	case "season":
-		out = push(out, targetRef{Type: "season", ID: p.ItemID, Name: chooseName(p.Name, p.SeasonName), ImageURL: p.PrimaryImageURL})
-		out = push(out, targetRef{Type: "series", ID: p.SeriesID, Name: chooseName(p.SeriesName, p.Name), ImageURL: p.PrimaryImageURL})
+		seasonLabel := formatSeasonLabel(chooseName(p.Name, p.SeasonName), p.SeriesName, p.Name)
+		out = push(out, targetRef{Type: "season", ID: p.ItemID, Name: seasonLabel, ImageURL: p.PrimaryImageURL})
+		if p.ItemID == "" {
+			out = push(out, targetRef{Type: "series", ID: p.SeriesID, Name: chooseName(p.SeriesName, p.Name), ImageURL: p.PrimaryImageURL})
+		}
 	case "series":
 		out = push(out, targetRef{Type: "series", ID: p.ItemID, Name: chooseName(p.Name, p.SeriesName), ImageURL: p.PrimaryImageURL})
 	case "movie":
@@ -514,6 +520,15 @@ func chooseName(values ...string) string {
 		}
 	}
 	return "Unknown"
+}
+
+func formatSeasonLabel(seasonName string, seriesName string, fallback string) string {
+	season := strings.TrimSpace(seasonName)
+	series := strings.TrimSpace(seriesName)
+	if season != "" && series != "" {
+		return season + " of " + series
+	}
+	return chooseName(seasonName, seriesName, fallback)
 }
 
 func shortHash(value string) string {
