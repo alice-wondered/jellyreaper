@@ -20,8 +20,18 @@ type BackfillClient interface {
 }
 
 type BackfillService struct {
-	client  BackfillClient
-	baseURL string
+	client       BackfillClient
+	baseURL      string
+	progressHook func(FetchProgress)
+}
+
+type FetchProgress struct {
+	Stream           string
+	Page             int
+	Fetched          int
+	PageItems        int
+	TotalRecordCount int
+	Since            time.Time
 }
 
 type PlaybackEvent struct {
@@ -78,6 +88,10 @@ func NewBackfillServiceWithClient(client BackfillClient) *BackfillService {
 	return &BackfillService{client: client}
 }
 
+func (s *BackfillService) SetProgressHook(hook func(FetchProgress)) {
+	s.progressHook = hook
+}
+
 func (s *BackfillService) FetchPlaybackEventsSince(ctx context.Context, since time.Time, limit int32) ([]PlaybackEvent, error) {
 	pageSize := limit
 	if pageSize <= 0 {
@@ -86,6 +100,7 @@ func (s *BackfillService) FetchPlaybackEventsSince(ctx context.Context, since ti
 
 	out := make([]PlaybackEvent, 0, pageSize)
 	startIndex := int32(0)
+	page := 0
 
 	for {
 		params := &gen.GetLogEntriesParams{StartIndex: &startIndex, Limit: &pageSize}
@@ -119,6 +134,7 @@ func (s *BackfillService) FetchPlaybackEventsSince(ctx context.Context, since ti
 		if body == nil || body.Items == nil || len(*body.Items) == 0 {
 			break
 		}
+		page++
 
 		for _, entry := range *body.Items {
 			t := safeString(entry.Type)
@@ -133,6 +149,14 @@ func (s *BackfillService) FetchPlaybackEventsSince(ctx context.Context, since ti
 				Date:   safeTime(entry.Date),
 			})
 		}
+		s.emitProgress(FetchProgress{
+			Stream:           "playback",
+			Page:             page,
+			Fetched:          len(out),
+			PageItems:        len(*body.Items),
+			TotalRecordCount: safeTotalCount(body.TotalRecordCount),
+			Since:            since,
+		})
 
 		if int32(len(*body.Items)) < pageSize {
 			break
@@ -155,6 +179,7 @@ func (s *BackfillService) FetchChangedItemsSince(ctx context.Context, since time
 
 	out := make([]ItemSnapshot, 0, pageSize)
 	startIndex := int32(0)
+	page := 0
 
 	for {
 		params := &gen.GetItemsParams{
@@ -195,6 +220,7 @@ func (s *BackfillService) FetchChangedItemsSince(ctx context.Context, since time
 		if body == nil || body.Items == nil || len(*body.Items) == 0 {
 			break
 		}
+		page++
 
 		for _, item := range *body.Items {
 			itemID := uuidString(item.Id)
@@ -215,6 +241,14 @@ func (s *BackfillService) FetchChangedItemsSince(ctx context.Context, since time
 				DateLastMediaAdded: safeTime(item.DateLastMediaAdded),
 			})
 		}
+		s.emitProgress(FetchProgress{
+			Stream:           "items",
+			Page:             page,
+			Fetched:          len(out),
+			PageItems:        len(*body.Items),
+			TotalRecordCount: safeTotalCount(body.TotalRecordCount),
+			Since:            since,
+		})
 
 		if int32(len(*body.Items)) < pageSize {
 			break
@@ -223,6 +257,22 @@ func (s *BackfillService) FetchChangedItemsSince(ctx context.Context, since time
 	}
 
 	return out, nil
+}
+
+func (s *BackfillService) emitProgress(progress FetchProgress) {
+	if s.progressHook != nil {
+		s.progressHook(progress)
+	}
+}
+
+func safeTotalCount(value *int32) int {
+	if value == nil {
+		return 0
+	}
+	if *value < 0 {
+		return 0
+	}
+	return int(*value)
 }
 
 func buildPrimaryImageURL(baseURL string, itemID string, imageTags *map[string]string) string {

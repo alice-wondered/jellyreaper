@@ -157,6 +157,21 @@ func main() {
 			if err != nil {
 				logger.Error("create backfill service", "error", err)
 			} else {
+				backfillSvc.SetProgressHook(func(progress jellyfin.FetchProgress) {
+					remaining := 0
+					if progress.TotalRecordCount > 0 && progress.TotalRecordCount > progress.Fetched {
+						remaining = progress.TotalRecordCount - progress.Fetched
+					}
+					logger.Info("backfill fetch progress",
+						"stream", progress.Stream,
+						"page", progress.Page,
+						"page_items", progress.PageItems,
+						"fetched", progress.Fetched,
+						"total", progress.TotalRecordCount,
+						"remaining", remaining,
+						"since", progress.Since,
+					)
+				})
 				go runBackfillLoop(ctx, logger, store, appService, discordService, cfg, backfillSvc)
 			}
 		}
@@ -236,18 +251,23 @@ func runBackfillOnce(ctx context.Context, logger *slog.Logger, repository repo.R
 	}
 
 	startedAt := time.Now().UTC()
+	logger.Info("backfill fetch started", "since", since, "page_limit", cfg.BackfillLimit)
 	plays, err := fetchPlaybackWithRetry(ctx, backfillSvc, since, cfg.BackfillLimit)
 	if err != nil {
 		return fmt.Errorf("backfill playback fetch failed (since=%s): %w", since.Format(time.RFC3339), err)
 	}
+	logger.Info("backfill playback fetch complete", "fetched", len(plays), "since", since)
 	items, err := fetchChangedItemsWithRetry(ctx, backfillSvc, since, cfg.BackfillLimit)
 	if err != nil {
 		return fmt.Errorf("backfill item fetch failed (since=%s): %w", since.Format(time.RFC3339), err)
 	}
+	logger.Info("backfill item fetch complete", "fetched", len(items), "since", since)
 
+	logger.Info("backfill ingest started", "items", len(items), "plays", len(plays))
 	if err := ingestBackfillBatch(ctx, appService.IngestBackfillItems, appService.IngestBackfillPlayback, items, plays); err != nil {
 		return err
 	}
+	logger.Info("backfill ingest complete", "items", len(items), "plays", len(plays))
 
 	completedAt := time.Now().UTC()
 	checkpoint := computeBackfillCheckpoint(startedAt, plays, items)
