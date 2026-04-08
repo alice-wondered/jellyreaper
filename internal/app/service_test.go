@@ -487,6 +487,45 @@ func TestSetGlobalPolicyDefaultsUpdateMetaOnly(t *testing.T) {
 	}
 }
 
+func TestGlobalDeferDaysAppliesLazilyOnNextDelayAction(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 7, 17, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	if err := svc.SetGlobalDeferDays(context.Background(), 15); err != nil {
+		t.Fatalf("set global defer days: %v", err)
+	}
+
+	targetID := "target:season:season-lazy-defer"
+	_, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction("delay", targetID, 0, snowflakeIDFor(now)))
+	if err != nil {
+		t.Fatalf("handle delay interaction: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, targetID)
+	if want := now.Add(15 * 24 * time.Hour); !flow.NextActionAt.Equal(want) {
+		t.Fatalf("expected delay to use global defer days, got=%s want=%s", flow.NextActionAt, want)
+	}
+
+	jobs, err := store.LeaseDueJobs(context.Background(), now.Add(16*24*time.Hour), 10, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease jobs: %v", err)
+	}
+	found := false
+	for _, job := range jobs {
+		if job.ItemID == targetID && job.Kind == domain.JobKindEvaluatePolicy {
+			if !job.RunAt.Equal(now.Add(15 * 24 * time.Hour)) {
+				t.Fatalf("expected evaluate job runAt to match global defer, got %s", job.RunAt)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected evaluate job after delay interaction")
+	}
+}
+
 func TestHITLDelaySchedulesFutureEvaluation(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)
