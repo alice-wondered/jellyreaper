@@ -18,11 +18,12 @@ const (
 	defaultLeaseTTL = 30 * time.Second
 	fallbackWorker  = "jellyreaper-1"
 
-	defaultBackfillEnabled  = true
-	defaultBackfillInterval = 15 * time.Minute
-	defaultBackfillLookback = 24 * time.Hour
-	defaultBackfillOverlap  = 2 * time.Minute
-	defaultBackfillLimit    = 500
+	defaultBackfillEnabled   = true
+	defaultBackfillInterval  = 15 * time.Minute
+	defaultBackfillLookback  = 24 * time.Hour
+	defaultBackfillOverlap   = 2 * time.Minute
+	defaultBackfillLimit     = 500
+	defaultBackfillFullSweep = true
 )
 
 type Config struct {
@@ -42,11 +43,12 @@ type Config struct {
 	JellyfinPort   string
 	JellyfinAPIKey string
 
-	BackfillEnabled  bool
-	BackfillInterval time.Duration
-	BackfillLookback time.Duration
-	BackfillOverlap  time.Duration
-	BackfillLimit    int32
+	BackfillEnabled            bool
+	BackfillInterval           time.Duration
+	BackfillLookback           time.Duration
+	BackfillOverlap            time.Duration
+	BackfillLimit              int32
+	BackfillFullSweepOnStartup bool
 }
 
 func LoadFromEnv() (Config, error) {
@@ -106,6 +108,15 @@ func LoadFromEnv() (Config, error) {
 		backfillEnabled = parsed
 	}
 
+	backfillFullSweep := defaultBackfillFullSweep
+	if raw := strings.TrimSpace(os.Getenv("BACKFILL_FULL_SWEEP_ON_STARTUP")); raw != "" {
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse BACKFILL_FULL_SWEEP_ON_STARTUP: %w", err)
+		}
+		backfillFullSweep = parsed
+	}
+
 	cfg := Config{
 		HTTPAddr: httpAddr,
 		HTTPPort: httpPort,
@@ -121,11 +132,12 @@ func LoadFromEnv() (Config, error) {
 		JellyfinPort:     jellyfinPort,
 		JellyfinAPIKey:   os.Getenv("JELLYFIN_API_KEY"),
 
-		BackfillEnabled:  backfillEnabled,
-		BackfillInterval: backfillInterval,
-		BackfillLookback: backfillLookback,
-		BackfillOverlap:  backfillOverlap,
-		BackfillLimit:    backfillLimit,
+		BackfillEnabled:            backfillEnabled,
+		BackfillInterval:           backfillInterval,
+		BackfillLookback:           backfillLookback,
+		BackfillOverlap:            backfillOverlap,
+		BackfillLimit:              backfillLimit,
+		BackfillFullSweepOnStartup: backfillFullSweep,
 	}
 
 	if raw := os.Getenv("DISCORD_PUBLIC_KEY_HEX"); raw != "" {

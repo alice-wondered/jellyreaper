@@ -210,7 +210,8 @@ func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.R
 		}
 
 		completedAt := time.Now().UTC()
-		if err := saveBackfillCheckpoint(ctx, repository, completedAt); err != nil {
+		checkpoint := computeBackfillCheckpoint(startedAt, plays, items)
+		if err := saveBackfillCheckpoint(ctx, repository, checkpoint); err != nil {
 			logger.Error("save backfill checkpoint failed", "error", err)
 		}
 
@@ -252,6 +253,9 @@ func resolveBackfillStart(ctx context.Context, repository repo.Repository, cfg c
 		return time.Time{}, err
 	}
 	if !exists || raw == "" {
+		if cfg.BackfillFullSweepOnStartup {
+			return time.Time{}, nil
+		}
 		return now.Add(-cfg.BackfillLookback), nil
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, raw)
@@ -259,6 +263,27 @@ func resolveBackfillStart(ctx context.Context, repository repo.Repository, cfg c
 		return now.Add(-cfg.BackfillLookback), nil
 	}
 	return parsed.Add(-cfg.BackfillOverlap), nil
+}
+
+func computeBackfillCheckpoint(startedAt time.Time, plays []jellyfin.PlaybackEvent, items []jellyfin.ItemSnapshot) time.Time {
+	maxSeen := startedAt.UTC()
+	for _, play := range plays {
+		if play.Date.After(maxSeen) {
+			maxSeen = play.Date
+		}
+	}
+	for _, item := range items {
+		if item.LastPlayedAt.After(maxSeen) {
+			maxSeen = item.LastPlayedAt
+		}
+		if item.DateLastMediaAdded.After(maxSeen) {
+			maxSeen = item.DateLastMediaAdded
+		}
+		if item.DateCreated.After(maxSeen) {
+			maxSeen = item.DateCreated
+		}
+	}
+	return maxSeen.UTC()
 }
 
 func saveBackfillCheckpoint(ctx context.Context, repository repo.Repository, at time.Time) error {
