@@ -338,3 +338,83 @@ func TestSearchFlowsIndexUpdatesOnRenameAndDelete(t *testing.T) {
 		t.Fatalf("verify search after delete: %v", err)
 	}
 }
+
+func TestSearchFlowsIndexReflectsNewAdditions(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+		results, err := tx.SearchFlows(ctx, "severance", "series", 10)
+		if err != nil {
+			return err
+		}
+		if len(results) != 0 {
+			return fmt.Errorf("expected empty initial search, got %#v", results)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify initial empty search: %v", err)
+	}
+
+	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(ctx, domain.Flow{
+			FlowID:      "flow:target:series:severance",
+			ItemID:      "target:series:severance",
+			SubjectType: "series",
+			DisplayName: "Severance",
+			Version:     0,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("insert new flow: %v", err)
+	}
+
+	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+		results, err := tx.SearchFlows(ctx, "severance", "series", 10)
+		if err != nil {
+			return err
+		}
+		if len(results) != 1 || results[0].ItemID != "target:series:severance" {
+			return fmt.Errorf("expected newly added flow to be searchable, got %#v", results)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify search after insert: %v", err)
+	}
+}
+
+func TestSearchFlowsIndexDeletionKeepsRemainingMatches(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(ctx, domain.Flow{FlowID: "flow:target:series:star-trek", ItemID: "target:series:star-trek", SubjectType: "series", DisplayName: "Star Trek", Version: 0, CreatedAt: now, UpdatedAt: now}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertFlowCAS(ctx, domain.Flow{FlowID: "flow:target:series:star-gate", ItemID: "target:series:star-gate", SubjectType: "series", DisplayName: "Stargate SG-1", Version: 0, CreatedAt: now, UpdatedAt: now}, 0)
+	}); err != nil {
+		t.Fatalf("seed star flows: %v", err)
+	}
+
+	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+		return tx.DeleteFlow(ctx, "target:series:star-trek")
+	}); err != nil {
+		t.Fatalf("delete one star flow: %v", err)
+	}
+
+	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+		results, err := tx.SearchFlows(ctx, "star", "series", 10)
+		if err != nil {
+			return err
+		}
+		if len(results) != 1 || results[0].ItemID != "target:series:star-gate" {
+			return fmt.Errorf("expected remaining star match only, got %#v", results)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify search after partial delete: %v", err)
+	}
+}
