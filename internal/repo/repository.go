@@ -9,6 +9,7 @@ import (
 
 type TxRepository interface {
 	GetFlow(ctx context.Context, itemID string) (domain.Flow, bool, error)
+	ListFlows(ctx context.Context) ([]domain.Flow, error)
 	UpsertFlowCAS(ctx context.Context, flow domain.Flow, expectedVersion int64) error
 	DeleteFlow(ctx context.Context, itemID string) error
 

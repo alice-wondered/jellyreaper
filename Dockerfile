@@ -20,7 +20,8 @@ ENV HTTP_PORT=6767 \
     HTTP_ADDR=:6767 \
     DB_PATH=/data/jellyreaper.db \
     LOG_DIR=/logs \
-    EMBED_PERSIST_DIR=/embeds
+    EMBED_PERSIST_DIR=/embeds \
+    OPENAI_MODEL=gpt-4o-mini
 
 EXPOSE 6767
 USER appuser

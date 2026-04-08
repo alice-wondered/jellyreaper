@@ -35,6 +35,8 @@ JellyReaper is a Go service that listens to Jellyfin and Discord webhooks, persi
 | `DISCORD_PUBLIC_KEY_HEX` | yes | - | Discord app public key (hex) |
 | `DISCORD_BOT_TOKEN` | yes (for sending HITL prompts) | - | bot token |
 | `DISCORD_CHANNEL_ID` | yes (for prompt fallback) | - | default channel for HITL messages |
+| `OPENAI_API_KEY` | no | - | enables @mention AI assistant in Discord |
+| `OPENAI_MODEL` | no | `gpt-4o-mini` | model for mention assistant intent/tool routing |
 | `JELLYFIN_URL` | no | derived from host/port | Jellyfin base URL |
 | `JELLYFIN_HOST` | no | `localhost` | Jellyfin host when `JELLYFIN_URL` is unset |
 | `JELLYFIN_PORT` | no | `8096` | Jellyfin port |
@@ -76,6 +78,8 @@ docker network create media_shared || true
 docker compose -f docker-compose.example.yml up -d
 ```
 
+If you want the Discord @mention assistant, set `OPENAI_API_KEY` in `.env`.
+
 Mounted persistence paths in compose:
 - `./data` -> `/data`
 - `./logs` -> `/logs`
@@ -104,6 +108,14 @@ go generate ./api
 - Backfill is paginated and performs a full sweep from the checkpoint boundary (not just the first page).
 - First startup defaults to a full historical sweep; later runs sweep from the saved checkpoint with overlap.
 - Backfill reuses the same typed orchestration path as webhooks to keep flow/job behavior consistent.
+
+### Discord Mention Assistant
+- Enabled when `OPENAI_API_KEY` is set.
+- Runs on Discord mention messages and responds in a thread (creates one when needed).
+- Uses tool-calling with `auto` tool choice so the model can decide whether to call tools or respond directly.
+- Receives serialized thread context each turn (selected target, pending action, candidate targets, known aliases).
+- Context memory is in-process and LRU-capped by thread to avoid unbounded growth; cache misses can restore recent thread messages from Discord.
+- Responses are designed to stay user-facing (Discord markdown, human-readable wording, no internal IDs).
 
 ## Notes On Provider Payloads
 - Discord ingress is validated and decoded using `discordgo` payload semantics.
