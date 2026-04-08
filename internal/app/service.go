@@ -260,6 +260,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 	}
 
 	seasonChildIDs := make([]string, 0)
+	seasonEpisodeDelta := map[string]int{}
 	if removalEvent && strings.EqualFold(strings.TrimSpace(event.Payload.ItemType), "season") {
 		seasonID := strings.TrimSpace(event.Payload.SeasonID)
 		if seasonID == "" {
@@ -308,6 +309,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 			}
 		}
 
+		itemTypeLower := strings.ToLower(strings.TrimSpace(event.Payload.ItemType))
 		if catalogIndexEvent && catalogUpdateAllowed {
 			created := event.Payload.DateCreated.UTC()
 			if created.IsZero() {
@@ -349,6 +351,21 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 			if eventAt.After(media.LastCatalogEventAt) {
 				media.LastCatalogEventAt = eventAt
 			}
+			if itemTypeLower == "episode" {
+				oldSeasonID := strings.TrimSpace(existing.SeasonID)
+				newSeasonID := strings.TrimSpace(media.SeasonID)
+				switch {
+				case !found && newSeasonID != "":
+					seasonEpisodeDelta[newSeasonID]++
+				case found && oldSeasonID != newSeasonID:
+					if oldSeasonID != "" {
+						seasonEpisodeDelta[oldSeasonID]--
+					}
+					if newSeasonID != "" {
+						seasonEpisodeDelta[newSeasonID]++
+					}
+				}
+			}
 		}
 
 		if playbackEvent && playbackUpdateAllowed {
@@ -363,6 +380,14 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		if !removalEvent {
 			if err := tx.UpsertMedia(ctx, media); err != nil {
 				return err
+			}
+		} else if itemTypeLower == "episode" && found {
+			seasonID := strings.TrimSpace(existing.SeasonID)
+			if seasonID == "" {
+				seasonID = strings.TrimSpace(event.Payload.SeasonID)
+			}
+			if seasonID != "" {
+				seasonEpisodeDelta[seasonID]--
 			}
 		}
 	}
@@ -397,6 +422,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		}
 		catalogFlowUpdateAllowed := true
 		flowNeedsWrite := false
+		targetID := strings.TrimSpace(target.ID)
 		if !found {
 			if !catalogIndexEvent {
 				continue
@@ -416,6 +442,9 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 				},
 				LastCatalogEventAt: eventAt,
 				CreatedAt:          now,
+			}
+			if target.Type == "season" {
+				flow.EpisodeCount = 0
 			}
 			if err := tx.UpsertFlowCAS(ctx, flow, 0); err != nil {
 				return err
@@ -452,7 +481,29 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 			}
 		}
 
+		if target.Type == "season" {
+			if delta, ok := seasonEpisodeDelta[targetID]; ok && delta != 0 {
+				next := flow.EpisodeCount + delta
+				if next < 0 {
+					next = 0
+				}
+				if next != flow.EpisodeCount {
+					expected := flow.Version
+					flow.EpisodeCount = next
+					flow.UpdatedAt = now
+					flow.Version = expected + 1
+					if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+						return err
+					}
+				}
+				delete(seasonEpisodeDelta, targetID)
+			}
+		}
+
 		if removalEvent {
+			if !shouldRemoveTargetFlowForRemovalEvent(event, target, &flow, tx, ctx, now) {
+				continue
+			}
 			if err := tx.DeleteFlow(ctx, target.Canonical); err != nil {
 				return err
 			}
@@ -1359,6 +1410,30 @@ func deriveTargets(event jellyfin.WebhookEvent) []targetRef {
 	return out
 }
 
+func shouldRemoveTargetFlowForRemovalEvent(event jellyfin.WebhookEvent, target targetRef, flow *domain.Flow, tx repo.TxRepository, ctx context.Context, now time.Time) bool {
+	itemType := strings.ToLower(strings.TrimSpace(event.Payload.ItemType))
+	if itemType == "episode" && target.Type == "season" {
+		if flow != nil && flow.EpisodeCount > 0 {
+			return false
+		}
+		remaining, err := tx.ListMediaBySubject(ctx, "season", strings.TrimSpace(target.ID))
+		if err != nil {
+			return true
+		}
+		if flow != nil && len(remaining) > 0 && flow.EpisodeCount != len(remaining) {
+			expected := flow.Version
+			flow.EpisodeCount = len(remaining)
+			flow.UpdatedAt = now
+			flow.Version = expected + 1
+			if upsertErr := tx.UpsertFlowCAS(ctx, *flow, expected); upsertErr != nil {
+				return true
+			}
+		}
+		return len(remaining) == 0
+	}
+	return true
+}
+
 func mostRecentPlayForTarget(ctx context.Context, tx repo.TxRepository, flow domain.Flow) (time.Time, bool, error) {
 	parts := strings.SplitN(flow.ItemID, ":", 3)
 	if len(parts) == 3 && parts[0] == "target" {
@@ -1495,11 +1570,11 @@ func sourceTimestampForJellyfinEvent(event jellyfin.WebhookEvent) (time.Time, bo
 	if !event.OccurredAt.IsZero() {
 		return event.OccurredAt.UTC(), true
 	}
-	if ts := catalogEventTimestamp(event.Payload); !ts.IsZero() {
-		return ts.UTC(), true
-	}
 	if event.Payload.LastPlayedAt.After(time.Time{}) {
 		return event.Payload.LastPlayedAt.UTC(), true
+	}
+	if ts := catalogEventTimestamp(event.Payload); !ts.IsZero() {
+		return ts.UTC(), true
 	}
 	if ts := rawEventTimestamp(event.Raw); !ts.IsZero() {
 		return ts.UTC(), true

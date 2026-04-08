@@ -77,6 +77,7 @@ type Flow struct {
 	FlowID             string         `json:"flow_id"`
 	ItemID             string         `json:"item_id"`
 	SubjectType        string         `json:"subject_type"`
+	EpisodeCount       int            `json:"episode_count"`
 	DisplayName        string         `json:"display_name"`
 	ImageURL           string         `json:"image_url"`
 	State              FlowState      `json:"state"`

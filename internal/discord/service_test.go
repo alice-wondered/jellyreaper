@@ -24,6 +24,15 @@ func TestShouldRetryHITLPromptWithoutEmbed(t *testing.T) {
 	}
 }
 
+func TestFinalizeEmojiForOutcome(t *testing.T) {
+	if got := finalizeEmojiForOutcome("Resolved: DELETED for X"); got != "🗑" {
+		t.Fatalf("unexpected delete emoji: %q", got)
+	}
+	if got := finalizeEmojiForOutcome("Resolved: DELAYED for X"); got != "⏸" {
+		t.Fatalf("unexpected delay emoji: %q", got)
+	}
+}
+
 type testErr string
 
 func (e testErr) Error() string { return string(e) }
