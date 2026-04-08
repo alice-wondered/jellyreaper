@@ -226,6 +226,41 @@ func TestScheduleDelete_ConfirmQueuesDeleteJob(t *testing.T) {
 	}
 }
 
+func TestScheduleDelete_NoCancelsWithoutQueueing(t *testing.T) {
+	store := newTestStore(t)
+	seedFlow(t, store, "target:season:season-77", "Season 77", domain.FlowStateActive)
+
+	h := NewHarness(store, "", "")
+	h.SetDecisionService(app.NewService(store, nil, nil))
+	threadID := "thread-delete-cancel"
+
+	out, _, err := h.setDeleteState(context.Background(), threadID, "season 77")
+	if err != nil {
+		t.Fatalf("set delete state: %v", err)
+	}
+	if !strings.Contains(out, "\"status\":\"needs_confirmation\"") {
+		t.Fatalf("expected confirmation payload, got: %s", out)
+	}
+
+	out, _, err = h.handleFollowUp(context.Background(), threadID, "no")
+	if err != nil {
+		t.Fatalf("cancel delete: %v", err)
+	}
+	if !strings.Contains(out, "\"status\":\"cancelled\"") {
+		t.Fatalf("expected cancelled status, got: %s", out)
+	}
+
+	jobs, err := store.LeaseDueJobs(context.Background(), time.Now().UTC().Add(time.Hour), 10, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease jobs: %v", err)
+	}
+	for _, job := range jobs {
+		if job.Kind == domain.JobKindExecuteDelete {
+			t.Fatalf("expected no execute_delete job after cancellation, got %#v", job)
+		}
+	}
+}
+
 func TestHistoryRingBufferKeepsRecentWindow(t *testing.T) {
 	store := newTestStore(t)
 	h := NewHarness(store, "", "")
@@ -295,6 +330,29 @@ func TestThreadContextCapEvictsLeastRecentlyUsed(t *testing.T) {
 	}
 	if _, ok := h.history["thread-2"]; ok {
 		t.Fatal("expected thread-2 to be evicted as LRU")
+	}
+}
+
+func TestSerializeThreadContextUsesHumanReadableState(t *testing.T) {
+	store := newTestStore(t)
+	seedFlow(t, store, "target:season:s-human", "Season Human", domain.FlowStateActive)
+
+	h := NewHarness(store, "", "")
+	state := threadState{
+		SelectedTargetID: "target:season:s-human",
+		PendingAction:    "schedule_delete",
+		CandidateIDs:     []string{"target:season:s-human"},
+		AliasToItemID:    map[string]string{"this season": "target:season:s-human"},
+	}
+	ctx := h.serializeThreadContext(context.Background(), state)
+	if !strings.Contains(ctx, "pending_action=schedule_delete") {
+		t.Fatalf("expected pending action in context, got: %s", ctx)
+	}
+	if !strings.Contains(ctx, "selected_target=Season Human") {
+		t.Fatalf("expected human title in selected target, got: %s", ctx)
+	}
+	if strings.Contains(ctx, "target:season:s-human") {
+		t.Fatalf("did not expect internal target id in serialized context: %s", ctx)
 	}
 }
 
