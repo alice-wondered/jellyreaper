@@ -42,6 +42,7 @@ type targetRef struct {
 type Service struct {
 	repository            repo.Repository
 	logger                *slog.Logger
+	discord               *discord.Service
 	wake                  func(time.Time)
 	now                   func() time.Time
 	backfillBatchSize     int
@@ -77,6 +78,10 @@ func (s *Service) SetBackfillWriteBatching(size int, timeout time.Duration, queu
 	if queueCapacity > 0 {
 		s.backfillQueueCapacity = queueCapacity
 	}
+}
+
+func (s *Service) SetDiscordService(discordSvc *discord.Service) {
+	s.discord = discordSvc
 }
 
 func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.WebhookEvent) error {
@@ -547,6 +552,9 @@ func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action str
 	}
 
 	now := s.now().UTC()
+	finalizeChannelID := ""
+	finalizeMessageID := ""
+	finalizeDisplayName := ""
 	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, itemID)
 		if err != nil {
@@ -559,15 +567,25 @@ func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action str
 		expectedVersion := flow.Version
 		flow.UpdatedAt = now
 		flow.HITLOutcome = action
+		finalizeChannelID = flow.Discord.ChannelID
+		finalizeMessageID = flow.Discord.MessageID
+		finalizeDisplayName = strings.TrimSpace(flow.DisplayName)
 
 		switch action {
 		case "archive":
 			flow.State = domain.FlowStateArchived
+			flow.NextActionAt = time.Time{}
+			flow.DecisionDeadlineAt = time.Time{}
 		case "unarchive":
 			flow.State = domain.FlowStateActive
+			flow.DecisionDeadlineAt = time.Time{}
+			if err := enqueueEvaluatePolicy(ctx, tx, flow, now, "ai_unarchive", now); err != nil {
+				return err
+			}
 		case "delete":
 			flow.State = domain.FlowStateDeleteQueued
 			flow.NextActionAt = now
+			flow.DecisionDeadlineAt = time.Time{}
 			if err := enqueueExecuteDelete(ctx, tx, flow, now); err != nil {
 				return err
 			}
@@ -596,6 +614,16 @@ func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action str
 	})
 	if err != nil {
 		return err
+	}
+	if s.discord != nil && finalizeChannelID != "" && finalizeMessageID != "" {
+		display := finalizeDisplayName
+		if display == "" {
+			display = "item"
+		}
+		content := fmt.Sprintf("Decision: %s for %s (AI).", strings.ToUpper(action), display)
+		if err := s.discord.FinalizeHITLPrompt(ctx, finalizeChannelID, finalizeMessageID, content); err != nil {
+			s.logger.Warn("failed to finalize ai decision HITL message", "item_id", itemID, "error", err)
+		}
 	}
 	s.wake(now)
 	return nil

@@ -136,6 +136,7 @@ func main() {
 		}
 	}
 	appService := app.NewService(store, logger, wake)
+	appService.SetDiscordService(discordService)
 	if assistant != nil {
 		assistant.SetDecisionService(appService)
 	}

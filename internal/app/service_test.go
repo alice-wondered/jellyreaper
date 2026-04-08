@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -168,6 +169,65 @@ func TestApplyAIDecisionDeleteQueuesImmediateDeleteJob(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("expected execute_delete job from ai decision")
+	}
+}
+
+func TestApplyAIDecisionFinalizesOpenHITLPrompt(t *testing.T) {
+	store := newTestStore(t)
+	discordSvc, err := discord.NewService("", nil)
+	if err != nil {
+		t.Fatalf("new discord service: %v", err)
+	}
+
+	svc := NewService(store, nil, nil)
+	svc.SetDiscordService(discordSvc)
+	now := time.Date(2026, 4, 7, 13, 30, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	itemID := "target:item:item-ai-archive"
+	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:" + itemID,
+			ItemID:      itemID,
+			SubjectType: "item",
+			DisplayName: "AI Archive Target",
+			State:       domain.FlowStatePendingReview,
+			Version:     0,
+			PolicySnapshot: domain.PolicySnapshot{
+				ExpireAfterDays: 30,
+				HITLTimeoutHrs:  48,
+				TimeoutAction:   "delete",
+			},
+			Discord:   domain.DiscordContext{ChannelID: "chan-1", MessageID: "msg-1"},
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0)
+	})
+	if err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	finalized := false
+	discordSvc.SetEditPromptHookForTest(func(ctx context.Context, channelID, messageID, content string) error {
+		if channelID != "chan-1" || messageID != "msg-1" {
+			t.Fatalf("unexpected finalize target: %s/%s", channelID, messageID)
+		}
+		if !strings.Contains(content, "Decision: ARCHIVE for AI Archive Target (AI).") {
+			t.Fatalf("unexpected finalize content: %s", content)
+		}
+		finalized = true
+		return nil
+	})
+
+	if err := svc.ApplyAIDecision(context.Background(), itemID, "archive"); err != nil {
+		t.Fatalf("apply ai decision: %v", err)
+	}
+	if !finalized {
+		t.Fatal("expected open HITL prompt to be finalized")
+	}
+	flow := mustGetFlow(t, store, itemID)
+	if flow.State != domain.FlowStateArchived {
+		t.Fatalf("expected archived state, got %s", flow.State)
 	}
 }
 
