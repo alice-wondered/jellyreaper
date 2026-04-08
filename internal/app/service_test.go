@@ -1411,6 +1411,44 @@ func TestCollectionWebhookDoesNotCreateOperationalFlow(t *testing.T) {
 	}
 }
 
+func TestSeriesWebhookDoesNotCreateOperationalFlow(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 12, 10, 45, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:           "series-123",
+			ItemType:         "Series",
+			Name:             "Series Only Event",
+			NotificationType: "ItemUpdated",
+			EventID:          "evt-series-123",
+		},
+		Raw:       map[string]any{"EventId": "evt-series-123"},
+		ItemID:    "series-123",
+		EventID:   "evt-series-123",
+		EventType: "ItemUpdated",
+		DedupeKey: "jellyfin:evt-series-123",
+	})
+	if err != nil {
+		t.Fatalf("handle series webhook: %v", err)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		flows, err := tx.ListFlows(context.Background())
+		if err != nil {
+			return err
+		}
+		if len(flows) != 0 {
+			return fmt.Errorf("expected no operational flows from series-only webhook, got %d", len(flows))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify no series flow created: %v", err)
+	}
+}
+
 func TestDiscordInteractionUsesSnowflakeTimestamp(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)

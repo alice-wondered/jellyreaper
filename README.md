@@ -11,7 +11,7 @@ At a high level:
 - It ships an optional Discord @mention AI assistant that can discover projection targets, inspect state, and submit domain-safe decisions.
 
 AI compatibility notes:
-- AI operations are projection-centric (`movie`, `season`, `series`), not raw per-item mutation.
+- AI operations are projection-centric (`movie`, `season`) for scheduler/HITL, with higher-level intents mapped into those targets.
 - AI uses domain services for decisions (queueing/scheduler consistency stays centralized).
 - AI can update global defaults, delay a specific target by arbitrary days, and finalize active HITL prompts when it records a delay decision.
 
