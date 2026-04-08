@@ -92,6 +92,62 @@ func TestHITLDeleteQueuesImmediateDeleteJob(t *testing.T) {
 	}
 }
 
+func TestStaleInteractionPointsToLatestPrompt(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 7, 12, 45, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	targetID := "target:item:item-stale-link"
+	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:" + targetID,
+			ItemID:      targetID,
+			SubjectType: "item",
+			DisplayName: "Stale Link Item",
+			State:       domain.FlowStatePendingReview,
+			HITLOutcome: "",
+			Discord:     domain.DiscordContext{ChannelID: "ch-new", MessageID: "msg-new"},
+			Version:     2,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0)
+	})
+	if err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	interaction := discord.IncomingInteraction{
+		Raw:           &discordgo.Interaction{Message: &discordgo.Message{ID: "msg-old"}},
+		Type:          discordgo.InteractionMessageComponent,
+		InteractionID: snowflakeIDFor(now),
+		GuildID:       "guild-1",
+		ChannelID:     "ch-new",
+		CustomID:      "jr:v1:archive:" + targetID + ":1",
+	}
+
+	resp, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction)
+	if err != nil {
+		t.Fatalf("handle stale interaction: %v", err)
+	}
+	if resp == nil || resp.Data == nil {
+		t.Fatal("expected response data")
+	}
+	if len(resp.Data.Components) != 0 {
+		t.Fatalf("expected stale update to clear components, got %d", len(resp.Data.Components))
+	}
+	wantLink := "https://discord.com/channels/guild-1/ch-new/msg-new"
+	if !strings.Contains(resp.Data.Content, wantLink) {
+		t.Fatalf("expected stale response to include latest prompt link %q, got %q", wantLink, resp.Data.Content)
+	}
+	if strings.Contains(resp.Data.Content, "Resolved: DELAYED") {
+		t.Fatalf("stale prompt without decision should not claim DELAYED, got %q", resp.Data.Content)
+	}
+	if !strings.Contains(resp.Data.Content, "No decision") {
+		t.Fatalf("expected stale response to indicate no recorded decision, got %q", resp.Data.Content)
+	}
+}
+
 func TestApplyAIDecisionDeleteQueuesImmediateDeleteJob(t *testing.T) {
 	store := newTestStore(t)
 	var wokeAt time.Time

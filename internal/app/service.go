@@ -560,7 +560,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 					if display == "" {
 						display = decisionDisplayName
 					}
-					processedMessage = staleDecisionMessage(flow, display)
+					processedMessage = staleDecisionMessage(flow, display, interaction)
 				} else {
 					processedMessage = fmt.Sprintf("Resolved: %s for %s (target no longer exists)", interactionDecisionLabel(parsed.Action), decisionDisplayName)
 				}
@@ -584,7 +584,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 		expectedVersion := flow.Version
 		if parsed.Version != expectedVersion {
 			staleVersion = true
-			staleMessage = staleDecisionMessage(flow, decisionDisplayName)
+			staleMessage = staleDecisionMessage(flow, decisionDisplayName, interaction)
 			return nil
 		}
 
@@ -1175,29 +1175,61 @@ func interactionDecisionUpdateResponse(action string, itemDisplay string) *disco
 	return interactionMessageUpdateResponse(fmt.Sprintf("Resolved: %s for %s", decision, item))
 }
 
-func staleDecisionMessage(flow domain.Flow, itemDisplay string) string {
+func staleDecisionMessage(flow domain.Flow, itemDisplay string, interaction discord.IncomingInteraction) string {
 	item := strings.TrimSpace(itemDisplay)
 	if item == "" {
 		item = "item"
 	}
 	decision := strings.TrimSpace(strings.ToLower(flow.HITLOutcome))
-	if decision == "" {
+	hasDecision := decision != ""
+	if !hasDecision {
 		switch flow.State {
 		case domain.FlowStateArchived:
 			decision = "archive"
+			hasDecision = true
+		case domain.FlowStateDeleteInProgress:
+			decision = "delete_requested"
+			hasDecision = true
 		case domain.FlowStateDeleteQueued:
 			decision = "delete_requested"
+			hasDecision = true
 		case domain.FlowStateDeleted:
 			decision = "delete"
-		case domain.FlowStateActive:
-			decision = "resolved"
-		case domain.FlowStatePendingReview:
-			decision = "delay"
-		default:
-			decision = "resolved"
+			hasDecision = true
 		}
 	}
-	return fmt.Sprintf("Resolved: %s for %s", interactionDecisionLabel(decision), item)
+	message := ""
+	if hasDecision {
+		message = fmt.Sprintf("Resolved: %s for %s", interactionDecisionLabel(decision), item)
+	} else {
+		message = fmt.Sprintf("This prompt is stale for %s. No decision has been recorded yet.", item)
+	}
+	if reference := latestPromptReference(flow, interaction); reference != "" {
+		return message + "\n\n" + reference
+	}
+	return message
+}
+
+func latestPromptReference(flow domain.Flow, interaction discord.IncomingInteraction) string {
+	channelID := strings.TrimSpace(flow.Discord.ChannelID)
+	messageID := strings.TrimSpace(flow.Discord.MessageID)
+	if channelID == "" || messageID == "" {
+		return ""
+	}
+
+	clickedMessageID := ""
+	if interaction.Raw != nil && interaction.Raw.Message != nil {
+		clickedMessageID = strings.TrimSpace(interaction.Raw.Message.ID)
+	}
+	if clickedMessageID != "" && clickedMessageID == messageID {
+		return ""
+	}
+
+	guildID := strings.TrimSpace(interaction.GuildID)
+	if guildID != "" {
+		return fmt.Sprintf("This prompt is stale. Use the latest one: https://discord.com/channels/%s/%s/%s", guildID, channelID, messageID)
+	}
+	return fmt.Sprintf("This prompt is stale. Use the latest one in channel %s (message %s).", channelID, messageID)
 }
 
 func interactionDecisionLabel(action string) string {
