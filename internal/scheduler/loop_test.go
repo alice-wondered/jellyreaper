@@ -91,3 +91,21 @@ func TestLoop_ComputeNextWakePrefersSoonest(t *testing.T) {
 		t.Fatalf("unexpected next wake: got=%s want=%s", next, want)
 	}
 }
+
+func TestLoop_SignalHintEarlierThanDueCausesImmediateShortSleep(t *testing.T) {
+	now := time.Date(2026, 4, 8, 12, 0, 0, 0, time.UTC)
+	signal := make(chan time.Time, 1)
+	repo := &fakeRepo{nextDue: now.Add(30 * time.Second), hasDue: true}
+	loop := NewLoop(repo, func(context.Context, domain.JobRecord) error { return nil }, nil, Config{Signal: signal, IdlePoll: time.Minute})
+	loop.now = func() time.Time { return now }
+
+	signal <- now.Add(150 * time.Millisecond)
+	if err := loop.sleepUntil(context.Background(), now.Add(10*time.Second)); err != nil {
+		t.Fatalf("sleepUntil error: %v", err)
+	}
+
+	next := loop.computeNextWake(context.Background(), now)
+	if want := now.Add(150 * time.Millisecond); !next.Equal(want) {
+		t.Fatalf("expected signal hint to win: got=%s want=%s", next, want)
+	}
+}

@@ -179,3 +179,55 @@ func TestOpenReconcilesPersistedQueueAfterRestart(t *testing.T) {
 		t.Fatalf("expected restored job after restart, got %#v", jobs)
 	}
 }
+
+func TestLeaseDueJobsCleansStaleDueIndexEntries(t *testing.T) {
+	store := testStore(t)
+	now := time.Date(2026, 4, 8, 12, 0, 0, 0, time.UTC)
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.EnqueueJob(context.Background(), domain.JobRecord{
+			JobID:     "job-real",
+			ItemID:    "item-real",
+			Kind:      domain.JobKindEvaluatePolicy,
+			Status:    domain.JobStatusPending,
+			RunAt:     now,
+			FlowID:    "flow:item-real",
+			CreatedAt: now,
+			UpdatedAt: now,
+		})
+	}); err != nil {
+		t.Fatalf("seed real job: %v", err)
+	}
+
+	if err := store.db.Update(func(tx *bboltlib.Tx) error {
+		due, err := requireBucket(tx, bucketDueIndex)
+		if err != nil {
+			return err
+		}
+		return due.Put(dueIndexKeyBytes(now.Add(-time.Minute), "job-missing"), keyBytes("job-missing"))
+	}); err != nil {
+		t.Fatalf("insert stale due index entry: %v", err)
+	}
+
+	leased, err := store.LeaseDueJobs(context.Background(), now, 10, "worker", time.Minute)
+	if err != nil {
+		t.Fatalf("lease due jobs: %v", err)
+	}
+	if len(leased) != 1 || leased[0].JobID != "job-real" {
+		t.Fatalf("expected only real job leased, got %#v", leased)
+	}
+
+	if err := store.db.View(func(tx *bboltlib.Tx) error {
+		due, err := requireBucket(tx, bucketDueIndex)
+		if err != nil {
+			return err
+		}
+		k := dueIndexKeyBytes(now.Add(-time.Minute), "job-missing")
+		if due.Get(k) != nil {
+			t.Fatalf("expected stale due index key to be removed")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify stale due index removal: %v", err)
+	}
+}

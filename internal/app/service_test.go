@@ -121,7 +121,12 @@ func TestHITLDeleteQueuesImmediateDeleteJob(t *testing.T) {
 
 func TestApplyAIDecisionDeleteQueuesImmediateDeleteJob(t *testing.T) {
 	store := newTestStore(t)
-	svc := NewService(store, nil, nil)
+	var wokeAt time.Time
+	wakeCount := 0
+	svc := NewService(store, nil, func(at time.Time) {
+		wakeCount++
+		wokeAt = at
+	})
 	now := time.Date(2026, 4, 7, 13, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
 
@@ -169,6 +174,12 @@ func TestApplyAIDecisionDeleteQueuesImmediateDeleteJob(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("expected execute_delete job from ai decision")
+	}
+	if wakeCount != 1 {
+		t.Fatalf("expected one scheduler wake, got %d", wakeCount)
+	}
+	if !wokeAt.Equal(now) {
+		t.Fatalf("expected wake at now, got %s want %s", wokeAt, now)
 	}
 }
 
@@ -228,6 +239,59 @@ func TestApplyAIDecisionFinalizesOpenHITLPrompt(t *testing.T) {
 	flow := mustGetFlow(t, store, itemID)
 	if flow.State != domain.FlowStateArchived {
 		t.Fatalf("expected archived state, got %s", flow.State)
+	}
+}
+
+func TestApplyAIDecisionUnarchiveEnqueuesEvaluateNow(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 7, 14, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	itemID := "target:item:item-ai-unarchive"
+	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:" + itemID,
+			ItemID:      itemID,
+			SubjectType: "item",
+			DisplayName: "AI Unarchive Target",
+			State:       domain.FlowStateArchived,
+			Version:     0,
+			PolicySnapshot: domain.PolicySnapshot{
+				ExpireAfterDays: 30,
+				HITLTimeoutHrs:  48,
+				TimeoutAction:   "delete",
+			},
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0)
+	})
+	if err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	if err := svc.ApplyAIDecision(context.Background(), itemID, "unarchive"); err != nil {
+		t.Fatalf("apply ai decision: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, itemID)
+	if flow.State != domain.FlowStateActive {
+		t.Fatalf("expected active state, got %s", flow.State)
+	}
+
+	jobs, err := store.LeaseDueJobs(context.Background(), now, 10, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease jobs: %v", err)
+	}
+	foundEval := false
+	for _, job := range jobs {
+		if job.ItemID == itemID && job.Kind == domain.JobKindEvaluatePolicy {
+			foundEval = true
+			break
+		}
+	}
+	if !foundEval {
+		t.Fatal("expected evaluate_policy job to be queued after unarchive")
 	}
 }
 
