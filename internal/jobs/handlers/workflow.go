@@ -303,6 +303,8 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 				return nil
 			}
 			expected := current.Version
+			current.Discord.PreviousChannelID = strings.TrimSpace(current.Discord.ChannelID)
+			current.Discord.PreviousMessageID = strings.TrimSpace(current.Discord.MessageID)
 			current.Discord.MessageID = ""
 			current.UpdatedAt = clearNow
 			current.Version = expected + 1
@@ -361,6 +363,10 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 		current.DecisionDeadlineAt = deadline
 		current.NextActionAt = current.DecisionDeadlineAt
 		current.Discord.ChannelID = channelID
+		if existing := strings.TrimSpace(current.Discord.MessageID); existing != "" && existing != strings.TrimSpace(messageID) {
+			current.Discord.PreviousChannelID = strings.TrimSpace(channelID)
+			current.Discord.PreviousMessageID = existing
+		}
 		current.Discord.MessageID = messageID
 		current.UpdatedAt = now
 		current.Version = expected + 1

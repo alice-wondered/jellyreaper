@@ -66,9 +66,11 @@ type PolicySnapshot struct {
 }
 
 type DiscordContext struct {
-	ChannelID string `json:"channel_id"`
-	MessageID string `json:"message_id"`
-	ThreadID  string `json:"thread_id"`
+	ChannelID         string `json:"channel_id"`
+	MessageID         string `json:"message_id"`
+	PreviousChannelID string `json:"previous_channel_id"`
+	PreviousMessageID string `json:"previous_message_id"`
+	ThreadID          string `json:"thread_id"`
 }
 
 type Flow struct {

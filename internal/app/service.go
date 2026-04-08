@@ -600,7 +600,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 			flow.State = domain.FlowStateActive
 			flow.NextActionAt = now.Add(defaultDeferWindow)
 			flow.DecisionDeadlineAt = time.Time{}
-			flow.Discord.MessageID = ""
+			clearDiscordPromptLink(&flow.Discord)
 			if err := enqueueEvaluatePolicy(ctx, tx, flow, now, "discord_delay", flow.NextActionAt); err != nil {
 				return err
 			}
@@ -712,7 +712,7 @@ func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action str
 		case "unarchive":
 			flow.State = domain.FlowStateActive
 			flow.DecisionDeadlineAt = time.Time{}
-			flow.Discord.MessageID = ""
+			clearDiscordPromptLink(&flow.Discord)
 			if err := enqueueEvaluatePolicy(ctx, tx, flow, now, "ai_unarchive", now); err != nil {
 				return err
 			}
@@ -820,7 +820,7 @@ func (s *Service) ApplyAIDelayDays(ctx context.Context, itemID string, days int)
 			flow.PolicySnapshot.ExpireAfterDays = s.defaultExpireDays
 		}
 		flow.PolicySnapshot.ExpireAfterDays = days
-		flow.Discord.MessageID = ""
+		clearDiscordPromptLink(&flow.Discord)
 		flow.UpdatedAt = now
 		flow.Version = expectedVersion + 1
 		if err := tx.UpsertFlowCAS(ctx, flow, expectedVersion); err != nil {
@@ -1211,25 +1211,51 @@ func staleDecisionMessage(flow domain.Flow, itemDisplay string, interaction disc
 }
 
 func latestPromptReference(flow domain.Flow, interaction discord.IncomingInteraction) string {
-	channelID := strings.TrimSpace(flow.Discord.ChannelID)
-	messageID := strings.TrimSpace(flow.Discord.MessageID)
-	if channelID == "" || messageID == "" {
-		return ""
-	}
-
 	clickedMessageID := ""
 	if interaction.Raw != nil && interaction.Raw.Message != nil {
 		clickedMessageID = strings.TrimSpace(interaction.Raw.Message.ID)
 	}
-	if clickedMessageID != "" && clickedMessageID == messageID {
+	currentChannelID := strings.TrimSpace(flow.Discord.ChannelID)
+	currentMessageID := strings.TrimSpace(flow.Discord.MessageID)
+	previousChannelID := strings.TrimSpace(flow.Discord.PreviousChannelID)
+	previousMessageID := strings.TrimSpace(flow.Discord.PreviousMessageID)
+
+	if clickedMessageID != "" {
+		if currentMessageID != "" && clickedMessageID == currentMessageID {
+			return ""
+		}
+		if currentMessageID == "" && previousMessageID != "" && clickedMessageID == previousMessageID {
+			return "No newer prompt exists yet; this message is now closed."
+		}
+	}
+
+	targetChannelID := currentChannelID
+	targetMessageID := currentMessageID
+	if targetChannelID == "" || targetMessageID == "" {
+		targetChannelID = previousChannelID
+		targetMessageID = previousMessageID
+	}
+	if targetChannelID == "" || targetMessageID == "" {
 		return ""
 	}
 
 	guildID := strings.TrimSpace(interaction.GuildID)
 	if guildID != "" {
-		return fmt.Sprintf("This prompt is stale. Use the latest one: https://discord.com/channels/%s/%s/%s", guildID, channelID, messageID)
+		return fmt.Sprintf("This prompt is stale. Use the latest one: https://discord.com/channels/%s/%s/%s", guildID, targetChannelID, targetMessageID)
 	}
-	return fmt.Sprintf("This prompt is stale. Use the latest one in channel %s (message %s).", channelID, messageID)
+	return fmt.Sprintf("This prompt is stale. Use the latest one in channel %s (message %s).", targetChannelID, targetMessageID)
+}
+
+func clearDiscordPromptLink(ctx *domain.DiscordContext) {
+	if ctx == nil {
+		return
+	}
+	msg := strings.TrimSpace(ctx.MessageID)
+	if msg != "" {
+		ctx.PreviousChannelID = strings.TrimSpace(ctx.ChannelID)
+		ctx.PreviousMessageID = msg
+	}
+	ctx.MessageID = ""
 }
 
 func interactionDecisionLabel(action string) string {

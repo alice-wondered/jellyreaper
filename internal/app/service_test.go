@@ -148,6 +148,60 @@ func TestStaleInteractionPointsToLatestPrompt(t *testing.T) {
 	}
 }
 
+func TestStaleInteractionWithoutNewPromptClosesCurrentMessage(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 7, 12, 50, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	targetID := "target:item:item-stale-no-new"
+	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:" + targetID,
+			ItemID:      targetID,
+			SubjectType: "item",
+			DisplayName: "No New Prompt Item",
+			State:       domain.FlowStateActive,
+			HITLOutcome: "delay",
+			Discord: domain.DiscordContext{
+				ChannelID:         "ch-1",
+				MessageID:         "",
+				PreviousChannelID: "ch-1",
+				PreviousMessageID: "msg-old",
+			},
+			Version:   2,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0)
+	})
+	if err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	interaction := discord.IncomingInteraction{
+		Raw:           &discordgo.Interaction{Message: &discordgo.Message{ID: "msg-old"}},
+		Type:          discordgo.InteractionMessageComponent,
+		InteractionID: snowflakeIDFor(now),
+		GuildID:       "guild-1",
+		ChannelID:     "ch-1",
+		CustomID:      "jr:v1:delay:" + targetID + ":1",
+	}
+
+	resp, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction)
+	if err != nil {
+		t.Fatalf("handle stale interaction: %v", err)
+	}
+	if resp == nil || resp.Data == nil {
+		t.Fatal("expected response data")
+	}
+	if len(resp.Data.Components) != 0 {
+		t.Fatalf("expected stale update to clear components, got %d", len(resp.Data.Components))
+	}
+	if !strings.Contains(resp.Data.Content, "No newer prompt exists yet") {
+		t.Fatalf("expected stale response to explain no newer prompt, got %q", resp.Data.Content)
+	}
+}
+
 func TestApplyAIDecisionDeleteQueuesImmediateDeleteJob(t *testing.T) {
 	store := newTestStore(t)
 	var wokeAt time.Time
@@ -311,6 +365,9 @@ func TestApplyAIDecisionUnarchiveEnqueuesEvaluateNow(t *testing.T) {
 	if flow.Discord.MessageID != "" {
 		t.Fatalf("expected unarchive to clear stale discord message id, got %q", flow.Discord.MessageID)
 	}
+	if flow.Discord.PreviousMessageID != "msg-unarchive" {
+		t.Fatalf("expected unarchive to retain previous message id, got %q", flow.Discord.PreviousMessageID)
+	}
 
 	jobs, err := store.LeaseDueJobs(context.Background(), now, 10, "test", time.Minute)
 	if err != nil {
@@ -445,6 +502,9 @@ func TestApplyAIDelayDaysDefersLazilyAndFinalizesHITLPrompt(t *testing.T) {
 	}
 	if flow.Discord.MessageID != "" {
 		t.Fatalf("expected ai delay to clear discord message id, got %q", flow.Discord.MessageID)
+	}
+	if flow.Discord.PreviousMessageID != "msg-delay" {
+		t.Fatalf("expected ai delay to retain previous message id, got %q", flow.Discord.PreviousMessageID)
 	}
 
 	jobsEarly, err := store.LeaseDueJobs(context.Background(), now.Add(6*24*time.Hour), 20, "test", time.Minute)
