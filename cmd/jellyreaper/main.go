@@ -115,11 +115,13 @@ func main() {
 
 	evaluatePolicyHandler := handlers.NewEvaluatePolicyHandler(store, logger)
 	evaluatePolicyHandler.SetDefaultExpireDays(cfg.DefaultLastPlayedThresholdDays)
+	executeDeleteHandler := handlers.NewExecuteDeleteHandler(store, jellyfin.NewClient(cfg.JellyfinURL, cfg.JellyfinAPIKey, nil))
+	executeDeleteHandler.SetDiscordService(discordService)
 	handlerList := []jobs.JobHandler{
 		evaluatePolicyHandler,
 		handlers.NewSendHITLPromptHandler(store, logger, discordService, cfg.DiscordChannelID, 48*time.Hour),
 		handlers.NewHITLTimeoutHandler(store, discordService, logger),
-		handlers.NewExecuteDeleteHandler(store, jellyfin.NewClient(cfg.JellyfinURL, cfg.JellyfinAPIKey, nil)),
+		executeDeleteHandler,
 		handlers.NewNoopHandler(domain.JobKindVerifyDelete, logger),
 		handlers.NewNoopHandler(domain.JobKindReconcileItem, logger),
 	}

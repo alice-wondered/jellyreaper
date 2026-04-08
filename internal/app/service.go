@@ -438,9 +438,11 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 
 		if playbackEvent && flow.State == domain.FlowStatePendingReview {
 			runAt := now
+			resolvedPlayedAt := time.Time{}
 			if playAt, known, err := mostRecentPlayForTarget(ctx, tx, flow); err != nil {
 				return err
 			} else if known {
+				resolvedPlayedAt = playAt
 				expireDays := flow.PolicySnapshot.ExpireAfterDays
 				if expireDays <= 0 {
 					expireDays = defaultExpireDays
@@ -453,7 +455,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 
 			expected := flow.Version
 			flow.State = domain.FlowStateActive
-			flow.HITLOutcome = "keep"
+			flow.HITLOutcome = "played"
 			flow.DecisionDeadlineAt = time.Time{}
 			flow.NextActionAt = runAt
 			flow.UpdatedAt = now
@@ -472,7 +474,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 				*finalizations = append(*finalizations, hitlFinalizeRequest{
 					channelID: flow.Discord.ChannelID,
 					messageID: flow.Discord.MessageID,
-					content:   fmt.Sprintf("Decision: KEEP for %s (auto via new playback).", display),
+					content:   fmt.Sprintf("Resolved: PLAYED at %s for %s", humanTimeLabel(resolvedPlayedAt), display),
 				})
 			}
 			continue
@@ -534,8 +536,11 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 	}
 	dedupeKey := discordDedupeKey(interaction)
 	alreadyProcessed := false
+	processedMessage := ""
 	staleVersion := false
+	staleMessage := ""
 	decisionDisplayName := parsed.ItemID
+	resolvedAction := parsed.Action
 
 	err = s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
 		_, defaultDeferWindow, err := s.currentDefaultsFromMeta(ctx, tx)
@@ -549,6 +554,17 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 		}
 		if processed {
 			alreadyProcessed = true
+			if flow, found, err := tx.GetFlow(ctx, parsed.ItemID); err == nil {
+				if found {
+					display := strings.TrimSpace(flow.DisplayName)
+					if display == "" {
+						display = decisionDisplayName
+					}
+					processedMessage = staleDecisionMessage(flow, display)
+				} else {
+					processedMessage = fmt.Sprintf("Resolved: %s for %s (target no longer exists)", interactionDecisionLabel(parsed.Action), decisionDisplayName)
+				}
+			}
 			return nil
 		}
 
@@ -558,32 +574,33 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 		}
 		if !found {
 			staleVersion = true
-			return nil
-		}
-
-		expectedVersion := flow.Version
-		if parsed.Version != expectedVersion {
-			staleVersion = true
+			staleMessage = fmt.Sprintf("Resolved: %s for %s (target no longer exists)", interactionDecisionLabel(parsed.Action), decisionDisplayName)
 			return nil
 		}
 		if strings.TrimSpace(flow.DisplayName) != "" {
 			decisionDisplayName = strings.TrimSpace(flow.DisplayName)
 		}
 
-		flow.UpdatedAt = now
-		flow.HITLOutcome = parsed.Action
+		expectedVersion := flow.Version
+		if parsed.Version != expectedVersion {
+			staleVersion = true
+			staleMessage = staleDecisionMessage(flow, decisionDisplayName)
+			return nil
+		}
 
-		switch parsed.Action {
+		flow.UpdatedAt = now
+		effectiveAction := parsed.Action
+		resolvedAction = effectiveAction
+		flow.HITLOutcome = effectiveAction
+
+		switch effectiveAction {
 		case "archive":
 			flow.State = domain.FlowStateArchived
-		case "keep":
-			flow.State = domain.FlowStateActive
-			if err := enqueueEvaluatePolicy(ctx, tx, flow, now, "discord_keep", now); err != nil {
-				return err
-			}
 		case "delay":
-			flow.State = domain.FlowStatePendingReview
+			flow.State = domain.FlowStateActive
 			flow.NextActionAt = now.Add(defaultDeferWindow)
+			flow.DecisionDeadlineAt = time.Time{}
+			flow.Discord.MessageID = ""
 			if err := enqueueEvaluatePolicy(ctx, tx, flow, now, "discord_delay", flow.NextActionAt); err != nil {
 				return err
 			}
@@ -609,14 +626,14 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 			EventID:        "evt:discord:" + shortHash(dedupeKey),
 			FlowID:         flow.FlowID,
 			ItemID:         flow.ItemID,
-			Type:           "discord.interaction." + parsed.Action,
+			Type:           "discord.interaction." + effectiveAction,
 			Source:         "discord",
 			OccurredAt:     now,
 			IdempotencyKey: dedupeKey,
 			Payload: map[string]any{
 				"interaction_id": interaction.InteractionID,
 				"custom_id":      interaction.CustomID,
-				"action":         parsed.Action,
+				"action":         effectiveAction,
 				"version":        parsed.Version,
 			},
 		}
@@ -631,24 +648,30 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 	}
 
 	if alreadyProcessed {
-		return interactionMessageUpdateResponse("Decision already recorded."), nil
+		if strings.TrimSpace(processedMessage) == "" {
+			processedMessage = fmt.Sprintf("Resolved: %s for %s", interactionDecisionLabel(parsed.Action), decisionDisplayName)
+		}
+		return interactionMessageUpdateResponse(processedMessage), nil
 	}
 	if staleVersion {
-		return interactionMessageUpdateResponse("This decision is stale. Please refresh and try again."), nil
+		if strings.TrimSpace(staleMessage) == "" {
+			staleMessage = "Resolved: this prompt has already been handled."
+		}
+		return interactionMessageUpdateResponse(staleMessage), nil
 	}
 
 	s.wake(now)
 	actor := discordInteractionActor(interaction)
 	s.logger.InfoContext(ctx,
 		"processed discord interaction decision",
-		"lex", discordActionLexicon(parsed.Action),
-		"action", parsed.Action,
+		"lex", discordActionLexicon(resolvedAction),
+		"action", resolvedAction,
 		"subject_type", inferSubjectType(parsed.ItemID),
 		"title", decisionDisplayName,
 		"actor", actor,
 		"item_id", parsed.ItemID,
 	)
-	return interactionDecisionUpdateResponse(parsed.Action, decisionDisplayName), nil
+	return interactionDecisionUpdateResponse(resolvedAction, decisionDisplayName), nil
 }
 
 func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action string) error {
@@ -689,6 +712,7 @@ func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action str
 		case "unarchive":
 			flow.State = domain.FlowStateActive
 			flow.DecisionDeadlineAt = time.Time{}
+			flow.Discord.MessageID = ""
 			if err := enqueueEvaluatePolicy(ctx, tx, flow, now, "ai_unarchive", now); err != nil {
 				return err
 			}
@@ -730,7 +754,7 @@ func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action str
 		if display == "" {
 			display = "item"
 		}
-		content := fmt.Sprintf("Decision: %s for %s (AI).", strings.ToUpper(action), display)
+		content := fmt.Sprintf("Resolved: %s for %s (AI).", interactionDecisionLabel(action), display)
 		if err := s.discord.FinalizeHITLPrompt(ctx, finalizeChannelID, finalizeMessageID, content); err != nil {
 			s.logger.Warn("failed to finalize ai decision HITL message", "item_id", itemID, "error", err)
 		}
@@ -785,18 +809,20 @@ func (s *Service) ApplyAIDelayDays(ctx context.Context, itemID string, days int)
 			return fmt.Errorf("flow not found for item %s", itemID)
 		}
 		expectedVersion := flow.Version
-		flow.State = domain.FlowStatePendingReview
+		finalizeChannelID = flow.Discord.ChannelID
+		finalizeMessageID = flow.Discord.MessageID
+		finalizeDisplayName = strings.TrimSpace(flow.DisplayName)
+		flow.State = domain.FlowStateActive
 		flow.HITLOutcome = "delay"
 		flow.NextActionAt = delayUntil
+		flow.DecisionDeadlineAt = time.Time{}
 		if flow.PolicySnapshot.ExpireAfterDays <= 0 {
 			flow.PolicySnapshot.ExpireAfterDays = s.defaultExpireDays
 		}
 		flow.PolicySnapshot.ExpireAfterDays = days
+		flow.Discord.MessageID = ""
 		flow.UpdatedAt = now
 		flow.Version = expectedVersion + 1
-		finalizeChannelID = flow.Discord.ChannelID
-		finalizeMessageID = flow.Discord.MessageID
-		finalizeDisplayName = strings.TrimSpace(flow.DisplayName)
 		if err := tx.UpsertFlowCAS(ctx, flow, expectedVersion); err != nil {
 			return err
 		}
@@ -825,7 +851,7 @@ func (s *Service) ApplyAIDelayDays(ctx context.Context, itemID string, days int)
 		if display == "" {
 			display = "item"
 		}
-		content := fmt.Sprintf("Decision: DELAY %d days for %s (AI).", days, display)
+		content := fmt.Sprintf("Resolved: DELAYED %d days for %s (AI).", days, display)
 		if err := s.discord.FinalizeHITLPrompt(ctx, finalizeChannelID, finalizeMessageID, content); err != nil {
 			s.logger.Warn("failed to finalize ai delay HITL message", "item_id", itemID, "error", err)
 		}
@@ -1064,7 +1090,7 @@ func parseCustomID(value string) (customID, error) {
 	versionPart := remainder[lastSep+1:]
 
 	switch action {
-	case "archive", "keep", "delay", "delete":
+	case "archive", "delay", "delete":
 	default:
 		return customID{}, fmt.Errorf("unsupported action %q", action)
 	}
@@ -1141,15 +1167,54 @@ func interactionMessageUpdateResponse(content string) *discordgo.InteractionResp
 }
 
 func interactionDecisionUpdateResponse(action string, itemDisplay string) *discordgo.InteractionResponse {
-	decision := strings.TrimSpace(action)
-	if decision == "" {
-		decision = "unknown"
-	}
+	decision := interactionDecisionLabel(action)
 	item := strings.TrimSpace(itemDisplay)
 	if item == "" {
 		item = "item"
 	}
-	return interactionMessageUpdateResponse(fmt.Sprintf("Decision: %s for %s", strings.ToUpper(decision), item))
+	return interactionMessageUpdateResponse(fmt.Sprintf("Resolved: %s for %s", decision, item))
+}
+
+func staleDecisionMessage(flow domain.Flow, itemDisplay string) string {
+	item := strings.TrimSpace(itemDisplay)
+	if item == "" {
+		item = "item"
+	}
+	decision := strings.TrimSpace(strings.ToLower(flow.HITLOutcome))
+	if decision == "" {
+		switch flow.State {
+		case domain.FlowStateArchived:
+			decision = "archive"
+		case domain.FlowStateDeleteQueued:
+			decision = "delete_requested"
+		case domain.FlowStateDeleted:
+			decision = "delete"
+		case domain.FlowStateActive:
+			decision = "resolved"
+		case domain.FlowStatePendingReview:
+			decision = "delay"
+		default:
+			decision = "resolved"
+		}
+	}
+	return fmt.Sprintf("Resolved: %s for %s", interactionDecisionLabel(decision), item)
+}
+
+func interactionDecisionLabel(action string) string {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "archive":
+		return "ARCHIVED"
+	case "delay":
+		return "DELAYED"
+	case "delete", "delete_requested":
+		return "DELETE REQUESTED"
+	default:
+		v := strings.TrimSpace(action)
+		if v == "" {
+			return "RESOLVED"
+		}
+		return strings.ToUpper(v)
+	}
 }
 
 func jellyfinEventType(t string) string {
@@ -1432,8 +1497,6 @@ func discordActionLexicon(action string) string {
 	switch strings.ToLower(strings.TrimSpace(action)) {
 	case "archive":
 		return "ARCHIVAL"
-	case "keep":
-		return "RETENTION"
 	case "delay":
 		return "DEFER"
 	case "delete":
@@ -1480,6 +1543,13 @@ func formatSeasonLabel(seasonName string, seriesName string, fallback string) st
 		return season + " of " + series
 	}
 	return chooseName(seasonName, seriesName, fallback)
+}
+
+func humanTimeLabel(t time.Time) string {
+	if t.IsZero() {
+		return "unknown"
+	}
+	return t.UTC().Format("2006-01-02 15:04 UTC")
 }
 
 func shortHash(value string) string {

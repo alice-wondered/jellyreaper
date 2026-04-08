@@ -216,7 +216,7 @@ func TestIntegrationWebhookDoesNotDeleteImmediatelyWithShortTimeoutConfig(t *tes
 	}
 
 	var sentPrompts atomic.Int64
-	discordSvc.SetSendPromptHookForTest(func(context.Context, string, string, int64, string, string) (string, error) {
+	discordSvc.SetSendPromptHookForTest(func(context.Context, string, string, int64, string, string, string) (string, error) {
 		sentPrompts.Add(1)
 		return "msg-1", nil
 	})

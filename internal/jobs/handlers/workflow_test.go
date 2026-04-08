@@ -518,12 +518,19 @@ func TestExecuteDeleteHandlerDeletesChildrenForSeriesTarget(t *testing.T) {
 func TestExecuteDeleteHandlerDeletesChildrenForSeasonTarget(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
+	pub, _, _ := ed25519.GenerateKey(nil)
+	discordSvc, err := discord.NewService("", pub)
+	if err != nil {
+		t.Fatalf("discord service: %v", err)
+	}
 
 	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:target:season:season-9",
 			ItemID:      "target:season:season-9",
 			SubjectType: "season",
+			DisplayName: "Season 9",
+			Discord:     domain.DiscordContext{ChannelID: "ch-season", MessageID: "msg-season"},
 			State:       domain.FlowStateDeleteQueued,
 			Version:     0,
 			CreatedAt:   now,
@@ -546,6 +553,11 @@ func TestExecuteDeleteHandlerDeletesChildrenForSeasonTarget(t *testing.T) {
 	}
 
 	deleteCount := 0
+	finalized := false
+	discordSvc.SetEditPromptHookForTest(func(context.Context, string, string, string) error {
+		finalized = true
+		return nil
+	})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete && (r.URL.Path == "/Items/s9e1" || r.URL.Path == "/Items/s9e2") {
 			deleteCount++
@@ -557,11 +569,15 @@ func TestExecuteDeleteHandlerDeletesChildrenForSeasonTarget(t *testing.T) {
 	defer server.Close()
 
 	h := NewExecuteDeleteHandler(store, jellyfin.NewClient(server.URL, "api-key", server.Client()))
+	h.SetDiscordService(discordSvc)
 	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-season", ItemID: "target:season:season-9", IdempotencyKey: "dedupe:season"}); err != nil {
 		t.Fatalf("execute season delete: %v", err)
 	}
 	if deleteCount != 2 {
 		t.Fatalf("expected 2 episode deletes, got %d", deleteCount)
+	}
+	if !finalized {
+		t.Fatal("expected season delete completion to finalize discord message")
 	}
 
 	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
@@ -595,9 +611,14 @@ func TestExecuteDeleteHandlerDeletesChildrenForSeasonTarget(t *testing.T) {
 func TestExecuteDeleteHandlerDeletesMovieProjectionAndSiblingFlows(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
+	pub, _, _ := ed25519.GenerateKey(nil)
+	discordSvc, err := discord.NewService("", pub)
+	if err != nil {
+		t.Fatalf("discord service: %v", err)
+	}
 
 	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
-		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{FlowID: "flow:target:movie:mv-1", ItemID: "target:movie:mv-1", SubjectType: "movie", State: domain.FlowStateDeleteQueued, Version: 0, CreatedAt: now, UpdatedAt: now}, 0); err != nil {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{FlowID: "flow:target:movie:mv-1", ItemID: "target:movie:mv-1", SubjectType: "movie", DisplayName: "Movie One", Discord: domain.DiscordContext{ChannelID: "ch-del", MessageID: "msg-del"}, State: domain.FlowStateDeleteQueued, Version: 0, CreatedAt: now, UpdatedAt: now}, 0); err != nil {
 			return err
 		}
 		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "mv-1", ItemType: "Movie", UpdatedAt: now}); err != nil {
@@ -612,6 +633,11 @@ func TestExecuteDeleteHandlerDeletesMovieProjectionAndSiblingFlows(t *testing.T)
 	}
 
 	deleteCalled := false
+	finalized := false
+	discordSvc.SetEditPromptHookForTest(func(context.Context, string, string, string) error {
+		finalized = true
+		return nil
+	})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete && r.URL.Path == "/Items/mv-1" {
 			deleteCalled = true
@@ -623,11 +649,15 @@ func TestExecuteDeleteHandlerDeletesMovieProjectionAndSiblingFlows(t *testing.T)
 	defer server.Close()
 
 	h := NewExecuteDeleteHandler(store, jellyfin.NewClient(server.URL, "api-key", server.Client()))
+	h.SetDiscordService(discordSvc)
 	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-movie", ItemID: "target:movie:mv-1", IdempotencyKey: "dedupe:movie"}); err != nil {
 		t.Fatalf("execute movie delete: %v", err)
 	}
 	if !deleteCalled {
 		t.Fatal("expected jellyfin movie delete call")
+	}
+	if !finalized {
+		t.Fatal("expected delete completion to finalize discord message")
 	}
 
 	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
@@ -680,7 +710,7 @@ func TestSendHITLPromptHandlerAppliesMinimumResponseWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("discord service: %v", err)
 	}
-	discordSvc.SetSendPromptHookForTest(func(context.Context, string, string, int64, string, string) (string, error) {
+	discordSvc.SetSendPromptHookForTest(func(context.Context, string, string, int64, string, string, string) (string, error) {
 		return "msg-min-window", nil
 	})
 
@@ -713,5 +743,101 @@ func TestSendHITLPromptHandlerAppliesMinimumResponseWindow(t *testing.T) {
 		if job.Kind == domain.JobKindExecuteDelete {
 			t.Fatalf("unexpected execute delete job before minimum window: %#v", job)
 		}
+	}
+}
+
+func TestSendHITLPromptHandlerIncludesLastPlayedStatusLine(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:    "flow:item-last-played",
+			ItemID:    "item-last-played",
+			State:     domain.FlowStatePendingReview,
+			Version:   0,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "item-last-played", LastPlayedAt: now.Add(-6 * time.Hour), UpdatedAt: now})
+	}); err != nil {
+		t.Fatalf("seed flow/media: %v", err)
+	}
+
+	pub, _, _ := ed25519.GenerateKey(nil)
+	discordSvc, err := discord.NewService("", pub)
+	if err != nil {
+		t.Fatalf("discord service: %v", err)
+	}
+	receivedStatus := ""
+	discordSvc.SetSendPromptHookForTest(func(_ context.Context, _ string, _ string, _ int64, _ string, _ string, status string) (string, error) {
+		receivedStatus = status
+		return "msg-status", nil
+	})
+
+	h := NewSendHITLPromptHandler(store, nil, discordSvc, "channel-1", 48*time.Hour)
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "prompt-last-played", ItemID: "item-last-played"}); err != nil {
+		t.Fatalf("handle prompt: %v", err)
+	}
+	if receivedStatus == "" {
+		t.Fatal("expected status line argument to be provided for prompt send")
+	}
+}
+
+func TestSendHITLPromptHandlerSendsNewMessageWhenStoredMessageMissing(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:item-stale-msg",
+			ItemID:      "item-stale-msg",
+			SubjectType: "item",
+			DisplayName: "Stale Message Item",
+			State:       domain.FlowStatePendingReview,
+			Discord:     domain.DiscordContext{ChannelID: "channel-1", MessageID: "msg-stale"},
+			Version:     0,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	pub, _, _ := ed25519.GenerateKey(nil)
+	discordSvc, err := discord.NewService("", pub)
+	if err != nil {
+		t.Fatalf("discord service: %v", err)
+	}
+	sendCount := 0
+	discordSvc.SetSendPromptHookForTest(func(context.Context, string, string, int64, string, string, string) (string, error) {
+		sendCount++
+		return "msg-new", nil
+	})
+
+	h := NewSendHITLPromptHandler(store, nil, discordSvc, "channel-1", 48*time.Hour)
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "prompt-stale-msg", ItemID: "item-stale-msg"}); err != nil {
+		t.Fatalf("handle prompt: %v", err)
+	}
+	if sendCount != 1 {
+		t.Fatalf("expected one prompt send, got %d", sendCount)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(context.Background(), "item-stale-msg")
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatal("expected flow")
+		}
+		if flow.Discord.MessageID != "msg-new" {
+			t.Fatalf("expected new discord message id, got %q", flow.Discord.MessageID)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify flow: %v", err)
 	}
 }

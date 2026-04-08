@@ -39,6 +39,9 @@ func TestHITLArchiveLeavesNoDeletionJob(t *testing.T) {
 	if resp.Data.Content == "" {
 		t.Fatal("expected decision summary content")
 	}
+	if !strings.Contains(resp.Data.Content, "Resolved: ARCHIVED") {
+		t.Fatalf("expected archived decision wording, got %q", resp.Data.Content)
+	}
 
 	flow := mustGetFlow(t, store, targetID)
 	if flow.State != domain.FlowStateArchived {
@@ -64,9 +67,12 @@ func TestHITLDeleteQueuesImmediateDeleteJob(t *testing.T) {
 
 	targetID := "target:item:item-delete"
 	seedFlowForInteraction(t, store, targetID, now)
-	_, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction("delete", targetID, 0, snowflakeIDFor(now)))
+	resp, err := svc.HandleDiscordComponentInteraction(context.Background(), interaction("delete", targetID, 0, snowflakeIDFor(now)))
 	if err != nil {
 		t.Fatalf("handle interaction: %v", err)
+	}
+	if resp == nil || resp.Data == nil || !strings.Contains(resp.Data.Content, "Resolved: DELETE REQUESTED") {
+		t.Fatalf("expected delete requested wording, got %#v", resp)
 	}
 
 	flow := mustGetFlow(t, store, targetID)
@@ -190,7 +196,7 @@ func TestApplyAIDecisionFinalizesOpenHITLPrompt(t *testing.T) {
 		if channelID != "chan-1" || messageID != "msg-1" {
 			t.Fatalf("unexpected finalize target: %s/%s", channelID, messageID)
 		}
-		if !strings.Contains(content, "Decision: ARCHIVE for AI Archive Target (AI).") {
+		if !strings.Contains(content, "Resolved: ARCHIVED for AI Archive Target (AI).") {
 			t.Fatalf("unexpected finalize content: %s", content)
 		}
 		finalized = true
@@ -222,6 +228,7 @@ func TestApplyAIDecisionUnarchiveEnqueuesEvaluateNow(t *testing.T) {
 			ItemID:      itemID,
 			SubjectType: "item",
 			DisplayName: "AI Unarchive Target",
+			Discord:     domain.DiscordContext{ChannelID: "ch-unarchive", MessageID: "msg-unarchive"},
 			State:       domain.FlowStateArchived,
 			Version:     0,
 			PolicySnapshot: domain.PolicySnapshot{
@@ -244,6 +251,9 @@ func TestApplyAIDecisionUnarchiveEnqueuesEvaluateNow(t *testing.T) {
 	flow := mustGetFlow(t, store, itemID)
 	if flow.State != domain.FlowStateActive {
 		t.Fatalf("expected active state, got %s", flow.State)
+	}
+	if flow.Discord.MessageID != "" {
+		t.Fatalf("expected unarchive to clear stale discord message id, got %q", flow.Discord.MessageID)
 	}
 
 	jobs, err := store.LeaseDueJobs(context.Background(), now, 10, "test", time.Minute)
@@ -295,6 +305,12 @@ func TestApplyAIDelayDaysSetsPolicyAndSchedulesEval(t *testing.T) {
 	}
 
 	flow := mustGetFlow(t, store, itemID)
+	if flow.State != domain.FlowStateActive {
+		t.Fatalf("expected active state after ai delay, got %s", flow.State)
+	}
+	if flow.Discord.MessageID != "" {
+		t.Fatalf("expected ai delay to clear stale discord message id, got %q", flow.Discord.MessageID)
+	}
 	if flow.PolicySnapshot.ExpireAfterDays != 12 {
 		t.Fatalf("expected policy expire days 12, got %d", flow.PolicySnapshot.ExpireAfterDays)
 	}
@@ -354,7 +370,7 @@ func TestApplyAIDelayDaysDefersLazilyAndFinalizesHITLPrompt(t *testing.T) {
 		if channelID != "ch-delay" || messageID != "msg-delay" {
 			t.Fatalf("unexpected finalize target: %s/%s", channelID, messageID)
 		}
-		if !strings.Contains(content, "Decision: DELAY 7 days for Season Delay Prompt (AI).") {
+		if !strings.Contains(content, "Resolved: DELAYED 7 days for Season Delay Prompt (AI).") {
 			t.Fatalf("unexpected finalize content: %s", content)
 		}
 		finalized = true
@@ -366,6 +382,13 @@ func TestApplyAIDelayDaysDefersLazilyAndFinalizesHITLPrompt(t *testing.T) {
 	}
 	if !finalized {
 		t.Fatal("expected HITL message to be finalized on ai delay")
+	}
+	flow := mustGetFlow(t, store, itemID)
+	if flow.State != domain.FlowStateActive {
+		t.Fatalf("expected active state after ai delay, got %s", flow.State)
+	}
+	if flow.Discord.MessageID != "" {
+		t.Fatalf("expected ai delay to clear discord message id, got %q", flow.Discord.MessageID)
 	}
 
 	jobsEarly, err := store.LeaseDueJobs(context.Background(), now.Add(6*24*time.Hour), 20, "test", time.Minute)
@@ -507,7 +530,7 @@ func TestHITLDelaySchedulesFutureEvaluation(t *testing.T) {
 	}
 
 	flow := mustGetFlow(t, store, targetID)
-	if flow.State != domain.FlowStatePendingReview {
+	if flow.State != domain.FlowStateActive {
 		t.Fatalf("unexpected flow state: %s", flow.State)
 	}
 	if want := now.Add(24 * time.Hour); !flow.NextActionAt.Equal(want) {
@@ -1264,7 +1287,7 @@ func TestPlaybackEventClosesOpenHITLAndReschedulesEvaluation(t *testing.T) {
 		if channelID != "ch-play" || messageID != "msg-play" {
 			t.Fatalf("unexpected finalize target: %s/%s", channelID, messageID)
 		}
-		if !strings.Contains(content, "Decision: KEEP for Playback Recovery Movie (auto via new playback).") {
+		if !strings.Contains(content, "Resolved: PLAYED at") || !strings.Contains(content, "for Playback Recovery Movie") {
 			t.Fatalf("unexpected finalize content: %s", content)
 		}
 		finalized = true
@@ -1429,7 +1452,7 @@ func TestDiscordInteractionUsesSnowflakeTimestamp(t *testing.T) {
 	}
 
 	seedFlowForInteraction(t, store, "target:item:item-snowflake", ts.UTC())
-	_, err = svc.HandleDiscordComponentInteraction(context.Background(), interaction("keep", "target:item:item-snowflake", 0, id))
+	_, err = svc.HandleDiscordComponentInteraction(context.Background(), interaction("archive", "target:item:item-snowflake", 0, id))
 	if err != nil {
 		t.Fatalf("handle interaction: %v", err)
 	}
@@ -1437,5 +1460,8 @@ func TestDiscordInteractionUsesSnowflakeTimestamp(t *testing.T) {
 	flow := mustGetFlow(t, store, "target:item:item-snowflake")
 	if !flow.UpdatedAt.Equal(ts.UTC()) {
 		t.Fatalf("expected flow updated from discord snowflake timestamp, got=%s want=%s", flow.UpdatedAt, ts.UTC())
+	}
+	if flow.State != domain.FlowStateArchived {
+		t.Fatalf("expected archive action state, got %s", flow.State)
 	}
 }

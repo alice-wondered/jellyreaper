@@ -35,7 +35,7 @@ type MentionMessage struct {
 type Service struct {
 	publicKey ed25519.PublicKey
 	session   *discordgo.Session
-	sendHook  func(context.Context, string, string, int64, string, string) (string, error)
+	sendHook  func(context.Context, string, string, int64, string, string, string) (string, error)
 	editHook  func(context.Context, string, string, string) error
 
 	httpClient      *http.Client
@@ -146,9 +146,10 @@ func (s *Service) HandleIncomingInteraction(ctx context.Context, interaction Inc
 	}
 }
 
-func (s *Service) SendHITLPrompt(ctx context.Context, channelID, itemID string, version int64, displayName string, imageURL string) (string, error) {
+func (s *Service) SendHITLPrompt(ctx context.Context, channelID, itemID string, version int64, displayName string, imageURL string, statusLine string) (string, error) {
+	_ = statusLine
 	if s.sendHook != nil {
-		return s.sendHook(ctx, channelID, itemID, version, displayName, imageURL)
+		return s.sendHook(ctx, channelID, itemID, version, displayName, imageURL, statusLine)
 	}
 
 	if s.session == nil {
@@ -163,13 +164,14 @@ func (s *Service) SendHITLPrompt(ctx context.Context, channelID, itemID string, 
 		contentName = itemID
 	}
 
+	content := fmt.Sprintf("**%s**", contentName)
+
 	send := &discordgo.MessageSend{
-		Content: fmt.Sprintf("Review needed: **%s**\nChoose an action for this media group.", contentName),
+		Content: content,
 		Components: []discordgo.MessageComponent{
 			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
 				discordgo.Button{Label: "Archive", Style: discordgo.SecondaryButton, CustomID: customID("archive", itemID, version)},
 				discordgo.Button{Label: "Delay", Style: discordgo.PrimaryButton, CustomID: customID("delay", itemID, version)},
-				discordgo.Button{Label: "Keep", Style: discordgo.SuccessButton, CustomID: customID("keep", itemID, version)},
 				discordgo.Button{Label: "Delete", Style: discordgo.DangerButton, CustomID: customID("delete", itemID, version)},
 			}},
 		},
@@ -200,12 +202,26 @@ func (s *Service) SendHITLPrompt(ctx context.Context, channelID, itemID string, 
 	return msg.ID, nil
 }
 
-func (s *Service) SetSendPromptHookForTest(hook func(context.Context, string, string, int64, string, string) (string, error)) {
+func (s *Service) SetSendPromptHookForTest(hook func(context.Context, string, string, int64, string, string, string) (string, error)) {
 	s.sendHook = hook
 }
 
 func (s *Service) SetEditPromptHookForTest(hook func(context.Context, string, string, string) error) {
 	s.editHook = hook
+}
+
+func (s *Service) HITLPromptExists(ctx context.Context, channelID, messageID string) (bool, error) {
+	if strings.TrimSpace(channelID) == "" || strings.TrimSpace(messageID) == "" {
+		return false, nil
+	}
+	if s.session == nil {
+		return false, nil
+	}
+	msg, err := s.session.ChannelMessage(channelID, messageID)
+	if err != nil {
+		return false, nil
+	}
+	return msg != nil, nil
 }
 
 func (s *Service) FinalizeHITLPrompt(ctx context.Context, channelID, messageID, content string) error {
@@ -220,10 +236,20 @@ func (s *Service) FinalizeHITLPrompt(ctx context.Context, channelID, messageID, 
 	}
 
 	trimmed := strings.TrimSpace(content)
+	title := "item"
+	if msg, err := s.session.ChannelMessage(channelID, messageID); err == nil && msg != nil {
+		title = firstLineTitle(msg.Content)
+	}
+	trimmed = fmt.Sprintf("**%s**\n\n%s", title, trimmed)
 	emptyComponents := []discordgo.MessageComponent{}
 	edit := &discordgo.MessageEdit{ID: messageID, Channel: channelID, Content: &trimmed, Components: &emptyComponents}
 	if _, err := s.session.ChannelMessageEditComplex(edit); err != nil {
 		return fmt.Errorf("finalize hitl prompt: %w", err)
+	}
+
+	emoji := finalizeEmojiForOutcome(content)
+	if emoji != "" {
+		_ = s.session.MessageReactionAdd(channelID, messageID, emoji)
 	}
 	return nil
 }
@@ -451,6 +477,37 @@ func shouldRetryHITLPromptWithoutEmbed(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "url_type_invalid_url") || (strings.Contains(msg, "invalid form body") && strings.Contains(msg, "embeds"))
+}
+
+func firstLineTitle(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return "item"
+	}
+	line := strings.SplitN(trimmed, "\n", 2)[0]
+	line = strings.TrimSpace(line)
+	line = strings.TrimPrefix(line, "**")
+	line = strings.TrimSuffix(line, "**")
+	if line == "" {
+		return "item"
+	}
+	return line
+}
+
+func finalizeEmojiForOutcome(outcome string) string {
+	l := strings.ToLower(strings.TrimSpace(outcome))
+	switch {
+	case strings.Contains(l, "archiv"):
+		return "📦"
+	case strings.Contains(l, "delete"):
+		return "🗑️"
+	case strings.Contains(l, "delay"):
+		return "⏸️"
+	case strings.Contains(l, "played"):
+		return "▶️"
+	default:
+		return "✅"
+	}
 }
 
 func (s *Service) fetchImage(ctx context.Context, imageURL string) ([]byte, string, error) {
