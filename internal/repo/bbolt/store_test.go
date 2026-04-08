@@ -2,6 +2,7 @@ package bbolt
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -229,5 +230,111 @@ func TestLeaseDueJobsCleansStaleDueIndexEntries(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("verify stale due index removal: %v", err)
+	}
+}
+
+func TestSearchFlowsUsesTrigramIndex(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(ctx, domain.Flow{FlowID: "flow:target:series:office", ItemID: "target:series:office", SubjectType: "series", DisplayName: "The Office", Version: 0, CreatedAt: now, UpdatedAt: now}, 0); err != nil {
+			return err
+		}
+		if err := tx.UpsertFlowCAS(ctx, domain.Flow{FlowID: "flow:target:series:offgrid", ItemID: "target:series:offgrid", SubjectType: "series", DisplayName: "Off Grid", Version: 0, CreatedAt: now, UpdatedAt: now}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertFlowCAS(ctx, domain.Flow{FlowID: "flow:target:movie:office-space", ItemID: "target:movie:office-space", SubjectType: "movie", DisplayName: "Office Space", Version: 0, CreatedAt: now, UpdatedAt: now}, 0)
+	}); err != nil {
+		t.Fatalf("seed flows: %v", err)
+	}
+
+	var series []domain.Flow
+	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+		var err error
+		series, err = tx.SearchFlows(ctx, "office", "series", 10)
+		return err
+	}); err != nil {
+		t.Fatalf("search series flows: %v", err)
+	}
+	if len(series) != 1 || series[0].ItemID != "target:series:office" {
+		t.Fatalf("unexpected series search results: %#v", series)
+	}
+
+	var all []domain.Flow
+	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+		var err error
+		all, err = tx.SearchFlows(ctx, "off", "", 10)
+		return err
+	}); err != nil {
+		t.Fatalf("search all flows: %v", err)
+	}
+	if len(all) < 2 {
+		t.Fatalf("expected multiple fuzzy matches for off, got %#v", all)
+	}
+}
+
+func TestSearchFlowsIndexUpdatesOnRenameAndDelete(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(ctx, domain.Flow{FlowID: "flow:target:series:office", ItemID: "target:series:office", SubjectType: "series", DisplayName: "Parks and Recreation", Version: 0, CreatedAt: now, UpdatedAt: now}, 0)
+	}); err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(ctx, "target:series:office")
+		if err != nil || !found {
+			return fmt.Errorf("get flow before rename: found=%v err=%w", found, err)
+		}
+		flow.DisplayName = "The Workspace"
+		flow.UpdatedAt = now.Add(time.Minute)
+		flow.Version++
+		return tx.UpsertFlowCAS(ctx, flow, flow.Version-1)
+	}); err != nil {
+		t.Fatalf("rename flow: %v", err)
+	}
+
+	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+		results, err := tx.SearchFlows(ctx, "parks", "", 10)
+		if err != nil {
+			return err
+		}
+		if len(results) != 0 {
+			return fmt.Errorf("expected parks search to be empty after rename, got %#v", results)
+		}
+		results, err = tx.SearchFlows(ctx, "workspace", "", 10)
+		if err != nil {
+			return err
+		}
+		if len(results) != 1 || results[0].ItemID != "target:series:office" {
+			return fmt.Errorf("unexpected workspace search results: %#v", results)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify search after rename: %v", err)
+	}
+
+	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+		return tx.DeleteFlow(ctx, "target:series:office")
+	}); err != nil {
+		t.Fatalf("delete flow: %v", err)
+	}
+
+	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+		results, err := tx.SearchFlows(ctx, "workspace", "", 10)
+		if err != nil {
+			return err
+		}
+		if len(results) != 0 {
+			return fmt.Errorf("expected no results after delete, got %#v", results)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify search after delete: %v", err)
 	}
 }

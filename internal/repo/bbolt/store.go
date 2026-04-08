@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,13 +21,15 @@ var _ repo.Repository = (*Store)(nil)
 var _ repo.TxRepository = (*txRepo)(nil)
 
 var (
-	bucketMedia    = []byte("media")
-	bucketFlows    = []byte("flows")
-	bucketEvents   = []byte("events")
-	bucketJobs     = []byte("jobs")
-	bucketDueIndex = []byte("due_index")
-	bucketDedupe   = []byte("dedupe")
-	bucketMeta     = []byte("meta")
+	bucketMedia         = []byte("media")
+	bucketFlows         = []byte("flows")
+	bucketFlowSearchDoc = []byte("flow_search_doc")
+	bucketFlowSearchTri = []byte("flow_search_tri")
+	bucketEvents        = []byte("events")
+	bucketJobs          = []byte("jobs")
+	bucketDueIndex      = []byte("due_index")
+	bucketDedupe        = []byte("dedupe")
+	bucketMeta          = []byte("meta")
 )
 
 type Store struct {
@@ -45,7 +48,7 @@ func Open(path string, mode os.FileMode, options *bbolt.Options) (*Store, error)
 
 	store := &Store{db: db}
 	if err := store.db.Update(func(tx *bbolt.Tx) error {
-		for _, name := range [][]byte{bucketMedia, bucketFlows, bucketEvents, bucketJobs, bucketDueIndex, bucketDedupe, bucketMeta} {
+		for _, name := range [][]byte{bucketMedia, bucketFlows, bucketFlowSearchDoc, bucketFlowSearchTri, bucketEvents, bucketJobs, bucketDueIndex, bucketDedupe, bucketMeta} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return fmt.Errorf("create bucket %s: %w", string(name), err)
 			}
@@ -363,6 +366,98 @@ func (t *txRepo) ListFlows(ctx context.Context) ([]domain.Flow, error) {
 	return out, nil
 }
 
+func (t *txRepo) SearchFlows(ctx context.Context, query string, subjectType string, limit int) ([]domain.Flow, error) {
+	if err := checkContext(ctx); err != nil {
+		return nil, err
+	}
+	query = normalizeSearchText(query)
+	subjectType = strings.ToLower(strings.TrimSpace(subjectType))
+	if query == "" {
+		return []domain.Flow{}, nil
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+
+	tri, err := requireBucket(t.tx, bucketFlowSearchTri)
+	if err != nil {
+		return nil, err
+	}
+	flowsBucket, err := requireBucket(t.tx, bucketFlows)
+	if err != nil {
+		return nil, err
+	}
+
+	grams := trigrams(query)
+	if len(grams) == 0 {
+		return []domain.Flow{}, nil
+	}
+
+	counts := map[string]int{}
+	for _, g := range grams {
+		prefix := keyBytes(g + "\x00")
+		c := tri.Cursor()
+		for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
+			parts := bytes.SplitN(k, []byte("\x00"), 2)
+			if len(parts) != 2 {
+				continue
+			}
+			id := string(parts[1])
+			counts[id]++
+		}
+	}
+
+	type scored struct {
+		flow  domain.Flow
+		score int
+	}
+	results := make([]scored, 0)
+	for id, c := range counts {
+		if c != len(grams) {
+			continue
+		}
+		if err := checkContext(ctx); err != nil {
+			return nil, err
+		}
+		var flow domain.Flow
+		found, err := bucketGetJSON(flowsBucket, id, &flow)
+		if err != nil {
+			return nil, fmt.Errorf("decode flow %s: %w", id, err)
+		}
+		if !found {
+			continue
+		}
+		if subjectType != "" && strings.ToLower(strings.TrimSpace(flow.SubjectType)) != subjectType {
+			continue
+		}
+		results = append(results, scored{flow: flow, score: c})
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		ai := strings.ToLower(results[i].flow.DisplayName)
+		aj := strings.ToLower(results[j].flow.DisplayName)
+		if results[i].score != results[j].score {
+			return results[i].score > results[j].score
+		}
+		if ai == query && aj != query {
+			return true
+		}
+		if aj == query && ai != query {
+			return false
+		}
+		return len(ai) < len(aj)
+	})
+
+	if len(results) > limit {
+		results = results[:limit]
+	}
+	out := make([]domain.Flow, 0, len(results))
+	for _, r := range results {
+		out = append(out, r.flow)
+	}
+	return out, nil
+}
+
 func (t *txRepo) UpsertFlowCAS(ctx context.Context, flow domain.Flow, expectedVersion int64) error {
 	if err := checkContext(ctx); err != nil {
 		return err
@@ -371,6 +466,14 @@ func (t *txRepo) UpsertFlowCAS(ctx context.Context, flow domain.Flow, expectedVe
 		return fmt.Errorf("upsert flow: item id required: %w", ErrInvalidInput)
 	}
 	b, err := requireBucket(t.tx, bucketFlows)
+	if err != nil {
+		return err
+	}
+	searchDoc, err := requireBucket(t.tx, bucketFlowSearchDoc)
+	if err != nil {
+		return err
+	}
+	searchTri, err := requireBucket(t.tx, bucketFlowSearchTri)
 	if err != nil {
 		return err
 	}
@@ -393,6 +496,14 @@ func (t *txRepo) UpsertFlowCAS(ctx context.Context, flow domain.Flow, expectedVe
 	if err := bucketPutJSON(b, flow.ItemID, flow); err != nil {
 		return fmt.Errorf("persist flow %s: %w", flow.ItemID, err)
 	}
+	if found {
+		if err := removeFlowSearchIndex(searchDoc, searchTri, current.ItemID); err != nil {
+			return err
+		}
+	}
+	if err := putFlowSearchIndex(searchDoc, searchTri, flow); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -405,6 +516,17 @@ func (t *txRepo) DeleteFlow(ctx context.Context, itemID string) error {
 	}
 	b, err := requireBucket(t.tx, bucketFlows)
 	if err != nil {
+		return err
+	}
+	searchDoc, err := requireBucket(t.tx, bucketFlowSearchDoc)
+	if err != nil {
+		return err
+	}
+	searchTri, err := requireBucket(t.tx, bucketFlowSearchTri)
+	if err != nil {
+		return err
+	}
+	if err := removeFlowSearchIndex(searchDoc, searchTri, itemID); err != nil {
 		return err
 	}
 	return b.Delete(keyBytes(itemID))
@@ -763,6 +885,84 @@ func dueIndexKey(runAt time.Time, jobID string) string {
 
 func dueIndexKeyBytes(runAt time.Time, jobID string) []byte {
 	return keyBytes(dueIndexKey(runAt, jobID))
+}
+
+func putFlowSearchIndex(searchDoc *bbolt.Bucket, searchTri *bbolt.Bucket, flow domain.Flow) error {
+	text := flowSearchText(flow)
+	if err := searchDoc.Put(keyBytes(flow.ItemID), keyBytes(text)); err != nil {
+		return fmt.Errorf("persist flow search doc %s: %w", flow.ItemID, err)
+	}
+	for _, g := range trigrams(text) {
+		if err := searchTri.Put(keyBytes(g+"\x00"+flow.ItemID), []byte{1}); err != nil {
+			return fmt.Errorf("persist flow trigram %s for %s: %w", g, flow.ItemID, err)
+		}
+	}
+	return nil
+}
+
+func removeFlowSearchIndex(searchDoc *bbolt.Bucket, searchTri *bbolt.Bucket, itemID string) error {
+	raw := searchDoc.Get(keyBytes(itemID))
+	if raw == nil {
+		return nil
+	}
+	text := string(raw)
+	for _, g := range trigrams(text) {
+		if err := searchTri.Delete(keyBytes(g + "\x00" + itemID)); err != nil {
+			return fmt.Errorf("remove flow trigram %s for %s: %w", g, itemID, err)
+		}
+	}
+	if err := searchDoc.Delete(keyBytes(itemID)); err != nil {
+		return fmt.Errorf("remove flow search doc %s: %w", itemID, err)
+	}
+	return nil
+}
+
+func flowSearchText(flow domain.Flow) string {
+	return normalizeSearchText(strings.TrimSpace(flow.DisplayName + " " + flow.ItemID))
+}
+
+func normalizeSearchText(input string) string {
+	input = strings.ToLower(strings.TrimSpace(input))
+	if input == "" {
+		return ""
+	}
+	b := strings.Builder{}
+	b.Grow(len(input))
+	lastSpace := false
+	for _, r := range input {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			lastSpace = false
+			continue
+		}
+		if !lastSpace {
+			b.WriteByte(' ')
+			lastSpace = true
+		}
+	}
+	return strings.TrimSpace(strings.Join(strings.Fields(b.String()), " "))
+}
+
+func trigrams(input string) []string {
+	normalized := normalizeSearchText(input)
+	if normalized == "" {
+		return nil
+	}
+	r := []rune(normalized)
+	if len(r) < 3 {
+		return []string{normalized}
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(r)-2)
+	for i := 0; i+3 <= len(r); i++ {
+		g := string(r[i : i+3])
+		if _, ok := seen[g]; ok {
+			continue
+		}
+		seen[g] = struct{}{}
+		out = append(out, g)
+	}
+	return out
 }
 
 func keyBytes(key string) []byte {

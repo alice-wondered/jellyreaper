@@ -881,23 +881,18 @@ func (h *Harness) findFlowMatches(ctx context.Context, query string) ([]domain.F
 }
 
 func (h *Harness) findFlowMatchesFiltered(ctx context.Context, query string, subjectType string) ([]domain.Flow, error) {
-	matches := make([]domain.Flow, 0)
 	query = strings.TrimSpace(strings.ToLower(query))
 	subjectType = strings.TrimSpace(strings.ToLower(subjectType))
+	if query == "" {
+		return []domain.Flow{}, nil
+	}
+	matches := make([]domain.Flow, 0)
 	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
-		flows, err := tx.ListFlows(ctx)
+		flows, err := tx.SearchFlows(ctx, query, subjectType, 50)
 		if err != nil {
 			return err
 		}
-		for _, f := range flows {
-			if subjectType != "" && strings.ToLower(strings.TrimSpace(f.SubjectType)) != subjectType {
-				continue
-			}
-			hay := strings.ToLower(strings.TrimSpace(f.DisplayName + " " + f.ItemID))
-			if strings.Contains(hay, query) {
-				matches = append(matches, f)
-			}
-		}
+		matches = append(matches, flows...)
 		return nil
 	})
 	if err != nil {
