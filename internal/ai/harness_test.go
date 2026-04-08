@@ -410,6 +410,28 @@ func TestRememberAliasToolStoresCustomPhrase(t *testing.T) {
 	}
 }
 
+func TestDelayTargetDays_UpdatesFlowViaService(t *testing.T) {
+	store := newTestStore(t)
+	seedFlow(t, store, "target:season:s-delay", "Season Delay", domain.FlowStatePendingReview)
+
+	h := NewHarness(store, "", "")
+	h.SetDecisionService(app.NewService(store, nil, nil))
+	threadID := "thread-delay"
+
+	out, _, err := h.delayTargetDays(context.Background(), threadID, "season delay", 9)
+	if err != nil {
+		t.Fatalf("delay target days: %v", err)
+	}
+	if !strings.Contains(out, "\"status\":\"done\"") || !strings.Contains(out, "\"days\":9") {
+		t.Fatalf("expected done delay payload, got: %s", out)
+	}
+
+	flow := mustGetFlow(t, store, "target:season:s-delay")
+	if flow.PolicySnapshot.ExpireAfterDays != 9 {
+		t.Fatalf("expected policy days=9, got %d", flow.PolicySnapshot.ExpireAfterDays)
+	}
+}
+
 func TestScheduleDeleteProjection_UsesProjectionSelectionFlow(t *testing.T) {
 	store := newTestStore(t)
 	seedFlow(t, store, "target:season:s-1", "Season 1 of The Office", domain.FlowStateActive)

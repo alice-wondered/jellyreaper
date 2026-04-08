@@ -203,6 +203,69 @@ func TestEvaluatePolicyFallsBackToCreatedAtWhenNeverPlayed(t *testing.T) {
 	}
 }
 
+func TestEvaluatePolicyUsesGlobalReviewDaysMetaLazily(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+	lastPlayed := now.Add(-2 * time.Hour)
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.SetMeta(context.Background(), "settings.review_days", "60"); err != nil {
+			return err
+		}
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID:       "item-global-review",
+			ItemType:     "Movie",
+			LastPlayedAt: lastPlayed,
+			CreatedAt:    now.Add(-10 * 24 * time.Hour),
+			UpdatedAt:    now,
+		}); err != nil {
+			return err
+		}
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:item:item-global-review",
+			ItemID:      "target:item:item-global-review",
+			SubjectType: "item",
+			DisplayName: "Global Review Movie",
+			State:       domain.FlowStateActive,
+			Version:     0,
+			PolicySnapshot: domain.PolicySnapshot{
+				ExpireAfterDays: 30,
+				HITLTimeoutHrs:  48,
+				TimeoutAction:   "delete",
+			},
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed flow/media/meta: %v", err)
+	}
+
+	h := NewEvaluatePolicyHandler(store, nil)
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-eval-global-review", ItemID: "target:item:item-global-review"}); err != nil {
+		t.Fatalf("evaluate policy: %v", err)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(context.Background(), "target:item:item-global-review")
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatal("expected flow")
+		}
+		if flow.State != domain.FlowStateActive {
+			t.Fatalf("expected active state, got %s", flow.State)
+		}
+		wantDueAt := lastPlayed.Add(60 * 24 * time.Hour)
+		if flow.NextActionAt.Before(wantDueAt.Add(-time.Minute)) || flow.NextActionAt.After(wantDueAt.Add(time.Minute)) {
+			t.Fatalf("expected due time near %s from global review days, got %s", wantDueAt, flow.NextActionAt)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify flow state: %v", err)
+	}
+}
+
 func TestHITLTimeoutHandlerQueuesDeleteWhenPendingReview(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()

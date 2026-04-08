@@ -186,6 +186,15 @@ func (s *Service) SendHITLPrompt(ctx context.Context, channelID, itemID string, 
 
 	msg, err := s.session.ChannelMessageSendComplex(channelID, send)
 	if err != nil {
+		if len(send.Embeds) > 0 && shouldRetryHITLPromptWithoutEmbed(err) {
+			send.Embeds = nil
+			send.Files = nil
+			msg, retryErr := s.session.ChannelMessageSendComplex(channelID, send)
+			if retryErr == nil {
+				return msg.ID, nil
+			}
+			return "", fmt.Errorf("send hitl prompt retry without embed: %w", retryErr)
+		}
 		return "", fmt.Errorf("send hitl prompt: %w", err)
 	}
 	return msg.ID, nil
@@ -418,7 +427,12 @@ func normalizeHTTPURL(raw string) string {
 	if trimmed == "" {
 		return ""
 	}
-	parsed, err := url.Parse(trimmed)
+	for _, r := range trimmed {
+		if r <= 0x1F || r == 0x7F {
+			return ""
+		}
+	}
+	parsed, err := url.ParseRequestURI(trimmed)
 	if err != nil {
 		return ""
 	}
@@ -429,6 +443,14 @@ func normalizeHTTPURL(raw string) string {
 		return ""
 	}
 	return parsed.String()
+}
+
+func shouldRetryHITLPromptWithoutEmbed(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "url_type_invalid_url") || (strings.Contains(msg, "invalid form body") && strings.Contains(msg, "embeds"))
 }
 
 func (s *Service) fetchImage(ctx context.Context, imageURL string) ([]byte, string, error) {

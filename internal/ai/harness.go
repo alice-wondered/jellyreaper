@@ -20,9 +20,6 @@ import (
 )
 
 const (
-	metaReviewDays = "settings.review_days"
-	metaDeferDays  = "settings.defer_days"
-
 	historyLineCapacity = 20
 	maxThreadContexts   = 256
 
@@ -46,6 +43,9 @@ type Harness struct {
 
 type DecisionService interface {
 	ApplyAIDecision(context.Context, string, string) error
+	ApplyAIDelayDays(context.Context, string, int) error
+	SetGlobalReviewDays(context.Context, int) error
+	SetGlobalDeferDays(context.Context, int) error
 }
 
 type ringBuffer struct {
@@ -158,7 +158,7 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 		"Only handle requests related to this media server and its review/archive workflow.",
 		storageSkill,
 		"Use tools to gather data and take actions.",
-		"Tool usage guide: list_ready for queue overviews; fuzzy_search_targets for discovery; query_target_state to inspect one target; remember_alias to bind user phrases to a target; archive_target for archive/unarchive intents; schedule_delete for deletion scheduling regardless of whether target is item/movie/season/series; choose_candidate when user provides a numbered option; confirm_pending for yes/no confirmations; set_review_days and set_defer_days for policy tuning.",
+		"Tool usage guide: list_ready for queue overviews; fuzzy_search_targets for discovery; query_target_state to inspect one target; remember_alias to bind user phrases to a target; archive_target for archive/unarchive intents; schedule_delete for deletion scheduling on projection targets; delay_target_days to defer a target by an explicit number of days; choose_candidate when user provides a numbered option; confirm_pending for yes/no confirmations; set_review_days and set_defer_days for policy tuning.",
 		"Use schedule_delete for deletion requests; rely on domain logic for item vs projection delete semantics.",
 		"Natural-language target resolution guide: prefer known aliases from thread memory first, then exact title, then partial title, and ask clarifying follow-up when ambiguous.",
 		"When multiple targets are possible, present concise choices and invite a short follow-up reply (for example: `title a`, `title b`, or a clearer title).",
@@ -185,6 +185,7 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 		{Function: shared.FunctionDefinitionParam{Name: "query_target_state", Description: openai.String("Inspect state for a target by title text, or current selection when query omitted."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "remember_alias", Description: openai.String("Store a natural-language alias for a specific target so future follow-ups can resolve quickly."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"alias": map[string]any{"type": "string"}, "target_ref": map[string]any{"type": "string"}}, "required": []string{"alias"}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "schedule_delete", Description: openai.String("Schedule deletion for any target (item/movie/season/series) by title text, alias, or target id."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"target_ref": map[string]any{"type": "string"}}}}},
+		{Function: shared.FunctionDefinitionParam{Name: "delay_target_days", Description: openai.String("Delay a projection target by a specific number of days by updating flow policy/schedule."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"target_ref": map[string]any{"type": "string"}, "days": map[string]any{"type": "integer", "minimum": 1, "maximum": 3650}}, "required": []string{"days"}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "archive_target", Description: openai.String("Start archive or unarchive flow for a target title."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "archived": map[string]any{"type": "boolean"}}, "required": []string{"archived"}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "choose_candidate", Description: openai.String("Choose one of the numbered candidates from the last disambiguation list."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"number": map[string]any{"type": "integer", "minimum": 1}}, "required": []string{"number"}}}},
 		{Function: shared.FunctionDefinitionParam{Name: "confirm_pending", Description: openai.String("Confirm or cancel the pending archive/unarchive action."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"confirmed": map[string]any{"type": "boolean"}}, "required": []string{"confirmed"}}}},
@@ -293,6 +294,8 @@ func (h *Harness) executeToolCall(ctx context.Context, threadID string, tc opena
 		return h.rememberAlias(ctx, threadID, asString(args["alias"]), asString(args["target_ref"]))
 	case "schedule_delete":
 		return h.setDeleteState(ctx, threadID, asString(args["target_ref"]))
+	case "delay_target_days":
+		return h.delayTargetDays(ctx, threadID, asString(args["target_ref"]), asInt(args["days"], 0))
 	case "archive_target":
 		archived := asBool(args["archived"], true)
 		return h.setArchiveState(ctx, threadID, asString(args["query"]), archived)
@@ -387,46 +390,26 @@ func (h *Harness) setReviewDays(ctx context.Context, days int) (string, string, 
 	if days <= 0 || days > 3650 {
 		return "", "", fmt.Errorf("days must be between 1 and 3650")
 	}
-	updated := 0
-	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
-		if err := tx.SetMeta(ctx, metaReviewDays, strconv.Itoa(days)); err != nil {
-			return err
-		}
-		flows, err := tx.ListFlows(ctx)
-		if err != nil {
-			return err
-		}
-		for _, flow := range flows {
-			if flow.State == domain.FlowStateDeleted {
-				continue
-			}
-			if flow.PolicySnapshot.ExpireAfterDays == days {
-				continue
-			}
-			expected := flow.Version
-			flow.PolicySnapshot.ExpireAfterDays = days
-			flow.Version = expected + 1
-			flow.UpdatedAt = time.Now().UTC()
-			if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
-				return err
-			}
-			updated++
-		}
-		return nil
-	})
+	decision := h.getDecisionService()
+	if decision == nil {
+		return "", "", fmt.Errorf("decision service is not configured")
+	}
+	err := decision.SetGlobalReviewDays(ctx, days)
 	if err != nil {
 		return "", "", err
 	}
-	return marshalToolResult(map[string]any{"status": "ok", "days": days, "updated": updated}), "", nil
+	return marshalToolResult(map[string]any{"status": "ok", "days": days}), "", nil
 }
 
 func (h *Harness) setDeferDays(ctx context.Context, days int) (string, string, error) {
-	if days <= 0 || days > 365 {
-		return "", "", fmt.Errorf("days must be between 1 and 365")
+	if days <= 0 || days > 3650 {
+		return "", "", fmt.Errorf("days must be between 1 and 3650")
 	}
-	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
-		return tx.SetMeta(ctx, metaDeferDays, strconv.Itoa(days))
-	})
+	decision := h.getDecisionService()
+	if decision == nil {
+		return "", "", fmt.Errorf("decision service is not configured")
+	}
+	err := decision.SetGlobalDeferDays(ctx, days)
 	if err != nil {
 		return "", "", err
 	}
@@ -582,6 +565,38 @@ func (h *Harness) setDeleteState(ctx context.Context, threadID string, query str
 	h.setThreadState(threadID, state)
 
 	return marshalToolResult(map[string]any{"status": "needs_confirmation", "action": state.PendingAction, "target": h.flowToolPayload(ctx, flow)}), "", nil
+}
+
+func (h *Harness) delayTargetDays(ctx context.Context, threadID string, targetRef string, days int) (string, string, error) {
+	if days <= 0 || days > 3650 {
+		return "", "", fmt.Errorf("days must be between 1 and 3650")
+	}
+	targetID, err := h.resolveTargetRef(ctx, threadID, targetRef)
+	if err != nil {
+		return "", "", err
+	}
+	if strings.TrimSpace(targetID) == "" {
+		return marshalToolResult(map[string]any{"status": "needs_target"}), "", nil
+	}
+	flow, found, err := h.getFlowByID(ctx, targetID)
+	if err != nil {
+		return "", "", err
+	}
+	if !found || !isProjectionSubjectType(flow.SubjectType) {
+		return marshalToolResult(map[string]any{"status": "needs_projection_target"}), "", nil
+	}
+	decision := h.getDecisionService()
+	if decision == nil {
+		return "", "", fmt.Errorf("decision service is not configured")
+	}
+	if err := decision.ApplyAIDelayDays(ctx, targetID, days); err != nil {
+		return "", "", err
+	}
+	state := h.getThreadState(threadID)
+	state.SelectedTargetID = targetID
+	h.rememberFlowAlias(&state, flow, "")
+	h.setThreadState(threadID, state)
+	return marshalToolResult(map[string]any{"status": "done", "action": "delay", "days": days, "target": h.flowToolPayload(ctx, flow)}), "", nil
 }
 
 func (h *Harness) queryTargetState(ctx context.Context, threadID string, query string) (string, string, error) {
