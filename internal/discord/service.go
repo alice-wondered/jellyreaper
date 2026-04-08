@@ -172,7 +172,6 @@ func (s *Service) SendHITLPrompt(ctx context.Context, channelID, itemID string, 
 			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
 				discordgo.Button{Label: "Archive", Style: discordgo.SecondaryButton, CustomID: customID("archive", itemID, version)},
 				discordgo.Button{Label: "Delay", Style: discordgo.PrimaryButton, CustomID: customID("delay", itemID, version)},
-				discordgo.Button{Label: "Keep", Style: discordgo.SuccessButton, CustomID: customID("keep", itemID, version)},
 				discordgo.Button{Label: "Delete", Style: discordgo.DangerButton, CustomID: customID("delete", itemID, version)},
 			}},
 		},

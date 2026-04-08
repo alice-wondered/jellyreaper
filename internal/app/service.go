@@ -540,6 +540,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 	staleVersion := false
 	staleMessage := ""
 	decisionDisplayName := parsed.ItemID
+	resolvedAction := parsed.Action
 
 	err = s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
 		_, defaultDeferWindow, err := s.currentDefaultsFromMeta(ctx, tx)
@@ -588,16 +589,13 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 		}
 
 		flow.UpdatedAt = now
-		flow.HITLOutcome = parsed.Action
+		effectiveAction := parsed.Action
+		resolvedAction = effectiveAction
+		flow.HITLOutcome = effectiveAction
 
-		switch parsed.Action {
+		switch effectiveAction {
 		case "archive":
 			flow.State = domain.FlowStateArchived
-		case "keep":
-			flow.State = domain.FlowStateActive
-			if err := enqueueEvaluatePolicy(ctx, tx, flow, now, "discord_keep", now); err != nil {
-				return err
-			}
 		case "delay":
 			flow.State = domain.FlowStatePendingReview
 			flow.NextActionAt = now.Add(defaultDeferWindow)
@@ -626,14 +624,14 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 			EventID:        "evt:discord:" + shortHash(dedupeKey),
 			FlowID:         flow.FlowID,
 			ItemID:         flow.ItemID,
-			Type:           "discord.interaction." + parsed.Action,
+			Type:           "discord.interaction." + effectiveAction,
 			Source:         "discord",
 			OccurredAt:     now,
 			IdempotencyKey: dedupeKey,
 			Payload: map[string]any{
 				"interaction_id": interaction.InteractionID,
 				"custom_id":      interaction.CustomID,
-				"action":         parsed.Action,
+				"action":         effectiveAction,
 				"version":        parsed.Version,
 			},
 		}
@@ -664,14 +662,14 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 	actor := discordInteractionActor(interaction)
 	s.logger.InfoContext(ctx,
 		"processed discord interaction decision",
-		"lex", discordActionLexicon(parsed.Action),
-		"action", parsed.Action,
+		"lex", discordActionLexicon(resolvedAction),
+		"action", resolvedAction,
 		"subject_type", inferSubjectType(parsed.ItemID),
 		"title", decisionDisplayName,
 		"actor", actor,
 		"item_id", parsed.ItemID,
 	)
-	return interactionDecisionUpdateResponse(parsed.Action, decisionDisplayName), nil
+	return interactionDecisionUpdateResponse(resolvedAction, decisionDisplayName), nil
 }
 
 func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action string) error {
@@ -1087,7 +1085,7 @@ func parseCustomID(value string) (customID, error) {
 	versionPart := remainder[lastSep+1:]
 
 	switch action {
-	case "archive", "keep", "delay", "delete":
+	case "archive", "delay", "delete":
 	default:
 		return customID{}, fmt.Errorf("unsupported action %q", action)
 	}
@@ -1201,8 +1199,6 @@ func interactionDecisionLabel(action string) string {
 	switch strings.ToLower(strings.TrimSpace(action)) {
 	case "archive":
 		return "ARCHIVED"
-	case "keep":
-		return "KEPT"
 	case "delay":
 		return "DELAYED"
 	case "delete", "delete_requested":
@@ -1496,8 +1492,6 @@ func discordActionLexicon(action string) string {
 	switch strings.ToLower(strings.TrimSpace(action)) {
 	case "archive":
 		return "ARCHIVAL"
-	case "keep":
-		return "RETENTION"
 	case "delay":
 		return "DEFER"
 	case "delete":

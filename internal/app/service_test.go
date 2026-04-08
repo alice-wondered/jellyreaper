@@ -1435,7 +1435,7 @@ func TestDiscordInteractionUsesSnowflakeTimestamp(t *testing.T) {
 	}
 
 	seedFlowForInteraction(t, store, "target:item:item-snowflake", ts.UTC())
-	_, err = svc.HandleDiscordComponentInteraction(context.Background(), interaction("keep", "target:item:item-snowflake", 0, id))
+	_, err = svc.HandleDiscordComponentInteraction(context.Background(), interaction("archive", "target:item:item-snowflake", 0, id))
 	if err != nil {
 		t.Fatalf("handle interaction: %v", err)
 	}
@@ -1443,5 +1443,8 @@ func TestDiscordInteractionUsesSnowflakeTimestamp(t *testing.T) {
 	flow := mustGetFlow(t, store, "target:item:item-snowflake")
 	if !flow.UpdatedAt.Equal(ts.UTC()) {
 		t.Fatalf("expected flow updated from discord snowflake timestamp, got=%s want=%s", flow.UpdatedAt, ts.UTC())
+	}
+	if flow.State != domain.FlowStateArchived {
+		t.Fatalf("expected archive action state, got %s", flow.State)
 	}
 }

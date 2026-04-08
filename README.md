@@ -6,7 +6,7 @@ JellyReaper is a media lifecycle management server for Jellyfin. It ingests Jell
 
 At a high level:
 - It watches Jellyfin events and maintains durable flow state in bbolt.
-- It sends Discord decision prompts (`Archive`, `Delay`, `Keep`, `Delete`) and executes queued actions safely.
+- It sends Discord decision prompts (`Archive`, `Delay`, `Delete`) and executes queued actions safely.
 - It supports backfill/reconciliation so startup and drift recovery are operationally reliable.
 - It ships an optional Discord @mention AI assistant that can discover projection targets, inspect state, and submit domain-safe decisions.
 
