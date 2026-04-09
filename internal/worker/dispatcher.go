@@ -69,6 +69,11 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job domain.JobRecord) error {
 		if failErr := d.repository.FailJob(ctx, job.JobID, err.Error(), retryAt, terminal); failErr != nil {
 			return fmt.Errorf("mark job failed %s: %w", job.JobID, failErr)
 		}
+		if terminal && job.Kind == domain.JobKindExecuteDelete {
+			if markErr := d.markDeleteFlowFailed(ctx, job); markErr != nil {
+				d.logger.Warn("failed to mark delete flow failed", "lex", "DELETION", "job_id", job.JobID, "item_id", job.ItemID, "error", markErr)
+			}
+		}
 		return nil
 	}
 
@@ -80,6 +85,27 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job domain.JobRecord) error {
 	fields = append(fields, d.jobOutcomeFields(ctx, job)...)
 	d.logger.Info("job completed", fields...)
 	return nil
+}
+
+func (d *Dispatcher) markDeleteFlowFailed(ctx context.Context, job domain.JobRecord) error {
+	now := d.now().UTC()
+	return d.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(ctx, job.ItemID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return nil
+		}
+		if flow.State != domain.FlowStateDeleteInProgress && flow.State != domain.FlowStateDeleteQueued {
+			return nil
+		}
+		expected := flow.Version
+		flow.State = domain.FlowStateDeleteFailed
+		flow.UpdatedAt = now
+		flow.Version = expected + 1
+		return tx.UpsertFlowCAS(ctx, flow, expected)
+	})
 }
 
 func (d *Dispatcher) jobOutcomeFields(ctx context.Context, job domain.JobRecord) []any {

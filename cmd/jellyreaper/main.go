@@ -365,14 +365,14 @@ func runBackfillOnce(ctx context.Context, logger *slog.Logger, repository repo.R
 		cursor = nextCursor
 	}
 
-	if err := saveBackfillCheckpoint(ctx, repository, cursor.MaxSeen); err != nil {
+	completedAt := time.Now().UTC()
+	if err := saveBackfillCheckpoint(ctx, repository, completedAt); err != nil {
 		logger.Error("save backfill checkpoint failed", "error", err)
 	}
 	if err := clearBackfillCursor(ctx, repository); err != nil {
 		logger.Warn("clear backfill cursor failed", "error", err)
 	}
 
-	completedAt := time.Now().UTC()
 	logger.Info("backfill completed", "since", cursor.Since, "plays_fetched", cursor.PlaysProcessed, "items_fetched", cursor.ItemsProcessed, "duration", completedAt.Sub(startedAt).String())
 	if isStartup && cfg.DiscordChannelID != "" {
 		msg := "Backfill complete: plays=" + strconv.Itoa(cursor.PlaysProcessed) + ", items=" + strconv.Itoa(cursor.ItemsProcessed)

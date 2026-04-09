@@ -3,12 +3,17 @@ package worker
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
+
+	bbolt "go.etcd.io/bbolt"
 
 	"jellyreaper/internal/domain"
 	"jellyreaper/internal/jobs"
 	"jellyreaper/internal/repo"
+	bboltrepo "jellyreaper/internal/repo/bbolt"
 )
 
 type fakeRepo struct {
@@ -87,5 +92,67 @@ func TestDispatcher_RetryNonTerminalHandlerError(t *testing.T) {
 	}
 	if r.failCalls != 1 || r.lastTerminal {
 		t.Fatalf("expected non-terminal failure, got fail=%d terminal=%v", r.failCalls, r.lastTerminal)
+	}
+}
+
+func TestDispatcher_MarksDeleteFlowFailedOnTerminalDeleteError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dispatcher.db")
+	store, err := bboltrepo.Open(path, 0o600, &bbolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close(); _ = os.Remove(path) })
+
+	now := time.Now().UTC()
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:movie:delete-fail",
+			ItemID:      "target:movie:delete-fail",
+			SubjectType: "movie",
+			DisplayName: "Delete Fail",
+			State:       domain.FlowStateDeleteInProgress,
+			Version:     1,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0); err != nil {
+			return err
+		}
+		return tx.EnqueueJob(context.Background(), domain.JobRecord{JobID: "job-delete-fail", ItemID: "target:movie:delete-fail", Kind: domain.JobKindExecuteDelete, Status: domain.JobStatusPending, RunAt: now, MaxAttempts: 1})
+	}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	reg, _ := jobs.NewRegistry(testHandler{kind: domain.JobKindExecuteDelete, err: errors.New("boom")})
+	d := NewDispatcher(store, reg, nil)
+	d.now = func() time.Time { return now }
+
+	if err := d.Dispatch(context.Background(), domain.JobRecord{JobID: "job-delete-fail", ItemID: "target:movie:delete-fail", Kind: domain.JobKindExecuteDelete, Attempts: 0, MaxAttempts: 1}); err != nil {
+		t.Fatalf("dispatch terminal delete failure: %v", err)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(context.Background(), "target:movie:delete-fail")
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatal("expected flow to remain present after terminal delete failure")
+		}
+		if flow.State != domain.FlowStateDeleteFailed {
+			t.Fatalf("expected delete_failed state, got %s", flow.State)
+		}
+		job, found, err := tx.GetJob(context.Background(), "job-delete-fail")
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatal("expected failed job to remain present")
+		}
+		if job.Attempts != 1 {
+			t.Fatalf("expected attempts incremented to 1, got %d", job.Attempts)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify delete failure state: %v", err)
 	}
 }

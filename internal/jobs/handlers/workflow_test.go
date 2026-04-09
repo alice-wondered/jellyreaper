@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"crypto/ed25519"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -923,6 +924,58 @@ func TestExecuteDeleteHandlerDeletesMovieProjectionAndSiblingFlows(t *testing.T)
 		return nil
 	}); err != nil {
 		t.Fatalf("verify movie post-delete state: %v", err)
+	}
+}
+
+func TestExecuteDeleteHandlerRetriesDeleteInProgressFlow(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:movie:mv-retry",
+			ItemID:      "target:movie:mv-retry",
+			SubjectType: "movie",
+			DisplayName: "Retry Movie",
+			State:       domain.FlowStateDeleteInProgress,
+			Version:     2,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "mv-retry", ItemType: "Movie", UpdatedAt: now})
+	}); err != nil {
+		t.Fatalf("seed retrying delete flow: %v", err)
+	}
+
+	deleteCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && r.URL.Path == "/Items/mv-retry" {
+			deleteCalls++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	h := NewExecuteDeleteHandler(store, jellyfin.NewClient(server.URL, "api-key", server.Client()))
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-delete-retry", ItemID: "target:movie:mv-retry", IdempotencyKey: "dedupe:delete-retry"}); err != nil {
+		t.Fatalf("retry delete in progress flow: %v", err)
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("expected one jellyfin delete call on retry, got %d", deleteCalls)
+	}
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if _, found, err := tx.GetFlow(context.Background(), "target:movie:mv-retry"); err != nil {
+			return err
+		} else if found {
+			return fmt.Errorf("expected retry delete to remove flow")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify retry delete cleanup: %v", err)
 	}
 }
 

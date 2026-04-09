@@ -1234,6 +1234,61 @@ func TestBackfillReplayPreservesDelayedActiveFlowSchedule(t *testing.T) {
 	}
 }
 
+func TestBackfillReplayRecoversPendingReviewFlowWhenPlaybackAdvanced(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 9, 21, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:         "flow:target:movie:movie-pending-backfill-1",
+			ItemID:         "target:movie:movie-pending-backfill-1",
+			SubjectType:    "movie",
+			DisplayName:    "The Magicians",
+			State:          domain.FlowStatePendingReview,
+			Version:        0,
+			PolicySnapshot: domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 24, TimeoutAction: "delete"},
+			Discord:        domain.DiscordContext{ChannelID: "c1", MessageID: "m1"},
+			CreatedAt:      now.Add(-48 * time.Hour),
+			UpdatedAt:      now.Add(-48 * time.Hour),
+		}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID:       "movie-pending-backfill-1",
+			ItemType:     "Movie",
+			Name:         "The Magicians",
+			LastPlayedAt: now.Add(-40 * 24 * time.Hour),
+			UpdatedAt:    now.Add(-48 * time.Hour),
+		})
+	}); err != nil {
+		t.Fatalf("seed pending flow: %v", err)
+	}
+
+	newPlay := now.Add(-time.Hour)
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+		ItemID:       "movie-pending-backfill-1",
+		ItemType:     "Movie",
+		Name:         "The Magicians",
+		LastPlayedAt: newPlay,
+		PlayCount:    2,
+	}}); err != nil {
+		t.Fatalf("backfill replay with advanced playback: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, "target:movie:movie-pending-backfill-1")
+	if flow.State != domain.FlowStateActive {
+		t.Fatalf("expected pending review flow to recover to active, got %s", flow.State)
+	}
+	if flow.HITLOutcome != "played" {
+		t.Fatalf("expected recovered flow HITL outcome played, got %q", flow.HITLOutcome)
+	}
+	if flow.NextActionAt.Before(newPlay.Add(29 * 24 * time.Hour)) {
+		t.Fatalf("expected recovered flow next action to move beyond new play, got %s", flow.NextActionAt)
+	}
+}
+
 func TestIngestBackfillItemsEpisodeUsesSeriesProviderIDsAndCache(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)
@@ -2292,6 +2347,7 @@ func TestSourceTimestampForPlaybackPrefersLastPlayedAtOverCatalogDate(t *testing
 			DateLastMediaAdded: oldCatalog,
 			LastPlayedAt:       recentPlay,
 		},
+		EventType: "PlaybackStart",
 	}
 
 	ts, ok := sourceTimestampForJellyfinEvent(event)
@@ -2300,5 +2356,56 @@ func TestSourceTimestampForPlaybackPrefersLastPlayedAtOverCatalogDate(t *testing
 	}
 	if !ts.Equal(recentPlay) {
 		t.Fatalf("expected playback timestamp to prefer LastPlayedAt, got=%s want=%s", ts, recentPlay)
+	}
+}
+
+func TestSourceTimestampForCatalogEventPrefersCatalogDateOverLastPlayedAt(t *testing.T) {
+	catalog := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	recentPlay := time.Date(2026, 4, 5, 0, 29, 37, 0, time.UTC)
+
+	event := jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			NotificationType:   "ItemUpdated",
+			ItemType:           "Movie",
+			DateLastMediaAdded: catalog,
+			LastPlayedAt:       recentPlay,
+		},
+		EventType: "ItemUpdated",
+	}
+
+	ts, ok := sourceTimestampForJellyfinEvent(event)
+	if !ok {
+		t.Fatal("expected source timestamp")
+	}
+	if !ts.Equal(catalog) {
+		t.Fatalf("expected catalog event timestamp to prefer DateLastMediaAdded, got=%s want=%s", ts, catalog)
+	}
+}
+
+func TestFetchProviderIDsCachedRetriesAfterPreviousFailure(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"Items":[{"ProviderIds":{"Tvdb":"73244"}}]}`))
+	}))
+	defer server.Close()
+
+	svc.SetJellyfinClient(jellyfin.NewClient(server.URL, "api-key", server.Client()))
+	if _, err := svc.fetchProviderIDsCached(context.Background(), "series-retry-1"); err == nil {
+		t.Fatal("expected first provider id fetch to fail")
+	}
+	ids, err := svc.fetchProviderIDsCached(context.Background(), "series-retry-1")
+	if err != nil {
+		t.Fatalf("expected second provider id fetch to retry and succeed: %v", err)
+	}
+	if ids["tvdb"] != "73244" {
+		t.Fatalf("expected retried provider ids to include tvdb, got %#v", ids)
 	}
 }

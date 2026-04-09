@@ -306,6 +306,7 @@ func (s *Store) FailJob(ctx context.Context, jobID string, errMsg string, retryA
 		job.LeaseOwner = ""
 		job.LeaseUntil = time.Time{}
 		job.UpdatedAt = time.Now().UTC()
+		job.Attempts++
 
 		if markTerminal {
 			job.Status = domain.JobStatusFailed

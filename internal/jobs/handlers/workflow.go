@@ -871,21 +871,28 @@ func (h *ExecuteDeleteHandler) loadFlowForDelete(ctx context.Context, itemID str
 		if err != nil {
 			return err
 		}
-		if !found || flow.State != domain.FlowStateDeleteQueued {
+		if !found {
+			ok = false
+			return nil
+		}
+		switch flow.State {
+		case domain.FlowStateDeleteQueued:
+			expected = flow.Version
+			flow.State = domain.FlowStateDeleteInProgress
+			flow.UpdatedAt = time.Now().UTC()
+			flow.Version = expected + 1
+			if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+				return err
+			}
+			expected = flow.Version
+		case domain.FlowStateDeleteInProgress:
+			expected = flow.Version
+		default:
 			ok = false
 			return nil
 		}
 
-		expected = flow.Version
-		flow.State = domain.FlowStateDeleteInProgress
-		flow.UpdatedAt = time.Now().UTC()
-		flow.Version = expected + 1
-		if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
-			return err
-		}
-
 		out = flow
-		expected = flow.Version
 		ok = true
 		return nil
 	})
