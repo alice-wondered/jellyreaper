@@ -982,6 +982,66 @@ func TestIngestBackfillItemsSchedulesDeferredEvaluateFromLastPlay(t *testing.T) 
 	}
 }
 
+func TestIngestBackfillReplayIsIdempotentForSameRevision(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 8, 14, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	item := jellyfin.ItemSnapshot{
+		ItemID:             "movie-backfill-replay-1",
+		ItemType:           "Movie",
+		Name:               "Replay Safe Movie",
+		DateLastMediaAdded: now.Add(-2 * time.Hour),
+		LastPlayedAt:       now.Add(-3 * time.Hour),
+		PlayCount:          2,
+	}
+
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{item}); err != nil {
+		t.Fatalf("first backfill ingest: %v", err)
+	}
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{item}); err != nil {
+		t.Fatalf("replayed backfill ingest: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, "target:movie:movie-backfill-replay-1")
+	if flow.DisplayName != "Replay Safe Movie" {
+		t.Fatalf("expected stable flow display after replay, got %q", flow.DisplayName)
+	}
+	media := mustGetMedia(t, store, "movie-backfill-replay-1")
+	if media.PlayCountTotal != 2 {
+		t.Fatalf("expected stable play count after replay, got %d", media.PlayCountTotal)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		key := backfillItemDedupeKey(item, 0)
+		processed, err := tx.IsProcessed(context.Background(), key)
+		if err != nil {
+			return err
+		}
+		if !processed {
+			t.Fatalf("expected backfill dedupe key %q to be marked processed", key)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify dedupe key: %v", err)
+	}
+
+	jobs, err := store.LeaseDueJobs(context.Background(), now.Add(365*24*time.Hour), 100, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease jobs: %v", err)
+	}
+	evaluateJobs := 0
+	for _, job := range jobs {
+		if job.Kind == domain.JobKindEvaluatePolicy && job.ItemID == "target:movie:movie-backfill-replay-1" {
+			evaluateJobs++
+		}
+	}
+	if evaluateJobs != 1 {
+		t.Fatalf("expected exactly one evaluate job for replayed backfill item, got %d", evaluateJobs)
+	}
+}
+
 func TestIngestBackfillItemsEpisodeUsesSeriesProviderIDsAndCache(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)
