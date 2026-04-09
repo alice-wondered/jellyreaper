@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -53,6 +54,13 @@ func TestBackfillFetchChangedItemsSince(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/Items":
+			includeItemTypes := strings.Join(r.URL.Query()["includeItemTypes"], ",")
+			if includeItemTypes == "" {
+				includeItemTypes = strings.Join(r.URL.Query()["IncludeItemTypes"], ",")
+			}
+			if !strings.Contains(includeItemTypes, "Movie") || !strings.Contains(includeItemTypes, "Episode") {
+				t.Errorf("expected includeItemTypes to include Movie and Episode, got %q", includeItemTypes)
+			}
 			enableUserData := r.URL.Query().Get("EnableUserData")
 			if enableUserData == "" {
 				enableUserData = r.URL.Query().Get("enableUserData")
