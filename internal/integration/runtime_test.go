@@ -370,7 +370,7 @@ func TestIntegrationBackfillUsesUserPlaybackToDeferReviewScheduling(t *testing.T
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"Items": []map[string]any{
 					{"Id": movieID, "Type": "Movie", "Name": "Sample Movie", "DateCreated": now.Add(-300 * 24 * time.Hour).Format(time.RFC3339), "DateLastMediaAdded": now.Add(-300 * 24 * time.Hour).Format(time.RFC3339)},
-					{"Id": episodeID, "Type": "Episode", "Name": "Sample Episode", "SeriesId": "series-1", "SeriesName": "Sample Series", "SeasonId": "season-2", "SeasonName": "Season 2", "DateCreated": now.Add(-200 * 24 * time.Hour).Format(time.RFC3339), "DateLastMediaAdded": now.Add(-200 * 24 * time.Hour).Format(time.RFC3339)},
+					{"Id": episodeID, "Type": "Episode", "Name": "Sample Episode", "SeriesId": "99999999-8888-7777-6666-555555555555", "SeriesName": "Sample Series", "SeasonId": "12121212-3434-5656-7878-909090909090", "SeasonName": "Season 2", "DateCreated": now.Add(-200 * 24 * time.Hour).Format(time.RFC3339), "DateLastMediaAdded": now.Add(-200 * 24 * time.Hour).Format(time.RFC3339)},
 				},
 			})
 		case "/Users":

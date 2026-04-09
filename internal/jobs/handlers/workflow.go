@@ -190,6 +190,17 @@ func mostRecentPlayForFlow(ctx context.Context, tx repo.TxRepository, flow domai
 				latest = item.LastPlayedAt
 			}
 		}
+		if latest.IsZero() && (parts[1] == "movie" || parts[1] == "item") {
+			for _, candidate := range alternateItemIDs(parts[2]) {
+				media, found, err := tx.GetMedia(ctx, candidate)
+				if err != nil {
+					return time.Time{}, false, err
+				}
+				if found && media.LastPlayedAt.After(latest) {
+					latest = media.LastPlayedAt
+				}
+			}
+		}
 		if latest.IsZero() {
 			return time.Time{}, false, nil
 		}
@@ -774,4 +785,23 @@ func humanTimeLabel(t time.Time) string {
 		return "unknown"
 	}
 	return t.UTC().Format("2006-01-02 15:04 UTC")
+}
+
+func alternateItemIDs(id string) []string {
+	base := strings.TrimSpace(id)
+	if base == "" {
+		return nil
+	}
+	out := []string{base}
+	nodash := strings.ReplaceAll(base, "-", "")
+	if nodash != base {
+		out = append(out, nodash)
+	}
+	if len(nodash) == 32 {
+		dashed := nodash[0:8] + "-" + nodash[8:12] + "-" + nodash[12:16] + "-" + nodash[16:20] + "-" + nodash[20:32]
+		if dashed != base {
+			out = append(out, dashed)
+		}
+	}
+	return out
 }

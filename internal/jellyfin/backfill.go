@@ -301,13 +301,19 @@ func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.
 	if body == nil {
 		body = resp.ApplicationjsonProfilePascalCase200
 	}
+	var decodeErr error
 	if body == nil && len(resp.Body) > 0 {
 		var parsed gen.BaseItemDtoQueryResult
 		if err := json.Unmarshal(resp.Body, &parsed); err == nil {
 			body = &parsed
 		} else if looksLikeHTML(resp.Body) {
 			return ItemPage{}, htmlResponseError("items endpoint", resp.HTTPResponse, resp.Body)
+		} else {
+			decodeErr = fmt.Errorf("decode items response body: %w", err)
 		}
+	}
+	if body == nil && decodeErr != nil {
+		return ItemPage{}, decodeErr
 	}
 	out := make([]ItemSnapshot, 0)
 	nextStart := startIndex
