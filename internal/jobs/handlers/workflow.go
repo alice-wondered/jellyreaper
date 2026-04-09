@@ -654,6 +654,7 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 		deletedChildren = children
 		if h.sonarr != nil {
 			providerIDs := projectionProviderIDs(flow.SubjectType, deletedChildren)
+			providerIDs = h.enrichSeasonProviderIDs(ctx, deletedChildren, providerIDs)
 			if len(providerIDs) == 0 {
 				return fmt.Errorf("sonarr primary season delete missing provider ids for %s", flow.ItemID)
 			}
@@ -788,6 +789,7 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 				break
 			}
 			if h.sonarr != nil {
+				providerIDs = h.enrichSeasonProviderIDs(ctx, deletedChildren, providerIDs)
 				if len(providerIDs) == 0 {
 					return fmt.Errorf("sonarr removal skipped for %s: missing provider ids", flow.ItemID)
 				}
@@ -862,6 +864,45 @@ func projectionProviderIDs(subjectType string, deleted []domain.MediaItem) map[s
 		return nil
 	}
 	return series
+}
+
+func (h *ExecuteDeleteHandler) enrichSeasonProviderIDs(ctx context.Context, deleted []domain.MediaItem, base map[string]string) map[string]string {
+	merged := map[string]string{}
+	for k, v := range base {
+		key := strings.ToLower(strings.TrimSpace(k))
+		val := strings.TrimSpace(v)
+		if key == "" || val == "" {
+			continue
+		}
+		merged[key] = val
+	}
+	if h.client == nil {
+		return merged
+	}
+	seen := map[string]struct{}{}
+	for _, media := range deleted {
+		seriesID := strings.TrimSpace(media.SeriesID)
+		if seriesID == "" {
+			continue
+		}
+		if _, ok := seen[seriesID]; ok {
+			continue
+		}
+		seen[seriesID] = struct{}{}
+		ids, err := h.client.FetchProviderIDs(ctx, seriesID)
+		if err != nil {
+			continue
+		}
+		for k, v := range ids {
+			key := strings.ToLower(strings.TrimSpace(k))
+			val := strings.TrimSpace(v)
+			if key == "" || val == "" {
+				continue
+			}
+			merged[key] = val
+		}
+	}
+	return merged
 }
 
 func seasonNumberFromDeletedMedia(deleted []domain.MediaItem) int {

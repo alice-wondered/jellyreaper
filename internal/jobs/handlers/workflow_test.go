@@ -185,15 +185,20 @@ func TestExecuteDeleteHandlerSeasonProjectionTriggersSonarrSeasonRemoval(t *test
 		}, 0); err != nil {
 			return err
 		}
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-arr-1", ItemType: "Episode", SeasonID: "season-arr", SeasonName: "Season 3", ProviderIDs: map[string]string{"tvdb": "73244"}, UpdatedAt: now}); err != nil {
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-arr-1", ItemType: "Episode", SeasonID: "season-arr", SeasonName: "Season 3", SeriesID: "series-arr", ProviderIDs: map[string]string{"tvdb": "1111"}, UpdatedAt: now}); err != nil {
 			return err
 		}
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-arr-2", ItemType: "Episode", SeasonID: "season-arr", SeasonName: "Season 3", ProviderIDs: map[string]string{"tvdb": "73244"}, UpdatedAt: now})
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-arr-2", ItemType: "Episode", SeasonID: "season-arr", SeasonName: "Season 3", SeriesID: "series-arr", ProviderIDs: map[string]string{"tvdb": "1111"}, UpdatedAt: now})
 	}); err != nil {
 		t.Fatalf("seed season state: %v", err)
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/Items/series-arr" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ProviderIds":{"Tvdb":"73244","Imdb":"tt0386676"}}`))
+			return
+		}
 		if r.Method == http.MethodDelete && (r.URL.Path == "/Items/ep-arr-1" || r.URL.Path == "/Items/ep-arr-2") {
 			t.Fatalf("did not expect jellyfin episode delete when sonarr season primary delete is enabled")
 			w.WriteHeader(http.StatusNoContent)
@@ -215,6 +220,9 @@ func TestExecuteDeleteHandlerSeasonProjectionTriggersSonarrSeasonRemoval(t *test
 	}
 	if sonarrSpy.season != 3 {
 		t.Fatalf("expected sonarr season operation to target season 3, got %d", sonarrSpy.season)
+	}
+	if sonarrSpy.last["tvdb"] != "73244" {
+		t.Fatalf("expected season operation to use series-level tvdb id, got %q", sonarrSpy.last["tvdb"])
 	}
 }
 
