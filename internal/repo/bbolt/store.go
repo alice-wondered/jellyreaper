@@ -543,15 +543,17 @@ func (t *txRepo) GetMedia(ctx context.Context, itemID string) (domain.MediaItem,
 	if err != nil {
 		return domain.MediaItem{}, false, err
 	}
-	var media domain.MediaItem
-	found, err := bucketGetJSON(b, itemID, &media)
-	if err != nil {
-		return domain.MediaItem{}, false, fmt.Errorf("decode media %s: %w", itemID, err)
+	for _, candidate := range domain.AlternateIDForms(itemID) {
+		var media domain.MediaItem
+		found, err := bucketGetJSON(b, candidate, &media)
+		if err != nil {
+			return domain.MediaItem{}, false, fmt.Errorf("decode media %s: %w", candidate, err)
+		}
+		if found {
+			return media, true, nil
+		}
 	}
-	if !found {
-		return domain.MediaItem{}, false, nil
-	}
-	return media, true, nil
+	return domain.MediaItem{}, false, nil
 }
 
 func (t *txRepo) UpsertMedia(ctx context.Context, media domain.MediaItem) error {
@@ -561,6 +563,10 @@ func (t *txRepo) UpsertMedia(ctx context.Context, media domain.MediaItem) error 
 	if media.ItemID == "" {
 		return fmt.Errorf("upsert media: item id required: %w", ErrInvalidInput)
 	}
+	media.ItemID = domain.NormalizeID(media.ItemID)
+	media.SeasonID = domain.NormalizeID(media.SeasonID)
+	media.SeriesID = domain.NormalizeID(media.SeriesID)
+	media.LastUserID = domain.NormalizeID(media.LastUserID)
 	b, err := requireBucket(t.tx, bucketMedia)
 	if err != nil {
 		return err
@@ -582,13 +588,23 @@ func (t *txRepo) DeleteMedia(ctx context.Context, itemID string) error {
 	if err != nil {
 		return err
 	}
-	return b.Delete(keyBytes(itemID))
+	var firstErr error
+	for _, candidate := range domain.AlternateIDForms(itemID) {
+		if err := b.Delete(keyBytes(candidate)); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	return nil
 }
 
 func (t *txRepo) ListMediaBySubject(ctx context.Context, subjectType string, subjectID string) ([]domain.MediaItem, error) {
 	if err := checkContext(ctx); err != nil {
 		return nil, err
 	}
+	subjectID = domain.NormalizeID(subjectID)
 	if subjectType == "" || subjectID == "" {
 		return nil, fmt.Errorf("list media by subject: subject type and id required: %w", ErrInvalidInput)
 	}
@@ -608,15 +624,15 @@ func (t *txRepo) ListMediaBySubject(ctx context.Context, subjectType string, sub
 		}
 		switch subjectType {
 		case "season":
-			if media.SeasonID == subjectID {
+			if domain.NormalizeID(media.SeasonID) == subjectID {
 				out = append(out, media)
 			}
 		case "series":
-			if media.SeriesID == subjectID {
+			if domain.NormalizeID(media.SeriesID) == subjectID {
 				out = append(out, media)
 			}
 		case "movie", "item":
-			if media.ItemID == subjectID {
+			if domain.NormalizeID(media.ItemID) == subjectID {
 				out = append(out, media)
 			}
 		}

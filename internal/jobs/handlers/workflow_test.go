@@ -143,6 +143,41 @@ func TestEvaluatePolicyAssumesNeverPlayedWhenMetricsMissing(t *testing.T) {
 	}
 }
 
+func TestMostRecentPlayForFlowFallsBackAcrossDashedAndNonDashedIDs(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+	nonDashed := "1bb7dcaf2c6e04a75d91c4f0ee6b3cfd"
+	dashed := "1bb7dcaf-2c6e-04a7-5d91-c4f0ee6b3cfd"
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID:       nonDashed,
+			ItemType:     "Movie",
+			Name:         "Sample Movie",
+			LastPlayedAt: now,
+			UpdatedAt:    now,
+		})
+	}); err != nil {
+		t.Fatalf("seed media: %v", err)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		played, known, err := mostRecentPlayForFlow(context.Background(), tx, domain.Flow{ItemID: "target:movie:" + dashed})
+		if err != nil {
+			return err
+		}
+		if !known {
+			t.Fatal("expected fallback to find last played via alternate id form")
+		}
+		if !played.Equal(now) {
+			t.Fatalf("unexpected last played timestamp: got=%s want=%s", played, now)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("evaluate fallback play timestamp: %v", err)
+	}
+}
+
 func TestEvaluatePolicyFallsBackToCreatedAtWhenNeverPlayed(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()

@@ -50,21 +50,26 @@ func TestBackfillFetchChangedItemsSince(t *testing.T) {
 	id := uuid.New()
 	now := time.Now().UTC()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/Items" {
+		switch r.URL.Path {
+		case "/Items":
+			enableUserData := r.URL.Query().Get("EnableUserData")
+			if enableUserData == "" {
+				enableUserData = r.URL.Query().Get("enableUserData")
+			}
+			if enableUserData != "true" {
+				t.Fatalf("expected EnableUserData=true query parameter")
+			}
+			playCount := int32(7)
+			userData := gen.UserItemDataDto{LastPlayedDate: &now, PlayCount: &playCount}
+			res := gen.BaseItemDtoQueryResult{Items: &[]gen.BaseItemDto{{Id: &id, Name: strPtr("Movie C"), DateCreated: &now, DateLastMediaAdded: &now, UserData: &userData}}}
+			_ = json.NewEncoder(w).Encode(res)
+		case "/Users":
+			_, _ = w.Write([]byte(`[{"Id":"u1"}]`))
+		case "/Users/u1/Items":
+			_, _ = w.Write([]byte(`{"Items":[]}`))
+		default:
 			w.WriteHeader(http.StatusNotFound)
-			return
 		}
-		enableUserData := r.URL.Query().Get("EnableUserData")
-		if enableUserData == "" {
-			enableUserData = r.URL.Query().Get("enableUserData")
-		}
-		if enableUserData != "true" {
-			t.Fatalf("expected EnableUserData=true query parameter")
-		}
-		playCount := int32(7)
-		userData := gen.UserItemDataDto{LastPlayedDate: &now, PlayCount: &playCount}
-		res := gen.BaseItemDtoQueryResult{Items: &[]gen.BaseItemDto{{Id: &id, Name: strPtr("Movie C"), DateCreated: &now, DateLastMediaAdded: &now, UserData: &userData}}}
-		_ = json.NewEncoder(w).Encode(res)
 	}))
 	defer server.Close()
 
@@ -98,31 +103,36 @@ func TestBackfillFetchChangedItemsSincePaginatesAllResults(t *testing.T) {
 	ids := []uuid.UUID{uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/Items" {
+		switch r.URL.Path {
+		case "/Items":
+			start, _ := strconv.Atoi(r.URL.Query().Get("startIndex"))
+			limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+			if limit <= 0 {
+				limit = 500
+			}
+
+			if start >= len(ids) {
+				_ = json.NewEncoder(w).Encode(gen.BaseItemDtoQueryResult{Items: &[]gen.BaseItemDto{}})
+				return
+			}
+			end := start + limit
+			if end > len(ids) {
+				end = len(ids)
+			}
+
+			out := make([]gen.BaseItemDto, 0, end-start)
+			for i := start; i < end; i++ {
+				name := fmt.Sprintf("Item %d", i+1)
+				out = append(out, gen.BaseItemDto{Id: &ids[i], Name: &name, DateCreated: &now, DateLastMediaAdded: &now})
+			}
+			_ = json.NewEncoder(w).Encode(gen.BaseItemDtoQueryResult{Items: &out})
+		case "/Users":
+			_, _ = w.Write([]byte(`[{"Id":"u1"}]`))
+		case "/Users/u1/Items":
+			_, _ = w.Write([]byte(`{"Items":[]}`))
+		default:
 			w.WriteHeader(http.StatusNotFound)
-			return
 		}
-		start, _ := strconv.Atoi(r.URL.Query().Get("startIndex"))
-		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-		if limit <= 0 {
-			limit = 500
-		}
-
-		if start >= len(ids) {
-			_ = json.NewEncoder(w).Encode(gen.BaseItemDtoQueryResult{Items: &[]gen.BaseItemDto{}})
-			return
-		}
-		end := start + limit
-		if end > len(ids) {
-			end = len(ids)
-		}
-
-		out := make([]gen.BaseItemDto, 0, end-start)
-		for i := start; i < end; i++ {
-			name := fmt.Sprintf("Item %d", i+1)
-			out = append(out, gen.BaseItemDto{Id: &ids[i], Name: &name, DateCreated: &now, DateLastMediaAdded: &now})
-		}
-		_ = json.NewEncoder(w).Encode(gen.BaseItemDtoQueryResult{Items: &out})
 	}))
 	defer server.Close()
 
@@ -368,15 +378,91 @@ func TestBackfillFetchChangedItemsSinceSurfacesEnrichmentWarnings(t *testing.T) 
 	}
 	warnings := 0
 	b.SetWarningHook(func(stage string, err error) {
-		if stage == "user-playback-enrichment" && err != nil {
+		if err != nil {
 			warnings++
 		}
 	})
 
-	if _, err := b.FetchChangedItemsSince(context.Background(), time.Now().Add(-24*time.Hour), 100); err != nil {
-		t.Fatalf("fetch changed items: %v", err)
+	if _, err := b.FetchChangedItemsSince(context.Background(), time.Now().Add(-24*time.Hour), 100); err == nil {
+		t.Fatal("expected fetch changed items to fail when enrichment fails")
 	}
 	if warnings == 0 {
 		t.Fatal("expected enrichment warning hook to fire")
+	}
+}
+
+func TestBackfillFetchChangedItemsSinceRealisticAnonymizedUserPlaybackPattern(t *testing.T) {
+	movieID := uuid.New()
+	episodeID := uuid.New()
+	recentMoviePlay := time.Date(2026, 4, 5, 0, 29, 37, 0, time.UTC)
+	oldEpisodePlay := time.Date(2025, 11, 21, 1, 17, 7, 0, time.UTC)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/Items":
+			items := []map[string]any{
+				{"Id": uuid.New().String(), "Type": "ManualPlaylistsFolder", "Name": "Playlists", "DateCreated": "0001-01-01T00:00:00Z"},
+				{"Id": movieID.String(), "Type": "Movie", "Name": "Sample Movie", "DateCreated": "2025-06-20T14:01:48Z", "DateLastMediaAdded": "2025-06-20T14:01:48Z"},
+				{"Id": episodeID.String(), "Type": "Episode", "Name": "Sample Episode", "SeriesName": "Sample Series", "SeasonName": "Season 2", "DateCreated": "2025-11-02T05:29:56Z", "DateLastMediaAdded": "2025-11-02T05:29:56Z"},
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"Items": items})
+		case "/Users":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"Id": "u1"}, {"Id": "u2"}})
+		case "/Users/u1/Items":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"Items": []map[string]any{
+					{"Id": movieID.String(), "Type": "Movie", "Name": "Sample Movie", "UserData": map[string]any{"PlayCount": 0}},
+					{"Id": episodeID.String(), "Type": "Episode", "Name": "Sample Episode", "UserData": map[string]any{"PlayCount": 0}},
+				},
+			})
+		case "/Users/u2/Items":
+			if r.URL.Query().Get("IsPlayed") == "true" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"Items": []map[string]any{
+						{"Id": movieID.String(), "Type": "Movie", "Name": "Sample Movie", "UserData": map[string]any{"LastPlayedDate": recentMoviePlay.Format(time.RFC3339Nano), "PlayCount": 4}},
+						{"Id": episodeID.String(), "Type": "Episode", "Name": "Sample Episode", "UserData": map[string]any{"LastPlayedDate": oldEpisodePlay.Format(time.RFC3339Nano), "PlayCount": 1}},
+					},
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"Items": []map[string]any{
+					{"Id": movieID.String(), "Type": "Movie", "Name": "Sample Movie", "UserData": map[string]any{"LastPlayedDate": recentMoviePlay.Format(time.RFC3339Nano), "PlayCount": 4}},
+					{"Id": episodeID.String(), "Type": "Episode", "Name": "Sample Episode", "UserData": map[string]any{"LastPlayedDate": oldEpisodePlay.Format(time.RFC3339Nano), "PlayCount": 1}},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	b, err := NewBackfillService(server.URL, "token", server.Client())
+	if err != nil {
+		t.Fatalf("new backfill service: %v", err)
+	}
+
+	items, err := b.FetchChangedItemsSince(context.Background(), time.Now().Add(-90*24*time.Hour), 100)
+	if err != nil {
+		t.Fatalf("fetch changed items: %v", err)
+	}
+
+	var movie ItemSnapshot
+	foundMovie := false
+	for _, it := range items {
+		if it.ItemID == movieID.String() {
+			movie = it
+			foundMovie = true
+			break
+		}
+	}
+	if !foundMovie {
+		t.Fatalf("expected movie %s in backfill snapshot", movieID)
+	}
+	if !movie.LastPlayedAt.Equal(recentMoviePlay) {
+		t.Fatalf("expected aggregated movie last played %s, got %s", recentMoviePlay, movie.LastPlayedAt)
+	}
+	if movie.PlayCount != 4 {
+		t.Fatalf("expected aggregated movie playcount 4, got %d", movie.PlayCount)
 	}
 }

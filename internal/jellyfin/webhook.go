@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"jellyreaper/internal/domain"
 )
 
 type WebhookPayload struct {
@@ -43,6 +45,10 @@ type WebhookEvent struct {
 }
 
 func BuildWebhookEvent(payload WebhookPayload, raw map[string]any) WebhookEvent {
+	payload.ItemID = domain.NormalizeID(payload.ItemID)
+	payload.SeasonID = domain.NormalizeID(payload.SeasonID)
+	payload.SeriesID = domain.NormalizeID(payload.SeriesID)
+	payload.UserID = domain.NormalizeID(payload.UserID)
 	payload.PrimaryImageURL = derivePrimaryImageURL(payload)
 
 	eventID := payload.EventID
@@ -63,7 +69,7 @@ func BuildWebhookEvent(payload WebhookPayload, raw map[string]any) WebhookEvent 
 	return WebhookEvent{
 		Payload:   payload,
 		Raw:       raw,
-		ItemID:    strings.TrimSpace(payload.ItemID),
+		ItemID:    domain.NormalizeID(payload.ItemID),
 		EventID:   strings.TrimSpace(eventID),
 		EventType: eventType,
 		DedupeKey: dedupeKey,

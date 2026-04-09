@@ -190,6 +190,17 @@ func mostRecentPlayForFlow(ctx context.Context, tx repo.TxRepository, flow domai
 				latest = item.LastPlayedAt
 			}
 		}
+		if latest.IsZero() && (parts[1] == "movie" || parts[1] == "item") {
+			for _, candidate := range domain.AlternateIDForms(parts[2]) {
+				media, found, err := tx.GetMedia(ctx, candidate)
+				if err != nil {
+					return time.Time{}, false, err
+				}
+				if found && media.LastPlayedAt.After(latest) {
+					latest = media.LastPlayedAt
+				}
+			}
+		}
 		if latest.IsZero() {
 			return time.Time{}, false, nil
 		}

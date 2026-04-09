@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"jellyreaper/internal/domain"
 	gen "jellyreaper/internal/jellyfin/gen"
 )
 
@@ -36,6 +37,9 @@ type BackfillService struct {
 
 const usersCacheTTL = 30 * time.Minute
 const userItemsIDsChunkSize = 80
+const enrichmentRetryMaxAttempts = 4
+const enrichmentRetryBaseDelay = 200 * time.Millisecond
+const enrichmentRetryMaxDelay = 2 * time.Second
 
 type FetchProgress struct {
 	Stream           string
@@ -298,13 +302,19 @@ func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.
 	if body == nil {
 		body = resp.ApplicationjsonProfilePascalCase200
 	}
+	var decodeErr error
 	if body == nil && len(resp.Body) > 0 {
 		var parsed gen.BaseItemDtoQueryResult
 		if err := json.Unmarshal(resp.Body, &parsed); err == nil {
 			body = &parsed
 		} else if looksLikeHTML(resp.Body) {
 			return ItemPage{}, htmlResponseError("items endpoint", resp.HTTPResponse, resp.Body)
+		} else {
+			decodeErr = fmt.Errorf("decode items response body: %w", err)
 		}
+	}
+	if body == nil && decodeErr != nil {
+		return ItemPage{}, decodeErr
 	}
 	out := make([]ItemSnapshot, 0)
 	nextStart := startIndex
@@ -316,15 +326,15 @@ func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.
 		hasMore = int32(len(*body.Items)) >= pageSize
 		out = make([]ItemSnapshot, 0, len(*body.Items))
 		for _, item := range *body.Items {
-			itemID := uuidString(item.Id)
+			itemID := domain.NormalizeID(uuidString(item.Id))
 			itemType := stringValueFromKind(item.Type)
 			imageURL := buildPrimaryImageURL(s.baseURL, itemID, item.ImageTags)
 			out = append(out, ItemSnapshot{
 				ItemID:             itemID,
 				ItemType:           itemType,
-				SeasonID:           uuidString(item.SeasonId),
+				SeasonID:           domain.NormalizeID(uuidString(item.SeasonId)),
 				SeasonName:         safeString(item.SeasonName),
-				SeriesID:           uuidString(item.SeriesId),
+				SeriesID:           domain.NormalizeID(uuidString(item.SeriesId)),
 				SeriesName:         safeString(item.SeriesName),
 				Name:               safeString(item.Name),
 				ImageURL:           imageURL,
@@ -337,7 +347,13 @@ func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.
 	}
 
 	if !since.IsZero() && startIndex == 0 {
-		if recent, err := s.fetchRecentlyPlayedAcrossUsersSince(ctx, since, pageSize); err == nil && len(recent) > 0 {
+		if recent, err := s.fetchRecentlyPlayedAcrossUsersSince(ctx, since, pageSize); err != nil {
+			s.emitWarning("recent-user-plays", err)
+			if len(recent) > 0 {
+				out = mergeRecentSnapshots(out, recent)
+			}
+			return ItemPage{}, fmt.Errorf("recent user-play merge failed: %w", err)
+		} else if len(recent) > 0 {
 			out = mergeRecentSnapshots(out, recent)
 		}
 	}
@@ -345,6 +361,7 @@ func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.
 	if enriched, err := s.enrichItemsWithAllUsersPlayback(ctx, out); err != nil {
 		out = enriched
 		s.emitWarning("user-playback-enrichment", err)
+		return ItemPage{}, fmt.Errorf("user playback enrichment failed: %w", err)
 	} else {
 		out = enriched
 	}
@@ -392,7 +409,7 @@ func (s *BackfillService) enrichItemsWithAllUsersPlayback(ctx context.Context, i
 	ids := make([]string, 0, len(items))
 	indexByID := make(map[string]int, len(items))
 	for i := range items {
-		id := strings.TrimSpace(items[i].ItemID)
+		id := domain.NormalizeID(items[i].ItemID)
 		if id == "" {
 			continue
 		}
@@ -418,7 +435,7 @@ func (s *BackfillService) enrichItemsWithAllUsersPlayback(ctx context.Context, i
 				continue
 			}
 			for _, it := range userItems.Items {
-				id := strings.TrimSpace(it.ID)
+				id := domain.NormalizeID(it.ID)
 				if id == "" || it.UserData == nil {
 					continue
 				}
@@ -472,25 +489,8 @@ func (s *BackfillService) fetchUsersCached(ctx context.Context) ([]userSummary, 
 }
 
 func (s *BackfillService) fetchUsers(ctx context.Context) ([]userSummary, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL+"/Users", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("X-Emby-Token", s.apiKey)
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("fetch users returned status %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return nil, err
-	}
 	var users []userSummary
-	if err := json.Unmarshal(body, &users); err != nil {
+	if err := s.getJSONWithRetry(ctx, s.baseURL+"/Users", "fetch users", 4<<20, &users); err != nil {
 		return nil, err
 	}
 	return users, nil
@@ -503,25 +503,8 @@ func (s *BackfillService) fetchUserItemsPlayback(ctx context.Context, userID str
 	values.Set("EnableUserData", "true")
 	values.Set("Fields", "UserData")
 	endpoint := s.baseURL + "/Users/" + url.PathEscape(strings.TrimSpace(userID)) + "/Items?" + values.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return usersItemsResponse{}, err
-	}
-	req.Header.Set("X-Emby-Token", s.apiKey)
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return usersItemsResponse{}, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return usersItemsResponse{}, fmt.Errorf("fetch user items returned status %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if err != nil {
-		return usersItemsResponse{}, err
-	}
 	var out usersItemsResponse
-	if err := json.Unmarshal(body, &out); err != nil {
+	if err := s.getJSONWithRetry(ctx, endpoint, "fetch user items", 8<<20, &out); err != nil {
 		return usersItemsResponse{}, err
 	}
 	return out, nil
@@ -540,11 +523,17 @@ func (s *BackfillService) fetchRecentlyPlayedAcrossUsersSince(ctx context.Contex
 	}
 
 	merged := map[string]ItemSnapshot{}
+	failures := 0
+	var firstErr error
 	for _, user := range users {
 		start := int32(0)
 		for {
 			page, hasMore, nextStart, err := s.fetchUserRecentlyPlayedPage(ctx, user.ID, since, start, limit)
 			if err != nil {
+				failures++
+				if firstErr == nil {
+					firstErr = err
+				}
 				break
 			}
 			if len(page.Items) == 0 {
@@ -559,7 +548,7 @@ func (s *BackfillService) fetchRecentlyPlayedAcrossUsersSince(ctx context.Contex
 				if played.Before(since) {
 					continue
 				}
-				id := strings.TrimSpace(raw.ID)
+				id := domain.NormalizeID(raw.ID)
 				if id == "" {
 					continue
 				}
@@ -572,13 +561,13 @@ func (s *BackfillService) fetchRecentlyPlayedAcrossUsersSince(ctx context.Contex
 					item.Name = strings.TrimSpace(raw.Name)
 				}
 				if strings.TrimSpace(item.SeasonID) == "" {
-					item.SeasonID = strings.TrimSpace(raw.SeasonID)
+					item.SeasonID = domain.NormalizeID(raw.SeasonID)
 				}
 				if strings.TrimSpace(item.SeasonName) == "" {
 					item.SeasonName = strings.TrimSpace(raw.SeasonName)
 				}
 				if strings.TrimSpace(item.SeriesID) == "" {
-					item.SeriesID = strings.TrimSpace(raw.SeriesID)
+					item.SeriesID = domain.NormalizeID(raw.SeriesID)
 				}
 				if strings.TrimSpace(item.SeriesName) == "" {
 					item.SeriesName = strings.TrimSpace(raw.SeriesName)
@@ -609,6 +598,9 @@ func (s *BackfillService) fetchRecentlyPlayedAcrossUsersSince(ctx context.Contex
 	for _, v := range merged {
 		out = append(out, v)
 	}
+	if failures > 0 {
+		return out, fmt.Errorf("recent user-play fetch had %d failed user streams: %w", failures, firstErr)
+	}
 	return out, nil
 }
 
@@ -625,41 +617,92 @@ func (s *BackfillService) fetchUserRecentlyPlayedPage(ctx context.Context, userI
 	values.Set("MinDateLastSavedForUser", since.UTC().Format(time.RFC3339Nano))
 
 	endpoint := s.baseURL + "/Users/" + url.PathEscape(strings.TrimSpace(userID)) + "/Items?" + values.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return usersItemsResponse{}, false, startIndex, err
-	}
-	req.Header.Set("X-Emby-Token", s.apiKey)
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return usersItemsResponse{}, false, startIndex, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return usersItemsResponse{}, false, startIndex, fmt.Errorf("fetch user played items returned status %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if err != nil {
-		return usersItemsResponse{}, false, startIndex, err
-	}
 	var out usersItemsResponse
-	if err := json.Unmarshal(body, &out); err != nil {
+	if err := s.getJSONWithRetry(ctx, endpoint, "fetch user played items", 8<<20, &out); err != nil {
 		return usersItemsResponse{}, false, startIndex, err
 	}
 	next := startIndex + int32(len(out.Items))
 	return out, int32(len(out.Items)) >= limit, next, nil
 }
 
+func (s *BackfillService) getJSONWithRetry(ctx context.Context, endpoint string, op string, maxRead int64, out any) error {
+	var lastErr error
+	for attempt := 1; attempt <= enrichmentRetryMaxAttempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("X-Emby-Token", s.apiKey)
+		resp, err := s.httpClient.Do(req)
+		if err == nil {
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxRead))
+			_ = resp.Body.Close()
+			if readErr != nil {
+				err = readErr
+			} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				err = fmt.Errorf("%s returned status %d", op, resp.StatusCode)
+				if !isRetryableStatus(resp.StatusCode) {
+					return err
+				}
+			} else if err := json.Unmarshal(body, out); err != nil {
+				return err
+			} else {
+				return nil
+			}
+		}
+
+		lastErr = err
+		if attempt == enrichmentRetryMaxAttempts {
+			break
+		}
+		delay := retryBackoffDelayForEnrichment(attempt-1, enrichmentRetryBaseDelay, enrichmentRetryMaxDelay)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return fmt.Errorf("%s failed after %d attempts: %w", op, enrichmentRetryMaxAttempts, lastErr)
+}
+
+func isRetryableStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status >= 500
+}
+
+func retryBackoffDelayForEnrichment(attempt int, base time.Duration, max time.Duration) time.Duration {
+	if base <= 0 {
+		base = time.Second
+	}
+	if max < base {
+		max = base
+	}
+	if attempt <= 0 {
+		return base
+	}
+
+	delay := base
+	for i := 0; i < attempt; i++ {
+		if delay >= max/2 {
+			return max
+		}
+		delay *= 2
+	}
+	if delay > max {
+		return max
+	}
+	return delay
+}
+
 func mergeRecentSnapshots(base []ItemSnapshot, recent []ItemSnapshot) []ItemSnapshot {
 	index := make(map[string]int, len(base))
 	for i := range base {
-		id := strings.TrimSpace(base[i].ItemID)
+		id := domain.NormalizeID(base[i].ItemID)
 		if id != "" {
 			index[id] = i
 		}
 	}
 	for _, rec := range recent {
-		id := strings.TrimSpace(rec.ItemID)
+		id := domain.NormalizeID(rec.ItemID)
 		if id == "" {
 			continue
 		}
