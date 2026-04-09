@@ -206,7 +206,7 @@ func LoadFromEnv() (Config, error) {
 		DiscordBotToken:      os.Getenv("DISCORD_BOT_TOKEN"),
 		DiscordChannelID:     os.Getenv("DISCORD_CHANNEL_ID"),
 		OpenAIAPIKey:         strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
-		OpenAIModel:          envOrDefault("OPENAI_MODEL", "gpt-4o-mini"),
+		OpenAIModel:          envOrDefault("OPENAI_MODEL", "gpt-5-mini"),
 		JellyfinURL:          jellyfinURL,
 		JellyfinPort:         jellyfinPort,
 		JellyfinAPIKey:       os.Getenv("JELLYFIN_API_KEY"),

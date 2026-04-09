@@ -103,7 +103,7 @@ type intent struct {
 
 func NewHarness(repository repo.Repository, apiKey string, model string) *Harness {
 	if strings.TrimSpace(model) == "" {
-		model = "gpt-4o-mini"
+		model = "gpt-5-mini"
 	}
 	return &Harness{
 		repository:  repository,
