@@ -602,7 +602,7 @@ func TestIntegrationCanonicalizesIDsAcrossBackfillAndWebhookSources(t *testing.T
 	}
 }
 
-func TestIntegrationBackfillProviderIDsDriveARRRemovalOnDeleteWebhook(t *testing.T) {
+func TestIntegrationWebhookDeleteDoesNotTriggerARRRemovalPath(t *testing.T) {
 	store := openStore(t)
 	now := time.Now().UTC()
 	movieID := "1bb7dcaf-2c6e-04a7-5d91-c4f0ee6b3cfd"
@@ -641,8 +641,6 @@ func TestIntegrationBackfillProviderIDsDriveARRRemovalOnDeleteWebhook(t *testing
 	}
 	appSvc := app.NewService(store, nil, nil)
 	appSvc.SetPolicyDefaults(60, 15*24*time.Hour)
-	radarrRec := &removalRecorder{}
-	appSvc.SetRadarrService(radarrRec)
 	if err := appSvc.IngestBackfillItems(context.Background(), items); err != nil {
 		t.Fatalf("ingest backfill items: %v", err)
 	}
@@ -667,13 +665,6 @@ func TestIntegrationBackfillProviderIDsDriveARRRemovalOnDeleteWebhook(t *testing
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("unexpected status: %d", resp.StatusCode)
-	}
-
-	if got := radarrRec.calls.Load(); got != 1 {
-		t.Fatalf("expected exactly one radarr removal call, got %d", got)
-	}
-	if got := radarrRec.last["tmdb"]; got != "603" {
-		t.Fatalf("expected tmdb provider id to be forwarded, got %q", got)
 	}
 
 	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {

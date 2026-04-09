@@ -597,6 +597,16 @@ type ExecuteDeleteHandler struct {
 	repository repo.Repository
 	client     *jellyfin.Client
 	discord    *discord.Service
+	radarr     radarrRemover
+	sonarr     sonarrRemover
+}
+
+type radarrRemover interface {
+	RemoveByProviderIDs(context.Context, map[string]string) error
+}
+
+type sonarrRemover interface {
+	RemoveByProviderIDs(context.Context, map[string]string) error
 }
 
 func NewExecuteDeleteHandler(repository repo.Repository, client *jellyfin.Client) *ExecuteDeleteHandler {
@@ -605,6 +615,14 @@ func NewExecuteDeleteHandler(repository repo.Repository, client *jellyfin.Client
 
 func (h *ExecuteDeleteHandler) SetDiscordService(discordSvc *discord.Service) {
 	h.discord = discordSvc
+}
+
+func (h *ExecuteDeleteHandler) SetRadarrService(remover radarrRemover) {
+	h.radarr = remover
+}
+
+func (h *ExecuteDeleteHandler) SetSonarrService(remover sonarrRemover) {
+	h.sonarr = remover
 }
 
 func (h *ExecuteDeleteHandler) Kind() domain.JobKind { return domain.JobKindExecuteDelete }
@@ -634,10 +652,15 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 		if strings.HasPrefix(deleteID, "target:item:") || strings.HasPrefix(deleteID, "target:movie:") {
 			deleteID = deleteID[strings.LastIndex(deleteID, ":")+1:]
 		}
+		if media, found, err := h.getMedia(ctx, deleteID); err == nil && found {
+			deletedChildren = append(deletedChildren, media)
+		}
 		if err := h.client.DeleteItem(ctx, deleteID); err != nil {
 			return err
 		}
-		deletedChildren = append(deletedChildren, domain.MediaItem{ItemID: deleteID})
+		if len(deletedChildren) == 0 {
+			deletedChildren = append(deletedChildren, domain.MediaItem{ItemID: deleteID})
+		}
 	}
 
 	now := time.Now().UTC()
@@ -713,7 +736,90 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 			// best effort
 		}
 	}
+	if committed {
+		providerIDs := projectionProviderIDs(flow.SubjectType, deletedChildren)
+		switch flow.SubjectType {
+		case "movie", "item":
+			if h.radarr != nil {
+				if len(providerIDs) == 0 {
+					return fmt.Errorf("radarr removal skipped for %s: missing provider ids", flow.ItemID)
+				}
+				if err := h.radarr.RemoveByProviderIDs(ctx, providerIDs); err != nil {
+					return fmt.Errorf("radarr projection removal for %s: %w", flow.ItemID, err)
+				}
+			}
+		case "season", "series":
+			if h.sonarr != nil {
+				if len(providerIDs) == 0 {
+					return fmt.Errorf("sonarr removal skipped for %s: missing provider ids", flow.ItemID)
+				}
+				if err := h.sonarr.RemoveByProviderIDs(ctx, providerIDs); err != nil {
+					return fmt.Errorf("sonarr projection removal for %s: %w", flow.ItemID, err)
+				}
+			}
+		}
+	}
 	return nil
+}
+
+func (h *ExecuteDeleteHandler) getMedia(ctx context.Context, itemID string) (domain.MediaItem, bool, error) {
+	var media domain.MediaItem
+	var found bool
+	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		var err error
+		media, found, err = tx.GetMedia(ctx, itemID)
+		return err
+	})
+	if err != nil {
+		return domain.MediaItem{}, false, err
+	}
+	return media, found, nil
+}
+
+func projectionProviderIDs(subjectType string, deleted []domain.MediaItem) map[string]string {
+	merge := func(dst map[string]string, src map[string]string) map[string]string {
+		for k, v := range src {
+			if strings.TrimSpace(k) == "" || strings.TrimSpace(v) == "" {
+				continue
+			}
+			dst[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
+		}
+		return dst
+	}
+	out := map[string]string{}
+	for _, media := range deleted {
+		out = merge(out, media.ProviderIDs)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	if subjectType == "movie" || subjectType == "item" {
+		movie := map[string]string{}
+		if v := out["tmdb"]; v != "" {
+			movie["tmdb"] = v
+		}
+		if v := out["imdb"]; v != "" {
+			movie["imdb"] = v
+		}
+		if len(movie) == 0 {
+			return nil
+		}
+		return movie
+	}
+	series := map[string]string{}
+	if v := out["tvdb"]; v != "" {
+		series["tvdb"] = v
+	}
+	if v := out["tmdb"]; v != "" {
+		series["tmdb"] = v
+	}
+	if v := out["imdb"]; v != "" {
+		series["imdb"] = v
+	}
+	if len(series) == 0 {
+		return nil
+	}
+	return series
 }
 
 func (h *ExecuteDeleteHandler) deleteAggregateChildren(ctx context.Context, flow domain.Flow) ([]domain.MediaItem, error) {

@@ -158,11 +158,11 @@ func main() {
 		appService.SetJellyfinClient(jellyfin.NewClient(cfg.JellyfinURL, cfg.JellyfinAPIKey, nil))
 	}
 	if cfg.RadarrURL != "" && cfg.RadarrAPIKey != "" {
-		appService.SetRadarrService(radarr.NewService(cfg.RadarrURL, cfg.RadarrAPIKey))
+		executeDeleteHandler.SetRadarrService(radarr.NewService(cfg.RadarrURL, cfg.RadarrAPIKey))
 		logger.Info("radarr service enabled")
 	}
 	if cfg.SonarrURL != "" && cfg.SonarrAPIKey != "" {
-		appService.SetSonarrService(sonarr.NewService(cfg.SonarrURL, cfg.SonarrAPIKey))
+		executeDeleteHandler.SetSonarrService(sonarr.NewService(cfg.SonarrURL, cfg.SonarrAPIKey))
 		logger.Info("sonarr service enabled")
 	}
 	if assistant != nil {

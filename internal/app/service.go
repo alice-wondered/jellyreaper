@@ -48,20 +48,6 @@ type hitlFinalizeRequest struct {
 	content   string
 }
 
-type arrRemovalRequest struct {
-	service     string
-	providerIDs map[string]string
-	itemID      string
-}
-
-type radarrRemover interface {
-	RemoveByProviderIDs(context.Context, map[string]string) error
-}
-
-type sonarrRemover interface {
-	RemoveByProviderIDs(context.Context, map[string]string) error
-}
-
 type Service struct {
 	repository            repo.Repository
 	logger                *slog.Logger
@@ -72,8 +58,6 @@ type Service struct {
 	defaultExpireDays     int
 	defaultHITLTimeoutHrs int
 	jellyfinClient        *jellyfin.Client
-	radarr                radarrRemover
-	sonarr                sonarrRemover
 	backfillBatchSize     int
 	backfillBatchTimeout  time.Duration
 	backfillQueueCapacity int
@@ -194,14 +178,6 @@ func (s *Service) SetJellyfinClient(client *jellyfin.Client) {
 	s.jellyfinClient = client
 }
 
-func (s *Service) SetRadarrService(remover radarrRemover) {
-	s.radarr = remover
-}
-
-func (s *Service) SetSonarrService(remover sonarrRemover) {
-	s.sonarr = remover
-}
-
 func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.WebhookEvent) error {
 	if s.jellyfinClient != nil && isCatalogIndexEvent(event.EventType) && !isRemovalEvent(event.EventType) && event.ItemID != "" && len(event.Payload.ProviderIDs) == 0 {
 		providerIDs, err := s.jellyfinClient.FetchProviderIDs(ctx, event.ItemID)
@@ -216,7 +192,7 @@ func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.Webh
 	if sourceNow, ok := sourceTimestampForJellyfinEvent(event); ok {
 		now = sourceNow
 	}
-	itemID, targets, finalizations, arrRemovals, err := s.applyJellyfinWebhookTx(ctx, event, now)
+	itemID, targets, finalizations, err := s.applyJellyfinWebhookTx(ctx, event, now)
 	if err != nil {
 		return err
 	}
@@ -225,37 +201,6 @@ func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.Webh
 		for _, f := range finalizations {
 			if err := s.discord.FinalizeHITLPrompt(ctx, f.channelID, f.messageID, f.content); err != nil {
 				s.logger.Warn("failed to finalize playback-recovered HITL message", "item_id", itemID, "error", err)
-			}
-		}
-	}
-
-	if isRemovalEvent(event.EventType) && len(arrRemovals) == 0 {
-		itemType := strings.ToLower(strings.TrimSpace(event.Payload.ItemType))
-		if itemType == "movie" && s.radarr != nil {
-			s.logger.Warn("arr removal skipped: missing provider ids for radarr", "item_id", itemID, "item_type", itemType)
-		}
-		if (itemType == "series" || itemType == "season" || itemType == "episode") && s.sonarr != nil {
-			s.logger.Warn("arr removal skipped: missing provider ids for sonarr", "item_id", itemID, "item_type", itemType)
-		}
-	}
-
-	for _, req := range arrRemovals {
-		switch req.service {
-		case "radarr":
-			if s.radarr == nil {
-				s.logger.Warn("radarr removal requested but radarr service is not configured", "item_id", req.itemID)
-				continue
-			}
-			if err := s.radarr.RemoveByProviderIDs(ctx, req.providerIDs); err != nil {
-				s.logger.Warn("radarr removal failed", "item_id", req.itemID, "error", err)
-			}
-		case "sonarr":
-			if s.sonarr == nil {
-				s.logger.Warn("sonarr removal requested but sonarr service is not configured", "item_id", req.itemID)
-				continue
-			}
-			if err := s.sonarr.RemoveByProviderIDs(ctx, req.providerIDs); err != nil {
-				s.logger.Warn("sonarr removal failed", "item_id", req.itemID, "error", err)
 			}
 		}
 	}
@@ -282,7 +227,7 @@ func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.Webh
 	return nil
 }
 
-func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.WebhookEvent, now time.Time) (string, []targetRef, []hitlFinalizeRequest, []arrRemovalRequest, error) {
+func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.WebhookEvent, now time.Time) (string, []targetRef, []hitlFinalizeRequest, error) {
 	eventAt, _ := sourceTimestampForJellyfinEvent(event)
 	playbackEvent := isPlaybackEvent(event.EventType)
 	catalogIndexEvent := isCatalogIndexEvent(event.EventType)
@@ -291,18 +236,17 @@ func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.Web
 	itemID := event.ItemID
 	targets := deriveTargets(event)
 	finalizations := make([]hitlFinalizeRequest, 0)
-	arrRemovals := make([]arrRemovalRequest, 0)
 
 	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
-		return s.applyJellyfinWebhookInTx(ctx, tx, event, now, eventAt, playbackEvent, catalogIndexEvent, removalEvent, dedupeKey, itemID, targets, &finalizations, &arrRemovals)
+		return s.applyJellyfinWebhookInTx(ctx, tx, event, now, eventAt, playbackEvent, catalogIndexEvent, removalEvent, dedupeKey, itemID, targets, &finalizations)
 	})
 	if err != nil {
-		return "", nil, nil, nil, err
+		return "", nil, nil, err
 	}
-	return itemID, targets, finalizations, arrRemovals, nil
+	return itemID, targets, finalizations, nil
 }
 
-func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxRepository, event jellyfin.WebhookEvent, now, eventAt time.Time, playbackEvent, catalogIndexEvent, removalEvent bool, dedupeKey, itemID string, targets []targetRef, finalizations *[]hitlFinalizeRequest, arrRemovals *[]arrRemovalRequest) error {
+func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxRepository, event jellyfin.WebhookEvent, now, eventAt time.Time, playbackEvent, catalogIndexEvent, removalEvent bool, dedupeKey, itemID string, targets []targetRef, finalizations *[]hitlFinalizeRequest) error {
 	defaultReviewDays, _, defaultHITLTimeoutHours, err := s.currentDefaultsFromMeta(ctx, tx)
 	if err != nil {
 		return err
@@ -331,7 +275,6 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 
 	seasonChildIDs := make([]string, 0)
 	seasonChildren := make([]domain.MediaItem, 0)
-	removedMedia := make([]domain.MediaItem, 0)
 	seasonEpisodeDelta := map[string]int{}
 	if removalEvent && strings.EqualFold(strings.TrimSpace(event.Payload.ItemType), "season") {
 		seasonID := strings.TrimSpace(event.Payload.SeasonID)
@@ -463,7 +406,6 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 				return err
 			}
 		} else if found {
-			removedMedia = append(removedMedia, existing)
 			if itemTypeLower == "episode" {
 				seasonID := strings.TrimSpace(existing.SeasonID)
 				if seasonID == "" {
@@ -477,13 +419,6 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 	}
 
 	if removalEvent {
-		if len(seasonChildren) > 0 {
-			removedMedia = append(removedMedia, seasonChildren...)
-		}
-		if req, ok := buildARRRemovalRequest(event, removedMedia); ok && arrRemovals != nil {
-			*arrRemovals = append(*arrRemovals, req)
-		}
-
 		if itemID != "" {
 			if err := tx.DeleteMedia(ctx, itemID); err != nil {
 				return err
@@ -1196,7 +1131,6 @@ func (s *Service) processWebhookBatches(ctx context.Context, ops <-chan backfill
 					event.ItemID,
 					deriveTargets(event),
 					nil,
-					nil,
 				); err != nil {
 					return err
 				}
@@ -1525,36 +1459,6 @@ func shouldRemoveTargetFlowForRemovalEvent(event jellyfin.WebhookEvent, target t
 		return len(remaining) == 0
 	}
 	return true
-}
-
-func buildARRRemovalRequest(event jellyfin.WebhookEvent, removed []domain.MediaItem) (arrRemovalRequest, bool) {
-	itemType := strings.ToLower(strings.TrimSpace(event.Payload.ItemType))
-	if itemType == "movie" {
-		if ids := domain.NormalizeProviderIDs(event.Payload.ProviderIDs); len(ids) > 0 {
-			return arrRemovalRequest{service: "radarr", providerIDs: ids, itemID: event.ItemID}, true
-		}
-		for _, media := range removed {
-			if strings.EqualFold(strings.TrimSpace(media.ItemType), "movie") {
-				if ids := domain.NormalizeProviderIDs(media.ProviderIDs); len(ids) > 0 {
-					return arrRemovalRequest{service: "radarr", providerIDs: ids, itemID: event.ItemID}, true
-				}
-			}
-		}
-		return arrRemovalRequest{}, false
-	}
-
-	if itemType == "episode" || itemType == "season" || itemType == "series" {
-		if ids := domain.NormalizeProviderIDs(event.Payload.ProviderIDs); len(ids) > 0 {
-			return arrRemovalRequest{service: "sonarr", providerIDs: ids, itemID: event.ItemID}, true
-		}
-		for _, media := range removed {
-			if ids := domain.NormalizeProviderIDs(media.ProviderIDs); len(ids) > 0 {
-				return arrRemovalRequest{service: "sonarr", providerIDs: ids, itemID: event.ItemID}, true
-			}
-		}
-	}
-
-	return arrRemovalRequest{}, false
 }
 
 func mostRecentPlayForTarget(ctx context.Context, tx repo.TxRepository, flow domain.Flow) (time.Time, bool, error) {

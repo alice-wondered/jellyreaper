@@ -31,6 +31,20 @@ func testStore(t *testing.T) *bboltrepo.Store {
 	return store
 }
 
+type arrRemovalSpy struct {
+	calls int
+	last  map[string]string
+}
+
+func (s *arrRemovalSpy) RemoveByProviderIDs(_ context.Context, providerIDs map[string]string) error {
+	s.calls++
+	s.last = make(map[string]string, len(providerIDs))
+	for k, v := range providerIDs {
+		s.last[k] = v
+	}
+	return nil
+}
+
 func TestExecuteDeleteHandlerTransitionsToDeleted(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
@@ -81,6 +95,108 @@ func TestExecuteDeleteHandlerTransitionsToDeleted(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("verify flow: %v", err)
+	}
+}
+
+func TestExecuteDeleteHandlerMovieProjectionTriggersRadarrRemoval(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:movie:mv-arr",
+			ItemID:      "target:movie:mv-arr",
+			SubjectType: "movie",
+			DisplayName: "Movie ARR",
+			State:       domain.FlowStateDeleteQueued,
+			Version:     0,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID:      "mv-arr",
+			ItemType:    "Movie",
+			Name:        "Movie ARR",
+			ProviderIDs: map[string]string{"tmdb": "603", "imdb": "tt0133093"},
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		})
+	}); err != nil {
+		t.Fatalf("seed flow/media: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && r.URL.Path == "/Items/mv-arr" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	radarrSpy := &arrRemovalSpy{}
+	h := NewExecuteDeleteHandler(store, jellyfin.NewClient(server.URL, "api-key", server.Client()))
+	h.SetRadarrService(radarrSpy)
+
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-arr-movie", ItemID: "target:movie:mv-arr", IdempotencyKey: "dedupe:arr-movie"}); err != nil {
+		t.Fatalf("execute movie delete: %v", err)
+	}
+	if radarrSpy.calls != 1 {
+		t.Fatalf("expected one radarr removal call, got %d", radarrSpy.calls)
+	}
+	if radarrSpy.last["tmdb"] != "603" {
+		t.Fatalf("expected tmdb id forwarded to radarr, got %q", radarrSpy.last["tmdb"])
+	}
+}
+
+func TestExecuteDeleteHandlerSeasonProjectionTriggersSonarrRemoval(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:season:season-arr",
+			ItemID:      "target:season:season-arr",
+			SubjectType: "season",
+			DisplayName: "Season ARR",
+			State:       domain.FlowStateDeleteQueued,
+			Version:     0,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0); err != nil {
+			return err
+		}
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-arr-1", ItemType: "Episode", SeasonID: "season-arr", ProviderIDs: map[string]string{"tvdb": "73244"}, UpdatedAt: now}); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-arr-2", ItemType: "Episode", SeasonID: "season-arr", ProviderIDs: map[string]string{"tvdb": "73244"}, UpdatedAt: now})
+	}); err != nil {
+		t.Fatalf("seed season state: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && (r.URL.Path == "/Items/ep-arr-1" || r.URL.Path == "/Items/ep-arr-2") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	sonarrSpy := &arrRemovalSpy{}
+	h := NewExecuteDeleteHandler(store, jellyfin.NewClient(server.URL, "api-key", server.Client()))
+	h.SetSonarrService(sonarrSpy)
+
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-arr-season", ItemID: "target:season:season-arr", IdempotencyKey: "dedupe:arr-season"}); err != nil {
+		t.Fatalf("execute season delete: %v", err)
+	}
+	if sonarrSpy.calls != 1 {
+		t.Fatalf("expected one sonarr removal call, got %d", sonarrSpy.calls)
+	}
+	if sonarrSpy.last["tvdb"] != "73244" {
+		t.Fatalf("expected tvdb id forwarded to sonarr, got %q", sonarrSpy.last["tvdb"])
 	}
 }
 
