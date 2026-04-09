@@ -455,6 +455,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		if err != nil {
 			return err
 		}
+		newFlowCreated := false
 		catalogFlowUpdateAllowed := true
 		flowNeedsWrite := false
 		targetID := strings.TrimSpace(target.ID)
@@ -485,6 +486,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 			if err := tx.UpsertFlowCAS(ctx, flow, 0); err != nil {
 				return err
 			}
+			newFlowCreated = true
 		} else {
 			if catalogIndexEvent && !eventAt.IsZero() && eventAt.Before(flow.LastCatalogEventAt) {
 				catalogFlowUpdateAllowed = false
@@ -552,6 +554,9 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		}
 
 		if !catalogIndexEvent && !playbackEvent {
+			continue
+		}
+		if catalogIndexEvent && !playbackEvent && !newFlowCreated {
 			continue
 		}
 

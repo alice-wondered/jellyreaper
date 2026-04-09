@@ -1141,6 +1141,99 @@ func TestFullBackfillOverLiveIndexCanAdvancePlaybackWithoutRegression(t *testing
 	}
 }
 
+func TestBackfillReplayPreservesArchivedFlowState(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 9, 19, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:movie:movie-archived-1",
+			ItemID:      "target:movie:movie-archived-1",
+			SubjectType: "movie",
+			DisplayName: "The Magicians",
+			State:       domain.FlowStateArchived,
+			Version:     0,
+			CreatedAt:   now.Add(-24 * time.Hour),
+			UpdatedAt:   now.Add(-24 * time.Hour),
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed archived flow: %v", err)
+	}
+
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+		ItemID:             "movie-archived-1",
+		ItemType:           "Movie",
+		Name:               "The Magicians",
+		DateLastMediaAdded: now.Add(-48 * time.Hour),
+	}}); err != nil {
+		t.Fatalf("backfill replay: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, "target:movie:movie-archived-1")
+	if flow.State != domain.FlowStateArchived {
+		t.Fatalf("expected archived flow to remain archived, got %s", flow.State)
+	}
+}
+
+func TestBackfillReplayPreservesDelayedActiveFlowSchedule(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 9, 20, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+	delayedUntil := now.Add(10 * 24 * time.Hour)
+	lastPlayed := now.Add(-24 * time.Hour)
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:movie:movie-delayed-1",
+			ItemID:      "target:movie:movie-delayed-1",
+			SubjectType: "movie",
+			DisplayName: "RWBY",
+			State:       domain.FlowStateActive,
+			Version:     0,
+			PolicySnapshot: domain.PolicySnapshot{
+				ExpireAfterDays: 30,
+				HITLTimeoutHrs:  24,
+				TimeoutAction:   "delete",
+			},
+			NextActionAt: delayedUntil,
+			CreatedAt:    now.Add(-48 * time.Hour),
+			UpdatedAt:    now.Add(-48 * time.Hour),
+		}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID:             "movie-delayed-1",
+			ItemType:           "Movie",
+			Name:               "RWBY",
+			CreatedAt:          now.Add(-72 * time.Hour),
+			LastPlayedAt:       lastPlayed,
+			LastCatalogEventAt: now.Add(-48 * time.Hour),
+			UpdatedAt:          now.Add(-48 * time.Hour),
+		})
+	}); err != nil {
+		t.Fatalf("seed delayed flow/media: %v", err)
+	}
+
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+		ItemID:             "movie-delayed-1",
+		ItemType:           "Movie",
+		Name:               "RWBY",
+		DateLastMediaAdded: now.Add(-72 * time.Hour),
+		LastPlayedAt:       lastPlayed,
+		PlayCount:          1,
+	}}); err != nil {
+		t.Fatalf("backfill replay: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, "target:movie:movie-delayed-1")
+	if !flow.NextActionAt.Equal(delayedUntil) {
+		t.Fatalf("expected delayed next action to be preserved, got=%s want=%s", flow.NextActionAt, delayedUntil)
+	}
+}
+
 func TestIngestBackfillItemsEpisodeUsesSeriesProviderIDsAndCache(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)
