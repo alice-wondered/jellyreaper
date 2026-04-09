@@ -16,8 +16,10 @@ import (
 	"jellyreaper/internal/discord"
 	"jellyreaper/internal/domain"
 	"jellyreaper/internal/jellyfin"
+	"jellyreaper/internal/radarr"
 	"jellyreaper/internal/repo"
 	bboltrepo "jellyreaper/internal/repo/bbolt"
+	"jellyreaper/internal/sonarr"
 )
 
 func testStore(t *testing.T) *bboltrepo.Store {
@@ -35,6 +37,7 @@ type arrRemovalSpy struct {
 	calls  int
 	last   map[string]string
 	season int
+	err    error
 }
 
 func (s *arrRemovalSpy) RemoveByProviderIDs(_ context.Context, providerIDs map[string]string) error {
@@ -43,7 +46,7 @@ func (s *arrRemovalSpy) RemoveByProviderIDs(_ context.Context, providerIDs map[s
 	for k, v := range providerIDs {
 		s.last[k] = v
 	}
-	return nil
+	return s.err
 }
 
 func (s *arrRemovalSpy) RemoveSeasonByProviderIDs(_ context.Context, providerIDs map[string]string, seasonNumber int) error {
@@ -53,7 +56,7 @@ func (s *arrRemovalSpy) RemoveSeasonByProviderIDs(_ context.Context, providerIDs
 	for k, v := range providerIDs {
 		s.last[k] = v
 	}
-	return nil
+	return s.err
 }
 
 func TestExecuteDeleteHandlerTransitionsToDeleted(t *testing.T) {
@@ -226,6 +229,152 @@ func TestExecuteDeleteHandlerSeasonProjectionTriggersSonarrSeasonRemoval(t *test
 	}
 	if sonarrSpy.last["tmdb"] != "2316" {
 		t.Fatalf("expected season operation to use series-level tmdb id, got %q", sonarrSpy.last["tmdb"])
+	}
+}
+
+func TestExecuteDeleteHandlerMovieProjectionFallsBackToJellyfinWhenRadarrUnmanaged(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:movie:mv-unmanaged",
+			ItemID:      "target:movie:mv-unmanaged",
+			SubjectType: "movie",
+			ProviderIDs: map[string]string{"tmdb": "999999"},
+			State:       domain.FlowStateDeleteQueued,
+			Version:     0,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "mv-unmanaged", ItemType: "Movie", UpdatedAt: now})
+	}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	jellyfinDeleteCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && r.URL.Path == "/Items/mv-unmanaged" {
+			jellyfinDeleteCalls++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	radarrSpy := &arrRemovalSpy{err: radarr.ErrNotManaged}
+	h := NewExecuteDeleteHandler(store, jellyfin.NewClient(server.URL, "api-key", server.Client()))
+	h.SetRadarrService(radarrSpy)
+
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-arr-movie-unmanaged", ItemID: "target:movie:mv-unmanaged", IdempotencyKey: "dedupe:arr-movie-unmanaged"}); err != nil {
+		t.Fatalf("execute movie delete with unmanaged fallback: %v", err)
+	}
+	if radarrSpy.calls != 1 {
+		t.Fatalf("expected one radarr attempt, got %d", radarrSpy.calls)
+	}
+	if jellyfinDeleteCalls != 1 {
+		t.Fatalf("expected jellyfin fallback delete call, got %d", jellyfinDeleteCalls)
+	}
+}
+
+func TestExecuteDeleteHandlerSeasonProjectionFallsBackToJellyfinWhenSonarrUnmanaged(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:season:season-unmanaged",
+			ItemID:      "target:season:season-unmanaged",
+			SubjectType: "season",
+			ProviderIDs: map[string]string{"tvdb": "999999"},
+			State:       domain.FlowStateDeleteQueued,
+			Version:     0,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0); err != nil {
+			return err
+		}
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-unmanaged-1", ItemType: "Episode", SeasonID: "season-unmanaged", SeasonName: "Season 2", UpdatedAt: now}); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-unmanaged-2", ItemType: "Episode", SeasonID: "season-unmanaged", SeasonName: "Season 2", UpdatedAt: now})
+	}); err != nil {
+		t.Fatalf("seed season state: %v", err)
+	}
+
+	jellyfinDeleteCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && (r.URL.Path == "/Items/ep-unmanaged-1" || r.URL.Path == "/Items/ep-unmanaged-2") {
+			jellyfinDeleteCalls++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	sonarrSpy := &arrRemovalSpy{err: sonarr.ErrNotManaged}
+	h := NewExecuteDeleteHandler(store, jellyfin.NewClient(server.URL, "api-key", server.Client()))
+	h.SetSonarrService(sonarrSpy)
+
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-arr-season-unmanaged", ItemID: "target:season:season-unmanaged", IdempotencyKey: "dedupe:arr-season-unmanaged"}); err != nil {
+		t.Fatalf("execute season delete with unmanaged fallback: %v", err)
+	}
+	if sonarrSpy.calls != 1 {
+		t.Fatalf("expected one sonarr attempt, got %d", sonarrSpy.calls)
+	}
+	if jellyfinDeleteCalls != 2 {
+		t.Fatalf("expected jellyfin fallback deletes for two episodes, got %d", jellyfinDeleteCalls)
+	}
+}
+
+func TestExecuteDeleteHandlerMovieProjectionFallsBackToJellyfinWhenProviderIDsMissing(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:movie:mv-noids",
+			ItemID:      "target:movie:mv-noids",
+			SubjectType: "movie",
+			State:       domain.FlowStateDeleteQueued,
+			Version:     0,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "mv-noids", ItemType: "Movie", UpdatedAt: now})
+	}); err != nil {
+		t.Fatalf("seed movie state: %v", err)
+	}
+
+	jellyfinDeleteCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && r.URL.Path == "/Items/mv-noids" {
+			jellyfinDeleteCalls++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	radarrSpy := &arrRemovalSpy{}
+	h := NewExecuteDeleteHandler(store, jellyfin.NewClient(server.URL, "api-key", server.Client()))
+	h.SetRadarrService(radarrSpy)
+
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-arr-movie-noids", ItemID: "target:movie:mv-noids", IdempotencyKey: "dedupe:arr-movie-noids"}); err != nil {
+		t.Fatalf("execute movie delete without provider ids: %v", err)
+	}
+	if radarrSpy.calls != 0 {
+		t.Fatalf("expected no radarr attempt when provider ids missing, got %d", radarrSpy.calls)
+	}
+	if jellyfinDeleteCalls != 1 {
+		t.Fatalf("expected jellyfin delete fallback call, got %d", jellyfinDeleteCalls)
 	}
 }
 

@@ -3,6 +3,7 @@ package radarr
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,8 @@ type Service struct {
 	apiKey  string
 	http    *http.Client
 }
+
+var ErrNotManaged = errors.New("radarr movie not managed")
 
 type movieResource struct {
 	ID     int    `json:"id"`
@@ -47,7 +50,7 @@ func (s *Service) RemoveByProviderIDs(ctx context.Context, providerIDs map[strin
 		return err
 	}
 	if !found {
-		return fmt.Errorf("radarr movie not found for provider ids: %v", BuildProviderIDs(providerIDs))
+		return fmt.Errorf("%w for provider ids: %v", ErrNotManaged, BuildProviderIDs(providerIDs))
 	}
 	endpoint := fmt.Sprintf("%s/api/v3/movie/%d?deleteFiles=true&addImportExclusion=false", s.baseURL, movie.ID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)

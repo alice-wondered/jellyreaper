@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,6 +20,8 @@ type Service struct {
 	http    *http.Client
 	logger  *slog.Logger
 }
+
+var ErrNotManaged = errors.New("sonarr series or season not managed")
 
 type seriesResource struct {
 	ID     int    `json:"id"`
@@ -61,7 +64,7 @@ func (s *Service) RemoveSeasonByProviderIDs(ctx context.Context, providerIDs map
 		return err
 	}
 	if !found {
-		return fmt.Errorf("sonarr series not found for provider ids: %v", providerIDs)
+		return fmt.Errorf("%w for provider ids: %v", ErrNotManaged, providerIDs)
 	}
 	s.logger.Info("sonarr season delete resolved series", "lex", "SONARR-DELETE", "series_id", series.ID, "series_title", strings.TrimSpace(series.Title), "season_number", seasonNumber)
 	episodeIDs, err := s.listSeasonEpisodeIDs(ctx, series.ID, seasonNumber)
@@ -69,7 +72,7 @@ func (s *Service) RemoveSeasonByProviderIDs(ctx context.Context, providerIDs map
 		return err
 	}
 	if len(episodeIDs) == 0 {
-		return fmt.Errorf("sonarr season not found or empty for series %d season %d", series.ID, seasonNumber)
+		return fmt.Errorf("%w: season not found or empty for series %d season %d", ErrNotManaged, series.ID, seasonNumber)
 	}
 	s.logger.Info("sonarr season delete loaded episodes", "lex", "SONARR-DELETE", "series_id", series.ID, "season_number", seasonNumber, "episode_count", len(episodeIDs), "endpoint", "/api/v3/episode")
 	episodeFileIDs, err := s.listSeasonEpisodeFileIDs(ctx, series.ID, seasonNumber)
