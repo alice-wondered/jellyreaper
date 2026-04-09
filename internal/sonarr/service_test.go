@@ -3,6 +3,7 @@ package sonarr
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -86,8 +87,8 @@ func TestRemoveSeasonByProviderIDsNoMatchReturnsError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected not-found error for unmatched provider ids")
 	}
-	if !strings.Contains(err.Error(), "not found") {
-		t.Fatalf("expected not-found error, got %v", err)
+	if !errors.Is(err, ErrNotManaged) {
+		t.Fatalf("expected ErrNotManaged, got %v", err)
 	}
 	if monitorCalls != 0 {
 		t.Fatalf("expected no monitor update call for unmatched provider ids, got %d", monitorCalls)

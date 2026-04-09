@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
+	"github.com/openai/openai-go/responses"
 	"github.com/openai/openai-go/shared"
 
 	"jellyreaper/internal/domain"
@@ -23,13 +25,14 @@ const (
 	historyLineCapacity = 20
 	maxThreadContexts   = 256
 
-	storageSkill = "Domain skill: A flow is the scheduler-owned lifecycle record for a projection target. Flows have ids like target:<subject_type>:<subject_id>, policy state (active, pending_review, archived, delete_queued), policy knobs (review days, defer days, HITL timeout hours), scheduling fields (next_action_at/deadlines), and Discord/HITL context. Scheduler/HITL operational subject types are movie and season only. A movie projection maps one movie; a season projection maps all episodes in that season. Higher-level user intents (for example series-level requests) should be translated into movie/season operations before handoff. Media items are catalog/playback records and are not direct AI operation targets. The assistant should discover projection flows, then hand off actions to domain services (which enqueue jobs, drive scheduler transitions, and perform cleanup fanout). For deletion, only schedule projection flow deletes; do not attempt individual item-level deletes."
+	storageSkill = "Domain skill: The core object is a projection flow (`target:<subject_type>:<subject_id>`). Think of flows as user-visible review entries. `subject_type=movie` is one movie; `subject_type=season` is one TV season projection (episodes grouped by season). States: `pending_review` means ready now, `active` means scheduled for later, `archived` means hidden from normal review, `delete_queued` means deletion is in progress/queued. User wording mapping: 'next up for review' means first ready flow ordered by next action time; 'how many movies' means count projection flows with `subject_type=movie`; 'how many TV shows' means distinct series names represented by season projection flows. Operational actions are on projection flows only (movie/season), never on raw media-item IDs."
 )
 
 type Harness struct {
 	repository repo.Repository
 	client     openai.Client
 	model      string
+	logger     *slog.Logger
 	decision   DecisionService
 
 	mu              sync.Mutex
@@ -101,12 +104,13 @@ type intent struct {
 
 func NewHarness(repository repo.Repository, apiKey string, model string) *Harness {
 	if strings.TrimSpace(model) == "" {
-		model = "gpt-4o-mini"
+		model = "gpt-5-mini"
 	}
 	return &Harness{
 		repository:  repository,
 		client:      openai.NewClient(option.WithAPIKey(strings.TrimSpace(apiKey))),
 		model:       model,
+		logger:      slog.Default(),
 		history:     map[string]*ringBuffer{},
 		state:       map[string]threadState{},
 		maxThreads:  maxThreadContexts,
@@ -141,12 +145,25 @@ func (h *Harness) HandleMention(ctx context.Context, threadID string, userName s
 	h.touchThread(threadID)
 	out, err := h.respondBestEffort(ctx, threadID, userName, input)
 	if err != nil {
-		return "I hit an issue while processing that request. Please try again with a little more detail.", nil
+		h.logger.Error("ai mention processing failed", "thread_id", threadID, "user", userName, "error", err)
+		return fmt.Sprintf("I couldn't complete that because the AI backend returned an error: `%s`", summarizeAIError(err)), nil
 	}
 
 	h.appendHistory(threadID, userName+": "+input)
 	h.appendHistory(threadID, "assistant: "+out)
 	return out, nil
+}
+
+func summarizeAIError(err error) string {
+	msg := strings.TrimSpace(err.Error())
+	if msg == "" {
+		return "unknown error"
+	}
+	msg = strings.ReplaceAll(msg, "\n", " ")
+	if len(msg) > 220 {
+		msg = msg[:220] + "..."
+	}
+	return msg
 }
 
 func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userName string, input string) (string, error) {
@@ -160,9 +177,17 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 		"Only handle requests related to this media server and its review/archive workflow.",
 		storageSkill,
 		"Use tools to gather data and take actions.",
-		"Tool usage guide: list_ready for queue overviews; fuzzy_search_targets for discovery; query_target_state to inspect one target; remember_alias to bind user phrases to a target; archive_target for archive/unarchive intents; schedule_delete for deletion scheduling on one projection target; schedule_delete_many for show-level intents mapped to multiple season targets; delay_target_days to defer a target by an explicit number of days; choose_candidate when user provides a numbered option; confirm_pending for yes/no confirmations; set_review_days, set_defer_days, and set_hitl_timeout_hours for policy tuning.",
+		"Tool usage guide: list_ready for queue overviews and next-up questions; query_library for generalized counting/filtering across flows and indexed media; fuzzy_search_targets for discovery; query_target_state to inspect one target; remember_alias to bind user phrases to a target; archive_target for archive/unarchive intents; schedule_delete for deletion scheduling on one projection target; schedule_delete_many for show-level intents mapped to multiple season targets; delay_target_days to defer a target by an explicit number of days; choose_candidate when user provides a numbered option; confirm_pending for yes/no confirmations; set_review_days, set_defer_days, and set_hitl_timeout_hours for policy tuning.",
+		"Flow semantics: A flow is the schedulable review record. A projection is the user-facing target represented by the flow. For TV, one season flow maps many episode media items. Media items are index records used for context and counting, not direct operation targets.",
+		"Tool-calling playbook: (1) informational/count question -> query_library; (2) next-up/review queue question -> list_ready (limit=1 for singular next item); (3) find candidate titles -> fuzzy_search_targets then query_target_state for one target; (4) mutate flow state (archive/delete/delay/policy) only after target is resolved and confirmed when required.",
+		"Alias behavior: after resolving an ambiguous title or when user uses a shorthand phrase, call remember_alias to store that phrase for future turns. Prefer aliases first on follow-up requests.",
+		"Disambiguation behavior: when multiple targets match, use choose_candidate path and keep options short (title + season/show context).",
+		"Example queries you should handle with tools: 'what is the next item up for review?', 'how many scooby doo movies do we have?', 'how many tv shows do we have right now?', 'show me all RWBY targets and states', 'how many seasons of The Magicians are tracked', 'which scooby titles are archived vs active', 'what has not been played recently'.",
+		"For examples above: use list_ready for next-up; use query_library for counts/state/listing/last-played context; use fuzzy_search_targets + query_target_state when a single target needs deeper inspection.",
 		"Use schedule_delete for deletion requests; rely on domain logic for item vs projection delete semantics.",
 		"When asked to change how long HITL waits before timeout, use set_hitl_timeout_hours.",
+		"When asked 'what is next up for review', call list_ready with limit=1.",
+		"When asked for counts, do not guess; call query_library first.",
 		"Natural-language target resolution guide: prefer known aliases from thread memory first, then exact title, then partial title, and ask clarifying follow-up when ambiguous.",
 		"When multiple targets are possible, present concise choices and invite a short follow-up reply (for example: `title a`, `title b`, or a clearer title).",
 		"When you reply, use Discord markdown and keep it conversational and concise.",
@@ -176,63 +201,73 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 		"Recent context:\n" + strings.Join(history, "\n") + "\n" +
 		"User " + userName + ": " + input
 
-	messages := []openai.ChatCompletionMessageParamUnion{
-		openai.SystemMessage(system),
-		openai.UserMessage(userPrompt),
+	tools := []responses.ToolUnionParam{
+		{OfFunction: &responses.FunctionToolParam{Name: "response", Description: openai.String("Send a Discord markdown response back to the user."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"message": map[string]any{"type": "string"}}, "required": []string{"message"}}}},
+		{OfFunction: &responses.FunctionToolParam{Name: "list_ready", Description: openai.String("List targets currently ready for review."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 20}}}}},
+		{OfFunction: &responses.FunctionToolParam{Name: "query_library", Description: openai.String("Generalized query over projection flows and indexed media. Use this for counts and lightweight discovery."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "scope": map[string]any{"type": "string", "enum": []string{"", "flows", "media", "both"}}, "subject_type": map[string]any{"type": "string", "enum": []string{"", "movie", "season", "episode"}}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 50}}}}},
+		{OfFunction: &responses.FunctionToolParam{Name: "fuzzy_search_targets", Description: openai.String("Find projection targets by fuzzy title/series/season text, optionally filtered by subject type."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "subject_type": map[string]any{"type": "string", "enum": []string{"", "movie", "season"}}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 30}}, "required": []string{"query"}}}},
+		{OfFunction: &responses.FunctionToolParam{Name: "query_target_state", Description: openai.String("Inspect state for a target by title text, or current selection when query omitted."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}}}},
+		{OfFunction: &responses.FunctionToolParam{Name: "remember_alias", Description: openai.String("Store a natural-language alias for a specific target so future follow-ups can resolve quickly."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"alias": map[string]any{"type": "string"}, "target_ref": map[string]any{"type": "string"}}, "required": []string{"alias"}}}},
+		{OfFunction: &responses.FunctionToolParam{Name: "schedule_delete", Description: openai.String("Schedule deletion for operational targets (movie/season) by title text, alias, or target id."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"target_ref": map[string]any{"type": "string"}}}}},
+		{OfFunction: &responses.FunctionToolParam{Name: "schedule_delete_many", Description: openai.String("Schedule deletion for many projection targets at once (useful for deleting all seasons in a show)."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"target_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}}, "required": []string{"target_ids"}}}},
+		{OfFunction: &responses.FunctionToolParam{Name: "delay_target_days", Description: openai.String("Delay a projection target by a specific number of days by updating flow policy/schedule."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"target_ref": map[string]any{"type": "string"}, "days": map[string]any{"type": "integer", "minimum": 1, "maximum": 3650}}, "required": []string{"days"}}}},
+		{OfFunction: &responses.FunctionToolParam{Name: "archive_target", Description: openai.String("Start archive or unarchive flow for a target title."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "archived": map[string]any{"type": "boolean"}}, "required": []string{"archived"}}}},
+		{OfFunction: &responses.FunctionToolParam{Name: "choose_candidate", Description: openai.String("Choose one of the numbered candidates from the last disambiguation list."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"number": map[string]any{"type": "integer", "minimum": 1}}, "required": []string{"number"}}}},
+		{OfFunction: &responses.FunctionToolParam{Name: "confirm_pending", Description: openai.String("Confirm or cancel the pending archive/unarchive action."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"confirmed": map[string]any{"type": "boolean"}}, "required": []string{"confirmed"}}}},
+		{OfFunction: &responses.FunctionToolParam{Name: "set_review_days", Description: openai.String("Set policy review period in days for active flows."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"days": map[string]any{"type": "integer", "minimum": 1, "maximum": 3650}}, "required": []string{"days"}}}},
+		{OfFunction: &responses.FunctionToolParam{Name: "set_defer_days", Description: openai.String("Set default defer period in days."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"days": map[string]any{"type": "integer", "minimum": 1, "maximum": 365}}, "required": []string{"days"}}}},
+		{OfFunction: &responses.FunctionToolParam{Name: "set_hitl_timeout_hours", Description: openai.String("Set default HITL review timeout in hours before timeout action."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"hours": map[string]any{"type": "integer", "minimum": 1, "maximum": 8760}}, "required": []string{"hours"}}}},
 	}
 
-	tools := []openai.ChatCompletionToolParam{
-		{Function: shared.FunctionDefinitionParam{Name: "response", Description: openai.String("Send a Discord markdown response back to the user."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"message": map[string]any{"type": "string"}}, "required": []string{"message"}}}},
-		{Function: shared.FunctionDefinitionParam{Name: "list_ready", Description: openai.String("List targets currently ready for review."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 20}}}}},
-		{Function: shared.FunctionDefinitionParam{Name: "fuzzy_search_targets", Description: openai.String("Find projection targets by fuzzy title/series/season text, optionally filtered by subject type."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "subject_type": map[string]any{"type": "string", "enum": []string{"", "movie", "season"}}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 30}}, "required": []string{"query"}}}},
-		{Function: shared.FunctionDefinitionParam{Name: "query_target_state", Description: openai.String("Inspect state for a target by title text, or current selection when query omitted."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}}}},
-		{Function: shared.FunctionDefinitionParam{Name: "remember_alias", Description: openai.String("Store a natural-language alias for a specific target so future follow-ups can resolve quickly."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"alias": map[string]any{"type": "string"}, "target_ref": map[string]any{"type": "string"}}, "required": []string{"alias"}}}},
-		{Function: shared.FunctionDefinitionParam{Name: "schedule_delete", Description: openai.String("Schedule deletion for operational targets (movie/season) by title text, alias, or target id."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"target_ref": map[string]any{"type": "string"}}}}},
-		{Function: shared.FunctionDefinitionParam{Name: "schedule_delete_many", Description: openai.String("Schedule deletion for many projection targets at once (useful for deleting all seasons in a show)."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"target_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}}, "required": []string{"target_ids"}}}},
-		{Function: shared.FunctionDefinitionParam{Name: "delay_target_days", Description: openai.String("Delay a projection target by a specific number of days by updating flow policy/schedule."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"target_ref": map[string]any{"type": "string"}, "days": map[string]any{"type": "integer", "minimum": 1, "maximum": 3650}}, "required": []string{"days"}}}},
-		{Function: shared.FunctionDefinitionParam{Name: "archive_target", Description: openai.String("Start archive or unarchive flow for a target title."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "archived": map[string]any{"type": "boolean"}}, "required": []string{"archived"}}}},
-		{Function: shared.FunctionDefinitionParam{Name: "choose_candidate", Description: openai.String("Choose one of the numbered candidates from the last disambiguation list."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"number": map[string]any{"type": "integer", "minimum": 1}}, "required": []string{"number"}}}},
-		{Function: shared.FunctionDefinitionParam{Name: "confirm_pending", Description: openai.String("Confirm or cancel the pending archive/unarchive action."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"confirmed": map[string]any{"type": "boolean"}}, "required": []string{"confirmed"}}}},
-		{Function: shared.FunctionDefinitionParam{Name: "set_review_days", Description: openai.String("Set policy review period in days for active flows."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"days": map[string]any{"type": "integer", "minimum": 1, "maximum": 3650}}, "required": []string{"days"}}}},
-		{Function: shared.FunctionDefinitionParam{Name: "set_defer_days", Description: openai.String("Set default defer period in days."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"days": map[string]any{"type": "integer", "minimum": 1, "maximum": 365}}, "required": []string{"days"}}}},
-		{Function: shared.FunctionDefinitionParam{Name: "set_hitl_timeout_hours", Description: openai.String("Set default HITL review timeout in hours before timeout action."), Parameters: shared.FunctionParameters{"type": "object", "properties": map[string]any{"hours": map[string]any{"type": "integer", "minimum": 1, "maximum": 8760}}, "required": []string{"hours"}}}},
-	}
+	previousResponseID := ""
+	pendingInput := []responses.ResponseInputItemUnionParam{responses.ResponseInputItemParamOfMessage(userPrompt, responses.EasyInputMessageRoleUser)}
 
 	for i := 0; i < 6; i++ {
-		resp, err := h.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
-			Model:      openai.ChatModel(h.model),
-			Messages:   messages,
-			Tools:      tools,
-			ToolChoice: openai.ChatCompletionToolChoiceOptionUnionParam{OfAuto: openai.String("auto")},
-		})
+		params := responses.ResponseNewParams{
+			Model:        shared.ResponsesModel(h.model),
+			Instructions: openai.String(system),
+			Tools:        tools,
+			Input: responses.ResponseNewParamsInputUnion{
+				OfInputItemList: pendingInput,
+			},
+		}
+		if strings.TrimSpace(previousResponseID) != "" {
+			params.PreviousResponseID = openai.String(previousResponseID)
+		}
+		resp, err := h.client.Responses.New(ctx, params)
 		if err != nil {
 			return "", err
 		}
-		if len(resp.Choices) == 0 {
-			return "", fmt.Errorf("no choices")
+		previousResponseID = resp.ID
+
+		toolCalls := make([]responses.ResponseFunctionToolCall, 0)
+		for _, item := range resp.Output {
+			if item.Type == "function_call" {
+				toolCalls = append(toolCalls, item.AsFunctionCall())
+			}
 		}
-		msg := resp.Choices[0].Message
-		if len(msg.ToolCalls) == 0 {
-			content := strings.TrimSpace(msg.Content)
+
+		if len(toolCalls) == 0 {
+			content := strings.TrimSpace(resp.OutputText())
 			if content != "" {
 				return content, nil
 			}
-			messages = append(messages, msg.ToParam())
-			messages = append(messages, openai.SystemMessage("Please respond with a concise Discord-markdown message for the user."))
+			pendingInput = []responses.ResponseInputItemUnionParam{responses.ResponseInputItemParamOfMessage("Please respond with a concise Discord-markdown message for the user.", responses.EasyInputMessageRoleUser)}
 			continue
 		}
 
-		messages = append(messages, msg.ToParam())
-		for _, tc := range msg.ToolCalls {
-			result, out, err := h.executeToolCall(ctx, threadID, tc)
+		toolOutputs := make([]responses.ResponseInputItemUnionParam, 0, len(toolCalls))
+		for _, tc := range toolCalls {
+			result, out, err := h.executeToolCall(ctx, threadID, tc.Name, tc.Arguments)
 			if err != nil {
 				result = "tool error: " + err.Error()
 			}
-			messages = append(messages, openai.ToolMessage(result, tc.ID))
+			toolOutputs = append(toolOutputs, responses.ResponseInputItemParamOfFunctionCallOutput(tc.CallID, result))
 			if strings.TrimSpace(out) != "" {
 				return out, nil
 			}
 		}
+		pendingInput = toolOutputs
 	}
 
 	return "I couldn't complete that yet. Could you share a bit more context and try again?", nil
@@ -274,105 +309,205 @@ func (h *Harness) ensureHistoryLoaded(ctx context.Context, threadID string) {
 	h.mu.Unlock()
 }
 
-func (h *Harness) executeToolCall(ctx context.Context, threadID string, tc openai.ChatCompletionMessageToolCall) (string, string, error) {
-	args := map[string]any{}
-	if strings.TrimSpace(tc.Function.Arguments) != "" {
-		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+func (h *Harness) executeToolCall(ctx context.Context, threadID string, toolName string, rawArguments string) (string, string, error) {
+	switch toolName {
+	case "response":
+		args, err := decodeToolArgs[toolResponseArgs](rawArguments)
+		if err != nil {
 			return "", "", err
 		}
-	}
-
-	switch tc.Function.Name {
-	case "response":
-		msg := strings.TrimSpace(asString(args["message"]))
+		msg := strings.TrimSpace(args.Message)
 		if msg == "" {
 			msg = "Could you share a little more detail so I can help?"
 		}
 		return `{"ok":true}`, msg, nil
 	case "list_ready":
-		return h.listReady(ctx)
+		args, err := decodeToolArgs[toolListReadyArgs](rawArguments)
+		if err != nil {
+			return "", "", err
+		}
+		return h.listReady(ctx, args.Limit)
+	case "query_library":
+		args, err := decodeToolArgs[toolQueryLibraryArgs](rawArguments)
+		if err != nil {
+			return "", "", err
+		}
+		if args.Limit <= 0 {
+			args.Limit = 12
+		}
+		return h.queryLibrary(ctx, args.Query, args.Scope, args.SubjectType, args.Limit)
 	case "fuzzy_search_targets":
-		return h.fuzzySearchTargets(ctx, asString(args["query"]), asString(args["subject_type"]), asInt(args["limit"], 12))
+		args, err := decodeToolArgs[toolFuzzySearchArgs](rawArguments)
+		if err != nil {
+			return "", "", err
+		}
+		limit := args.Limit
+		if limit <= 0 {
+			limit = 12
+		}
+		return h.fuzzySearchTargets(ctx, args.Query, args.SubjectType, limit)
 	case "query_target_state":
-		return h.queryTargetState(ctx, threadID, asString(args["query"]))
+		args, err := decodeToolArgs[toolQueryTargetStateArgs](rawArguments)
+		if err != nil {
+			return "", "", err
+		}
+		return h.queryTargetState(ctx, threadID, args.Query)
 	case "remember_alias":
-		return h.rememberAlias(ctx, threadID, asString(args["alias"]), asString(args["target_ref"]))
+		args, err := decodeToolArgs[toolRememberAliasArgs](rawArguments)
+		if err != nil {
+			return "", "", err
+		}
+		return h.rememberAlias(ctx, threadID, args.Alias, args.TargetRef)
 	case "schedule_delete":
-		return h.setDeleteState(ctx, threadID, asString(args["target_ref"]))
+		args, err := decodeToolArgs[toolScheduleDeleteArgs](rawArguments)
+		if err != nil {
+			return "", "", err
+		}
+		return h.setDeleteState(ctx, threadID, args.TargetRef)
 	case "schedule_delete_many":
-		return h.scheduleDeleteMany(ctx, asStringSlice(args["target_ids"]))
+		args, err := decodeToolArgs[toolScheduleDeleteManyArgs](rawArguments)
+		if err != nil {
+			return "", "", err
+		}
+		return h.scheduleDeleteMany(ctx, args.TargetIDs)
 	case "delay_target_days":
-		return h.delayTargetDays(ctx, threadID, asString(args["target_ref"]), asInt(args["days"], 0))
+		args, err := decodeToolArgs[toolDelayTargetDaysArgs](rawArguments)
+		if err != nil {
+			return "", "", err
+		}
+		return h.delayTargetDays(ctx, threadID, args.TargetRef, args.Days)
 	case "archive_target":
-		archived := asBool(args["archived"], true)
-		return h.setArchiveState(ctx, threadID, asString(args["query"]), archived)
+		args, err := decodeToolArgs[toolArchiveTargetArgs](rawArguments)
+		if err != nil {
+			return "", "", err
+		}
+		archived := true
+		if args.Archived != nil {
+			archived = *args.Archived
+		}
+		return h.setArchiveState(ctx, threadID, args.Query, archived)
 	case "choose_candidate":
-		n := asInt(args["number"], 0)
+		args, err := decodeToolArgs[toolChooseCandidateArgs](rawArguments)
+		if err != nil {
+			return "", "", err
+		}
+		n := args.Number
 		if n <= 0 {
 			return "", "", fmt.Errorf("number must be >= 1")
 		}
 		return h.handleFollowUp(ctx, threadID, strconv.Itoa(n))
 	case "confirm_pending":
-		confirmed := asBool(args["confirmed"], false)
-		if confirmed {
+		args, err := decodeToolArgs[toolConfirmPendingArgs](rawArguments)
+		if err != nil {
+			return "", "", err
+		}
+		if args.Confirmed {
 			return h.handleFollowUp(ctx, threadID, "yes")
 		}
 		return h.handleFollowUp(ctx, threadID, "no")
 	case "set_review_days":
-		return h.setReviewDays(ctx, asInt(args["days"], 0))
+		args, err := decodeToolArgs[toolSetReviewDaysArgs](rawArguments)
+		if err != nil {
+			return "", "", err
+		}
+		return h.setReviewDays(ctx, args.Days)
 	case "set_defer_days":
-		return h.setDeferDays(ctx, asInt(args["days"], 0))
+		args, err := decodeToolArgs[toolSetDeferDaysArgs](rawArguments)
+		if err != nil {
+			return "", "", err
+		}
+		return h.setDeferDays(ctx, args.Days)
 	case "set_hitl_timeout_hours":
-		return h.setHITLTimeoutHours(ctx, asInt(args["hours"], 0))
-	default:
-		return "", "", fmt.Errorf("unknown tool: %s", tc.Function.Name)
-	}
-}
-
-func asString(v any) string {
-	s, _ := v.(string)
-	return s
-}
-
-func asInt(v any, fallback int) int {
-	switch n := v.(type) {
-	case float64:
-		return int(n)
-	case int:
-		return n
-	default:
-		return fallback
-	}
-}
-
-func asBool(v any, fallback bool) bool {
-	b, ok := v.(bool)
-	if !ok {
-		return fallback
-	}
-	return b
-}
-
-func asStringSlice(v any) []string {
-	arr, ok := v.([]any)
-	if !ok {
-		return nil
-	}
-	out := make([]string, 0, len(arr))
-	for _, raw := range arr {
-		s, ok := raw.(string)
-		if !ok {
-			continue
+		args, err := decodeToolArgs[toolSetHITLTimeoutHoursArgs](rawArguments)
+		if err != nil {
+			return "", "", err
 		}
-		if strings.TrimSpace(s) == "" {
-			continue
-		}
-		out = append(out, s)
+		return h.setHITLTimeoutHours(ctx, args.Hours)
+	default:
+		return "", "", fmt.Errorf("unknown tool: %s", toolName)
 	}
-	return out
 }
 
-func (h *Harness) listReady(ctx context.Context) (string, string, error) {
+type toolResponseArgs struct {
+	Message string `json:"message"`
+}
+
+type toolListReadyArgs struct {
+	Limit int `json:"limit"`
+}
+
+type toolQueryLibraryArgs struct {
+	Query       string `json:"query"`
+	Scope       string `json:"scope"`
+	SubjectType string `json:"subject_type"`
+	Limit       int    `json:"limit"`
+}
+
+type toolFuzzySearchArgs struct {
+	Query       string `json:"query"`
+	SubjectType string `json:"subject_type"`
+	Limit       int    `json:"limit"`
+}
+
+type toolQueryTargetStateArgs struct {
+	Query string `json:"query"`
+}
+
+type toolRememberAliasArgs struct {
+	Alias     string `json:"alias"`
+	TargetRef string `json:"target_ref"`
+}
+
+type toolScheduleDeleteArgs struct {
+	TargetRef string `json:"target_ref"`
+}
+
+type toolScheduleDeleteManyArgs struct {
+	TargetIDs []string `json:"target_ids"`
+}
+
+type toolDelayTargetDaysArgs struct {
+	TargetRef string `json:"target_ref"`
+	Days      int    `json:"days"`
+}
+
+type toolArchiveTargetArgs struct {
+	Query    string `json:"query"`
+	Archived *bool  `json:"archived"`
+}
+
+type toolChooseCandidateArgs struct {
+	Number int `json:"number"`
+}
+
+type toolConfirmPendingArgs struct {
+	Confirmed bool `json:"confirmed"`
+}
+
+type toolSetReviewDaysArgs struct {
+	Days int `json:"days"`
+}
+
+type toolSetDeferDaysArgs struct {
+	Days int `json:"days"`
+}
+
+type toolSetHITLTimeoutHoursArgs struct {
+	Hours int `json:"hours"`
+}
+
+func decodeToolArgs[T any](raw string) (T, error) {
+	var out T
+	if strings.TrimSpace(raw) == "" {
+		return out, nil
+	}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return out, fmt.Errorf("decode tool args: %w", err)
+	}
+	return out, nil
+}
+
+func (h *Harness) listReady(ctx context.Context, limit int) (string, string, error) {
 	type row struct {
 		flow domain.Flow
 		next time.Time
@@ -404,14 +539,230 @@ func (h *Harness) listReady(ctx context.Context) (string, string, error) {
 		return marshalToolResult(map[string]any{"status": "ok", "ready": []map[string]any{}}), "", nil
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].next.Before(rows[j].next) })
-	if len(rows) > 10 {
-		rows = rows[:10]
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 20 {
+		limit = 20
+	}
+	if len(rows) > limit {
+		rows = rows[:limit]
 	}
 	ready := make([]map[string]any, 0, len(rows))
 	for _, r := range rows {
 		ready = append(ready, h.flowToolPayload(ctx, r.flow))
 	}
 	return marshalToolResult(map[string]any{"status": "ok", "ready": ready}), "", nil
+}
+
+func (h *Harness) queryLibrary(ctx context.Context, query string, scope string, subjectType string, limit int) (string, string, error) {
+	query = strings.TrimSpace(strings.ToLower(query))
+	scope = strings.TrimSpace(strings.ToLower(scope))
+	if scope == "" {
+		scope = "both"
+	}
+	if scope != "flows" && scope != "media" && scope != "both" {
+		return marshalToolResult(map[string]any{"status": "invalid_scope", "scope": scope}), "", nil
+	}
+	subjectType = strings.TrimSpace(strings.ToLower(subjectType))
+	if subjectType != "" && subjectType != "movie" && subjectType != "season" && subjectType != "episode" {
+		return marshalToolResult(map[string]any{"status": "invalid_subject_type", "subject_type": subjectType}), "", nil
+	}
+	if limit <= 0 {
+		limit = 12
+	}
+	if limit > 50 {
+		limit = 50
+	}
+
+	flowResults := make([]map[string]any, 0, limit)
+	mediaResults := make([]map[string]any, 0, limit)
+	flowTotal := 0
+	mediaTotal := 0
+	movieFlowCount := 0
+	seasonFlowCount := 0
+	showNames := map[string]struct{}{}
+
+	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		flows, err := tx.ListFlows(ctx)
+		if err != nil {
+			return err
+		}
+		for _, flow := range flows {
+			typeLower := strings.ToLower(strings.TrimSpace(flow.SubjectType))
+			if !isProjectionSubjectType(typeLower) || flow.State == domain.FlowStateDeleteQueued {
+				continue
+			}
+			switch typeLower {
+			case "movie":
+				movieFlowCount++
+			case "season":
+				seasonFlowCount++
+				if name := h.seasonSeriesName(ctx, tx, flow); name != "" {
+					showNames[name] = struct{}{}
+				}
+			}
+
+			if subjectType != "" && subjectType != typeLower && !(subjectType == "episode" && typeLower == "season") {
+				continue
+			}
+			if scope == "flows" || scope == "both" {
+				title := strings.ToLower(strings.TrimSpace(flow.DisplayName))
+				if query == "" || strings.Contains(title, query) {
+					flowTotal++
+					if len(flowResults) < limit {
+						flowResults = append(flowResults, flowToolPayloadInTx(flow, h.seasonSeriesName(ctx, tx, flow)))
+					}
+				}
+			}
+
+			if scope == "media" || scope == "both" {
+				if typeLower == "movie" {
+					itemID := flowSubjectID(flow.ItemID)
+					if itemID != "" {
+						if m, ok, err := tx.GetMedia(ctx, itemID); err == nil && ok {
+							if subjectType == "" || subjectType == "movie" {
+								if mediaMatchesQuery(m, query) {
+									mediaTotal++
+									if len(mediaResults) < limit {
+										mediaResults = append(mediaResults, mediaToolPayload(m))
+									}
+								}
+							}
+						}
+					}
+				}
+				if typeLower == "season" {
+					seasonID := flowSubjectID(flow.ItemID)
+					if seasonID == "" {
+						continue
+					}
+					media, err := tx.ListMediaBySubject(ctx, "season", seasonID)
+					if err != nil {
+						continue
+					}
+					for _, m := range media {
+						itemType := strings.ToLower(strings.TrimSpace(m.ItemType))
+						if subjectType != "" && subjectType != itemType && !(subjectType == "season" && itemType == "episode") {
+							continue
+						}
+						if !mediaMatchesQuery(m, query) {
+							continue
+						}
+						mediaTotal++
+						if len(mediaResults) < limit {
+							mediaResults = append(mediaResults, mediaToolPayload(m))
+						}
+					}
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return "", "", err
+	}
+
+	payload := map[string]any{
+		"status":                  "ok",
+		"scope":                   scope,
+		"query":                   query,
+		"subject_type":            subjectType,
+		"flow_total":              flowTotal,
+		"media_total":             mediaTotal,
+		"movie_projection_count":  movieFlowCount,
+		"season_projection_count": seasonFlowCount,
+		"tv_show_count":           len(showNames),
+	}
+	if scope == "flows" || scope == "both" {
+		payload["flows"] = flowResults
+	}
+	if scope == "media" || scope == "both" {
+		payload["media"] = mediaResults
+	}
+	return marshalToolResult(payload), "", nil
+}
+
+func (h *Harness) seasonSeriesName(ctx context.Context, tx repo.TxRepository, flow domain.Flow) string {
+	if seasonID := flowSubjectID(flow.ItemID); seasonID != "" {
+		if seasonID != "" {
+			media, err := tx.ListMediaBySubject(ctx, "season", seasonID)
+			if err == nil {
+				for _, item := range media {
+					name := strings.TrimSpace(item.SeriesName)
+					if name != "" {
+						return strings.ToLower(name)
+					}
+				}
+			}
+		}
+	}
+	label := strings.TrimSpace(flow.DisplayName)
+	if label == "" {
+		return ""
+	}
+	lower := strings.ToLower(label)
+	if idx := strings.LastIndex(lower, " of "); idx >= 0 && idx+4 < len(lower) {
+		return strings.TrimSpace(lower[idx+4:])
+	}
+	return ""
+}
+
+func flowSubjectID(itemID string) string {
+	parts := strings.SplitN(strings.TrimSpace(itemID), ":", 3)
+	if len(parts) != 3 || parts[0] != "target" {
+		return ""
+	}
+	return domain.NormalizeID(parts[2])
+}
+
+func mediaMatchesQuery(m domain.MediaItem, query string) bool {
+	if query == "" {
+		return true
+	}
+	haystack := strings.ToLower(strings.TrimSpace(strings.Join([]string{m.Name, m.Title, m.SeriesName, m.SeasonName}, " ")))
+	return strings.Contains(haystack, query)
+}
+
+func mediaToolPayload(m domain.MediaItem) map[string]any {
+	payload := map[string]any{
+		"name":      strings.TrimSpace(m.Name),
+		"item_type": strings.ToLower(strings.TrimSpace(m.ItemType)),
+	}
+	if strings.TrimSpace(m.SeriesName) != "" {
+		payload["series_name"] = strings.TrimSpace(m.SeriesName)
+	}
+	if strings.TrimSpace(m.SeasonName) != "" {
+		payload["season_name"] = strings.TrimSpace(m.SeasonName)
+	}
+	if !m.LastPlayedAt.IsZero() {
+		payload["last_played_at"] = m.LastPlayedAt.UTC().Format(time.RFC3339)
+	}
+	if !m.CreatedAt.IsZero() {
+		payload["created_at"] = m.CreatedAt.UTC().Format(time.RFC3339)
+	}
+	return payload
+}
+
+func flowToolPayloadInTx(flow domain.Flow, seriesName string) map[string]any {
+	title := strings.TrimSpace(flow.DisplayName)
+	if title == "" {
+		title = "Untitled target"
+	}
+	payload := map[string]any{
+		"title":        title,
+		"subject_type": strings.ToLower(strings.TrimSpace(flow.SubjectType)),
+		"flow_state":   string(flow.State),
+		"archived":     flow.State == domain.FlowStateArchived,
+		"ready":        flow.State == domain.FlowStatePendingReview || (flow.State == domain.FlowStateActive && !flow.NextActionAt.IsZero() && !flow.NextActionAt.After(time.Now().UTC())),
+	}
+	if !flow.NextActionAt.IsZero() {
+		payload["next_action_at"] = flow.NextActionAt.UTC().Format(time.RFC3339)
+	}
+	if strings.TrimSpace(seriesName) != "" {
+		payload["series_name"] = strings.TrimSpace(seriesName)
+	}
+	return payload
 }
 
 func (h *Harness) setReviewDays(ctx context.Context, days int) (string, string, error) {

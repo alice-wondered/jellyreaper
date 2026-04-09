@@ -982,6 +982,165 @@ func TestIngestBackfillItemsSchedulesDeferredEvaluateFromLastPlay(t *testing.T) 
 	}
 }
 
+func TestIngestBackfillReplayIsIdempotentForSameRevision(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 8, 14, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	item := jellyfin.ItemSnapshot{
+		ItemID:             "movie-backfill-replay-1",
+		ItemType:           "Movie",
+		Name:               "Replay Safe Movie",
+		DateLastMediaAdded: now.Add(-2 * time.Hour),
+		LastPlayedAt:       now.Add(-3 * time.Hour),
+		PlayCount:          2,
+	}
+
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{item}); err != nil {
+		t.Fatalf("first backfill ingest: %v", err)
+	}
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{item}); err != nil {
+		t.Fatalf("replayed backfill ingest: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, "target:movie:movie-backfill-replay-1")
+	if flow.DisplayName != "Replay Safe Movie" {
+		t.Fatalf("expected stable flow display after replay, got %q", flow.DisplayName)
+	}
+	media := mustGetMedia(t, store, "movie-backfill-replay-1")
+	if media.PlayCountTotal != 2 {
+		t.Fatalf("expected stable play count after replay, got %d", media.PlayCountTotal)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		key := backfillItemDedupeKey(item, 0)
+		processed, err := tx.IsProcessed(context.Background(), key)
+		if err != nil {
+			return err
+		}
+		if !processed {
+			t.Fatalf("expected backfill dedupe key %q to be marked processed", key)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify dedupe key: %v", err)
+	}
+
+	jobs, err := store.LeaseDueJobs(context.Background(), now.Add(365*24*time.Hour), 100, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease jobs: %v", err)
+	}
+	evaluateJobs := 0
+	for _, job := range jobs {
+		if job.Kind == domain.JobKindEvaluatePolicy && job.ItemID == "target:movie:movie-backfill-replay-1" {
+			evaluateJobs++
+		}
+	}
+	if evaluateJobs != 1 {
+		t.Fatalf("expected exactly one evaluate job for replayed backfill item, got %d", evaluateJobs)
+	}
+}
+
+func TestBackfillAfterLivePlaybackCanAdvanceMissedDowntimePlay(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	base := time.Date(2026, 4, 8, 12, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return base }
+
+	item := jellyfin.ItemSnapshot{
+		ItemID:             "movie-magicians-1",
+		ItemType:           "Movie",
+		Name:               "The Magicians",
+		DateLastMediaAdded: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
+		LastPlayedAt:       base.Add(-3 * time.Hour),
+		PlayCount:          1,
+	}
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{item}); err != nil {
+		t.Fatalf("seed backfill: %v", err)
+	}
+
+	livePlay := base.Add(-2 * time.Hour)
+	if err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload:    jellyfin.WebhookPayload{ItemID: "movie-magicians-1", ItemType: "Movie", NotificationType: "PlaybackStart", EventID: "evt-live-play-1"},
+		Raw:        map[string]any{"EventId": "evt-live-play-1"},
+		ItemID:     "movie-magicians-1",
+		EventID:    "evt-live-play-1",
+		EventType:  "PlaybackStart",
+		DedupeKey:  "jellyfin:evt-live-play-1",
+		OccurredAt: livePlay,
+	}); err != nil {
+		t.Fatalf("live playback webhook: %v", err)
+	}
+
+	missedPlay := base.Add(-time.Hour)
+	item.LastPlayedAt = missedPlay
+	item.PlayCount = 3
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{item}); err != nil {
+		t.Fatalf("downtime backfill replay: %v", err)
+	}
+
+	media := mustGetMedia(t, store, "movie-magicians-1")
+	if !media.LastPlayedAt.Equal(missedPlay) {
+		t.Fatalf("expected backfill to advance last played after downtime, got=%s want=%s", media.LastPlayedAt, missedPlay)
+	}
+	if media.PlayCountTotal != 3 {
+		t.Fatalf("expected backfill to advance play count after downtime, got %d", media.PlayCountTotal)
+	}
+}
+
+func TestFullBackfillOverLiveIndexCanAdvancePlaybackWithoutRegression(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	base := time.Date(2026, 4, 8, 15, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return base }
+
+	if err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload:    jellyfin.WebhookPayload{ItemID: "movie-magicians-2", ItemType: "Movie", Name: "The Magicians", NotificationType: "ItemAdded", EventID: "evt-live-add-2"},
+		Raw:        map[string]any{"EventId": "evt-live-add-2"},
+		ItemID:     "movie-magicians-2",
+		EventID:    "evt-live-add-2",
+		EventType:  "ItemAdded",
+		DedupeKey:  "jellyfin:evt-live-add-2",
+		OccurredAt: base.Add(-4 * time.Hour),
+	}); err != nil {
+		t.Fatalf("seed live item added: %v", err)
+	}
+
+	livePlay := base.Add(-3 * time.Hour)
+	if err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload:    jellyfin.WebhookPayload{ItemID: "movie-magicians-2", ItemType: "Movie", NotificationType: "PlaybackStart", EventID: "evt-live-play-2"},
+		Raw:        map[string]any{"EventId": "evt-live-play-2"},
+		ItemID:     "movie-magicians-2",
+		EventID:    "evt-live-play-2",
+		EventType:  "PlaybackStart",
+		DedupeKey:  "jellyfin:evt-live-play-2",
+		OccurredAt: livePlay,
+	}); err != nil {
+		t.Fatalf("seed live playback: %v", err)
+	}
+
+	missedPlay := base.Add(-time.Hour)
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+		ItemID:             "movie-magicians-2",
+		ItemType:           "Movie",
+		Name:               "The Magicians",
+		DateLastMediaAdded: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
+		LastPlayedAt:       missedPlay,
+		PlayCount:          5,
+	}}); err != nil {
+		t.Fatalf("full backfill replay over live index: %v", err)
+	}
+
+	media := mustGetMedia(t, store, "movie-magicians-2")
+	if !media.LastPlayedAt.Equal(missedPlay) {
+		t.Fatalf("expected full backfill to advance last played over live index, got=%s want=%s", media.LastPlayedAt, missedPlay)
+	}
+	if media.PlayCountTotal != 5 {
+		t.Fatalf("expected full backfill to advance play count over live index, got %d", media.PlayCountTotal)
+	}
+}
+
 func TestIngestBackfillItemsEpisodeUsesSeriesProviderIDsAndCache(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)
@@ -1154,6 +1313,20 @@ func TestBackfillItemDedupeKeyUsesRevisionNotOrdinalWhenAvailable(t *testing.T) 
 	keyB := backfillItemDedupeKey(item, 999)
 	if keyA != keyB {
 		t.Fatalf("expected stable dedupe key across ordinals when revision exists: %s != %s", keyA, keyB)
+	}
+}
+
+func TestBackfillItemDedupeKeyChangesWhenPlaybackRevisionChanges(t *testing.T) {
+	added := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	itemA := jellyfin.ItemSnapshot{ItemID: "movie-2", DateLastMediaAdded: added, LastPlayedAt: time.Date(2026, 4, 2, 10, 0, 0, 0, time.UTC), PlayCount: 1}
+	itemB := itemA
+	itemB.LastPlayedAt = itemA.LastPlayedAt.Add(2 * time.Hour)
+	itemB.PlayCount = 2
+
+	keyA := backfillItemDedupeKey(itemA, 1)
+	keyB := backfillItemDedupeKey(itemB, 1)
+	if keyA == keyB {
+		t.Fatalf("expected dedupe key to change when playback revision changes: %s", keyA)
 	}
 }
 
@@ -1837,6 +2010,40 @@ func TestCatalogEventFallsBackToServiceClockWhenPayloadDatesMissing(t *testing.T
 	}
 }
 
+func TestItemAddedUsesEventTimestampWhenDateLastMediaAddedMissing(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 12, 10, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	oldCreated := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	eventAddedAt := time.Date(2026, 4, 10, 12, 30, 0, 0, time.UTC)
+	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:           "movie-ts-item-added",
+			ItemType:         "Movie",
+			Name:             "Added Movie",
+			NotificationType: "ItemAdded",
+			DateCreated:      oldCreated,
+			EventID:          "evt-ts-item-added",
+		},
+		Raw:        map[string]any{"EventId": "evt-ts-item-added"},
+		ItemID:     "movie-ts-item-added",
+		EventID:    "evt-ts-item-added",
+		EventType:  "ItemAdded",
+		DedupeKey:  "jellyfin:evt-ts-item-added",
+		OccurredAt: eventAddedAt,
+	})
+	if err != nil {
+		t.Fatalf("handle webhook: %v", err)
+	}
+
+	media := mustGetMedia(t, store, "movie-ts-item-added")
+	if !media.CreatedAt.Equal(eventAddedAt) {
+		t.Fatalf("expected media created timestamp from item-added event time, got=%s want=%s", media.CreatedAt, eventAddedAt)
+	}
+}
+
 func TestCollectionWebhookDoesNotCreateOperationalFlow(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)
@@ -1912,6 +2119,45 @@ func TestSeriesWebhookDoesNotCreateOperationalFlow(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("verify no series flow created: %v", err)
+	}
+}
+
+func TestSeasonCatalogWebhookDoesNotCreateOperationalFlow(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 12, 10, 50, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:           "season-magicians-1",
+			ItemType:         "Season",
+			Name:             "Season 1",
+			SeriesName:       "The Magicians",
+			NotificationType: "ItemUpdated",
+			EventID:          "evt-season-magicians-1",
+		},
+		Raw:       map[string]any{"EventId": "evt-season-magicians-1"},
+		ItemID:    "season-magicians-1",
+		EventID:   "evt-season-magicians-1",
+		EventType: "ItemUpdated",
+		DedupeKey: "jellyfin:evt-season-magicians-1",
+	})
+	if err != nil {
+		t.Fatalf("handle season webhook: %v", err)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		flows, err := tx.ListFlows(context.Background())
+		if err != nil {
+			return err
+		}
+		if len(flows) != 0 {
+			return fmt.Errorf("expected no operational flows from season-only catalog webhook, got %d", len(flows))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify no season flow created: %v", err)
 	}
 }
 

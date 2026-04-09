@@ -333,6 +333,11 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		if catalogIndexEvent && catalogUpdateAllowed {
 			created := event.Payload.DateLastMediaAdded.UTC()
 			if created.IsZero() {
+				if isItemAddedEvent(event.EventType) && !eventAt.IsZero() {
+					created = eventAt.UTC()
+				}
+			}
+			if created.IsZero() {
 				created = event.Payload.DateCreated.UTC()
 			}
 			if created.IsZero() {
@@ -1513,8 +1518,10 @@ func deriveTargets(event jellyfin.WebhookEvent) []targetRef {
 		seasonLabel := formatSeasonLabel(p.SeasonName, p.SeriesName, p.Name)
 		out = push(out, targetRef{Type: "season", ID: p.SeasonID, Name: seasonLabel, ImageURL: p.PrimaryImageURL})
 	case "season":
-		seasonLabel := formatSeasonLabel(chooseName(p.Name, p.SeasonName), p.SeriesName, p.Name)
-		out = push(out, targetRef{Type: "season", ID: p.ItemID, Name: seasonLabel, ImageURL: p.PrimaryImageURL})
+		if isRemovalEvent(event.EventType) {
+			seasonLabel := formatSeasonLabel(chooseName(p.Name, p.SeasonName), p.SeriesName, p.Name)
+			out = push(out, targetRef{Type: "season", ID: p.ItemID, Name: seasonLabel, ImageURL: p.PrimaryImageURL})
+		}
 	case "series":
 	case "movie":
 		out = push(out, targetRef{Type: "movie", ID: p.ItemID, Name: p.Name, ImageURL: p.PrimaryImageURL})
@@ -1709,6 +1716,17 @@ func isRemovalEvent(eventType string) bool {
 	return strings.Contains(t, "removed") || strings.Contains(t, "deleted")
 }
 
+func isItemAddedEvent(eventType string) bool {
+	t := strings.ToLower(strings.TrimSpace(eventType))
+	if t == "" {
+		return false
+	}
+	if strings.Contains(t, "itemadded") {
+		return true
+	}
+	return strings.Contains(t, "item") && strings.Contains(t, "added")
+}
+
 func catalogEventTimestamp(payload jellyfin.WebhookPayload) time.Time {
 	if payload.DateLastMediaAdded.After(payload.DateCreated) {
 		return payload.DateLastMediaAdded.UTC()
@@ -1833,20 +1851,14 @@ func supportsMediaIndexType(itemType string) bool {
 }
 
 func backfillItemDedupeKey(item jellyfin.ItemSnapshot, ordinal int) string {
-	revision := item.DateLastMediaAdded.UnixNano()
-	if revision == 0 {
-		revision = item.DateCreated.UnixNano()
+	added := item.DateLastMediaAdded.UnixNano()
+	created := item.DateCreated.UnixNano()
+	played := item.LastPlayedAt.UnixNano()
+	plays := int64(item.PlayCount)
+	if added == 0 && created == 0 && played == 0 && plays == 0 {
+		return "backfill:item:" + item.ItemID + ":o" + strconv.Itoa(ordinal)
 	}
-	if revision == 0 {
-		revision = item.LastPlayedAt.UnixNano()
-	}
-	if revision == 0 {
-		revision = int64(item.PlayCount)
-	}
-	if revision == 0 {
-		revision = int64(ordinal)
-	}
-	return "backfill:item:" + item.ItemID + ":" + strconv.FormatInt(revision, 10)
+	return fmt.Sprintf("backfill:item:%s:a%d:c%d:p%d:n%d", item.ItemID, added, created, played, plays)
 }
 
 func formatSeasonLabel(seasonName string, seriesName string, fallback string) string {
