@@ -1518,8 +1518,10 @@ func deriveTargets(event jellyfin.WebhookEvent) []targetRef {
 		seasonLabel := formatSeasonLabel(p.SeasonName, p.SeriesName, p.Name)
 		out = push(out, targetRef{Type: "season", ID: p.SeasonID, Name: seasonLabel, ImageURL: p.PrimaryImageURL})
 	case "season":
-		seasonLabel := formatSeasonLabel(chooseName(p.Name, p.SeasonName), p.SeriesName, p.Name)
-		out = push(out, targetRef{Type: "season", ID: p.ItemID, Name: seasonLabel, ImageURL: p.PrimaryImageURL})
+		if isRemovalEvent(event.EventType) {
+			seasonLabel := formatSeasonLabel(chooseName(p.Name, p.SeasonName), p.SeriesName, p.Name)
+			out = push(out, targetRef{Type: "season", ID: p.ItemID, Name: seasonLabel, ImageURL: p.PrimaryImageURL})
+		}
 	case "series":
 	case "movie":
 		out = push(out, targetRef{Type: "movie", ID: p.ItemID, Name: p.Name, ImageURL: p.PrimaryImageURL})
