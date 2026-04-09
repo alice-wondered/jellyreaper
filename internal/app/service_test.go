@@ -778,14 +778,19 @@ func TestWebhookEpisodeCatalogEventFetchesSeriesProviderIDs(t *testing.T) {
 	seriesFetches := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/Items/ep-provider-1":
-			itemFetches++
+		case r.Method == http.MethodGet && r.URL.Path == "/Items":
+			ids := r.URL.Query().Get("Ids")
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"ProviderIds":{"Imdb":"tt6503782","Tmdb":"5957143"}}`))
-		case r.Method == http.MethodGet && r.URL.Path == "/Items/series-provider-1":
-			seriesFetches++
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"ProviderIds":{"Tvdb":"73244","Imdb":"tt0386676","Tmdb":"2316"}}`))
+			switch ids {
+			case "ep-provider-1":
+				itemFetches++
+				_, _ = w.Write([]byte(`{"Items":[{"ProviderIds":{"Imdb":"tt6503782","Tmdb":"5957143"}}]}`))
+			case "series-provider-1":
+				seriesFetches++
+				_, _ = w.Write([]byte(`{"Items":[{"ProviderIds":{"Tvdb":"73244","Imdb":"tt0386676","Tmdb":"2316"}}]}`))
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -986,10 +991,14 @@ func TestIngestBackfillItemsEpisodeUsesSeriesProviderIDsAndCache(t *testing.T) {
 	seriesFetches := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/Items/series-backfill-1":
+		case r.Method == http.MethodGet && r.URL.Path == "/Items":
+			if r.URL.Query().Get("Ids") != "series-backfill-1" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
 			seriesFetches++
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"ProviderIds":{"Tvdb":"9000","Imdb":"tt-series-backfill","Tmdb":"9001"}}`))
+			_, _ = w.Write([]byte(`{"Items":[{"ProviderIds":{"Tvdb":"9000","Imdb":"tt-series-backfill","Tmdb":"9001"}}]}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
