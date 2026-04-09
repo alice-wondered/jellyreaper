@@ -10,6 +10,7 @@ import (
 )
 
 func TestRemoveSeasonByProviderIDsUpdatesEpisodeMonitorState(t *testing.T) {
+	var sawBulkDelete bool
 	var sawMonitor bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -22,7 +23,14 @@ func TestRemoveSeasonByProviderIDsUpdatesEpisodeMonitorState(t *testing.T) {
 			if got := r.URL.Query().Get("seasonNumber"); got != "3" {
 				t.Fatalf("expected seasonNumber=3, got %q", got)
 			}
-			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1001}, {"id": 1002}})
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1001, "episodeFileId": 501}, {"id": 1002, "episodeFileId": 502}})
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v3/episodefile/bulk":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode bulk delete body: %v", err)
+			}
+			sawBulkDelete = true
+			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPut && r.URL.Path == "/api/v3/episode/monitor":
 			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -45,6 +53,9 @@ func TestRemoveSeasonByProviderIDsUpdatesEpisodeMonitorState(t *testing.T) {
 	}
 	if !sawMonitor {
 		t.Fatal("expected matched season episodes to be unmonitored")
+	}
+	if !sawBulkDelete {
+		t.Fatal("expected matched season episode files to be deleted")
 	}
 }
 

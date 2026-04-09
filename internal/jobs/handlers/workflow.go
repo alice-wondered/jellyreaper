@@ -645,12 +645,34 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 
 	deletedChildren := []domain.MediaItem{}
 	radarrPrimaryDelete := false
+	sonarrPrimarySeasonDelete := false
 	if flow.SubjectType == "season" {
-		children, err := h.deleteAggregateChildren(ctx, flow)
+		children, err := h.listChildren(ctx, "season", strings.TrimPrefix(flow.ItemID, "target:season:"))
 		if err != nil {
 			return err
 		}
 		deletedChildren = children
+		if h.sonarr != nil {
+			providerIDs := projectionProviderIDs(flow.SubjectType, deletedChildren)
+			if len(providerIDs) == 0 {
+				return fmt.Errorf("sonarr primary season delete missing provider ids for %s", flow.ItemID)
+			}
+			seasonNumber := seasonNumberFromDeletedMedia(deletedChildren)
+			if seasonNumber <= 0 {
+				return fmt.Errorf("sonarr primary season delete missing season number for %s", flow.ItemID)
+			}
+			if err := h.sonarr.RemoveSeasonByProviderIDs(ctx, providerIDs, seasonNumber); err != nil {
+				return fmt.Errorf("sonarr primary season delete for %s: %w", flow.ItemID, err)
+			}
+			sonarrPrimarySeasonDelete = true
+		}
+		if !sonarrPrimarySeasonDelete {
+			children, err := h.deleteAggregateChildren(ctx, flow)
+			if err != nil {
+				return err
+			}
+			deletedChildren = children
+		}
 	} else {
 		deleteID := flow.ItemID
 		if strings.HasPrefix(deleteID, "target:item:") || strings.HasPrefix(deleteID, "target:movie:") {
@@ -762,6 +784,9 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 				}
 			}
 		case "season":
+			if sonarrPrimarySeasonDelete {
+				break
+			}
 			if h.sonarr != nil {
 				if len(providerIDs) == 0 {
 					return fmt.Errorf("sonarr removal skipped for %s: missing provider ids", flow.ItemID)

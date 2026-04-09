@@ -195,6 +195,7 @@ func TestExecuteDeleteHandlerSeasonProjectionTriggersSonarrSeasonRemoval(t *test
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete && (r.URL.Path == "/Items/ep-arr-1" || r.URL.Path == "/Items/ep-arr-2") {
+			t.Fatalf("did not expect jellyfin episode delete when sonarr season primary delete is enabled")
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}

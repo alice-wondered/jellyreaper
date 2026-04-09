@@ -60,6 +60,15 @@ func (s *Service) RemoveSeasonByProviderIDs(ctx context.Context, providerIDs map
 	if len(episodeIDs) == 0 {
 		return fmt.Errorf("sonarr season not found or empty for series %d season %d", series.ID, seasonNumber)
 	}
+	episodeFileIDs, err := s.listSeasonEpisodeFileIDs(ctx, series.ID, seasonNumber)
+	if err != nil {
+		return err
+	}
+	if len(episodeFileIDs) > 0 {
+		if err := s.deleteEpisodeFiles(ctx, episodeFileIDs); err != nil {
+			return err
+		}
+	}
 	body, err := json.Marshal(map[string]any{"episodeIds": episodeIDs, "monitored": false})
 	if err != nil {
 		return fmt.Errorf("encode sonarr season monitor payload: %w", err)
@@ -135,7 +144,8 @@ func (s *Service) listSeries(ctx context.Context) ([]seriesResource, error) {
 }
 
 type episodeResource struct {
-	ID int `json:"id"`
+	ID            int `json:"id"`
+	EpisodeFileID int `json:"episodeFileId"`
 }
 
 func (s *Service) listSeasonEpisodeIDs(ctx context.Context, seriesID int, seasonNumber int) ([]int, error) {
@@ -168,4 +178,63 @@ func (s *Service) listSeasonEpisodeIDs(ctx context.Context, seriesID int, season
 		}
 	}
 	return ids, nil
+}
+
+func (s *Service) listSeasonEpisodeFileIDs(ctx context.Context, seriesID int, seasonNumber int) ([]int, error) {
+	endpoint := fmt.Sprintf("%s/api/v3/episode?seriesId=%d&seasonNumber=%d", s.baseURL, seriesID, seasonNumber)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build sonarr episodes(file ids) request: %w", err)
+	}
+	req.Header.Set("X-Api-Key", s.apiKey)
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("perform sonarr episodes(file ids) request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("sonarr episodes(file ids) returned status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read sonarr episodes(file ids) response: %w", err)
+	}
+	var out []episodeResource
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("decode sonarr episodes(file ids) response: %w", err)
+	}
+	set := map[int]struct{}{}
+	for _, ep := range out {
+		if ep.EpisodeFileID > 0 {
+			set[ep.EpisodeFileID] = struct{}{}
+		}
+	}
+	ids := make([]int, 0, len(set))
+	for id := range set {
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func (s *Service) deleteEpisodeFiles(ctx context.Context, fileIDs []int) error {
+	body, err := json.Marshal(map[string]any{"episodeFileIds": fileIDs})
+	if err != nil {
+		return fmt.Errorf("encode sonarr episodefile delete payload: %w", err)
+	}
+	endpoint := fmt.Sprintf("%s/api/v3/episodefile/bulk", s.baseURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build sonarr episodefile bulk delete request: %w", err)
+	}
+	req.Header.Set("X-Api-Key", s.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("perform sonarr episodefile bulk delete request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	return fmt.Errorf("sonarr episodefile bulk delete returned status %d", resp.StatusCode)
 }
