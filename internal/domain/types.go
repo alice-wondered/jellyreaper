@@ -36,27 +36,28 @@ const (
 )
 
 type MediaItem struct {
-	ItemID              string    `json:"item_id"`
-	Name                string    `json:"name"`
-	ItemType            string    `json:"item_type"`
-	SeasonID            string    `json:"season_id"`
-	SeasonName          string    `json:"season_name"`
-	SeriesID            string    `json:"series_id"`
-	SeriesName          string    `json:"series_name"`
-	ImageURL            string    `json:"image_url"`
-	LibraryID           string    `json:"library_id"`
-	Title               string    `json:"title"`
-	Path                string    `json:"path"`
-	SizeBytes           int64     `json:"size_bytes"`
-	CreatedAt           time.Time `json:"created_at"`
-	UpdatedAt           time.Time `json:"updated_at"`
-	LastCatalogEventAt  time.Time `json:"last_catalog_event_at"`
-	LastPlaybackEventAt time.Time `json:"last_playback_event_at"`
-	LastPlayedAt        time.Time `json:"last_played_at"`
-	PlayCountTotal      int64     `json:"play_count_total"`
-	LastUserID          string    `json:"last_user_id"`
-	IsDeletedInJellyfin bool      `json:"is_deleted_in_jellyfin"`
-	IsArchived          bool      `json:"is_archived"`
+	ItemID              string            `json:"item_id"`
+	ProviderIDs         map[string]string `json:"provider_ids,omitempty"`
+	Name                string            `json:"name"`
+	ItemType            string            `json:"item_type"`
+	SeasonID            string            `json:"season_id"`
+	SeasonName          string            `json:"season_name"`
+	SeriesID            string            `json:"series_id"`
+	SeriesName          string            `json:"series_name"`
+	ImageURL            string            `json:"image_url"`
+	LibraryID           string            `json:"library_id"`
+	Title               string            `json:"title"`
+	Path                string            `json:"path"`
+	SizeBytes           int64             `json:"size_bytes"`
+	CreatedAt           time.Time         `json:"created_at"`
+	UpdatedAt           time.Time         `json:"updated_at"`
+	LastCatalogEventAt  time.Time         `json:"last_catalog_event_at"`
+	LastPlaybackEventAt time.Time         `json:"last_playback_event_at"`
+	LastPlayedAt        time.Time         `json:"last_played_at"`
+	PlayCountTotal      int64             `json:"play_count_total"`
+	LastUserID          string            `json:"last_user_id"`
+	IsDeletedInJellyfin bool              `json:"is_deleted_in_jellyfin"`
+	IsArchived          bool              `json:"is_archived"`
 }
 
 type PolicySnapshot struct {

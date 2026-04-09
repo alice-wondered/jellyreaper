@@ -28,8 +28,10 @@ import (
 	api "jellyreaper/internal/http"
 	"jellyreaper/internal/jobs"
 	"jellyreaper/internal/jobs/handlers"
+	"jellyreaper/internal/radarr"
 	"jellyreaper/internal/repo"
 	"jellyreaper/internal/scheduler"
+	"jellyreaper/internal/sonarr"
 	"jellyreaper/internal/worker"
 )
 
@@ -152,6 +154,17 @@ func main() {
 	appService.SetDiscordService(discordService)
 	appService.SetPolicyDefaults(cfg.DefaultLastPlayedThresholdDays, cfg.DefaultDelayWindow)
 	appService.SetDefaultHITLTimeoutHours(cfg.DefaultHITLTimeoutHours)
+	if cfg.JellyfinURL != "" && cfg.JellyfinAPIKey != "" {
+		appService.SetProviderIDFetcher(jellyfin.NewClient(cfg.JellyfinURL, cfg.JellyfinAPIKey, nil))
+	}
+	if cfg.RadarrURL != "" && cfg.RadarrAPIKey != "" {
+		appService.SetRadarrService(radarr.NewService(cfg.RadarrURL, cfg.RadarrAPIKey, cfg.ARRInsecureTLS))
+		logger.Info("radarr service enabled")
+	}
+	if cfg.SonarrURL != "" && cfg.SonarrAPIKey != "" {
+		appService.SetSonarrService(sonarr.NewService(cfg.SonarrURL, cfg.SonarrAPIKey, cfg.ARRInsecureTLS))
+		logger.Info("sonarr service enabled")
+	}
 	if assistant != nil {
 		assistant.SetDecisionService(appService)
 	}

@@ -52,6 +52,11 @@ type Config struct {
 	JellyfinPort         string
 	JellyfinAPIKey       string
 	JellyfinWebhookToken string
+	RadarrURL            string
+	RadarrAPIKey         string
+	SonarrURL            string
+	SonarrAPIKey         string
+	ARRInsecureTLS       bool
 
 	BackfillEnabled            bool
 	BackfillInterval           time.Duration
@@ -190,6 +195,15 @@ func LoadFromEnv() (Config, error) {
 		defaultHITLTimeoutHours = parsed
 	}
 
+	arrInsecureTLS := false
+	if raw := strings.TrimSpace(os.Getenv("ARR_INSECURE_TLS")); raw != "" {
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse ARR_INSECURE_TLS: %w", err)
+		}
+		arrInsecureTLS = parsed
+	}
+
 	cfg := Config{
 		HTTPAddr: httpAddr,
 		HTTPPort: httpPort,
@@ -207,6 +221,11 @@ func LoadFromEnv() (Config, error) {
 		JellyfinPort:         jellyfinPort,
 		JellyfinAPIKey:       os.Getenv("JELLYFIN_API_KEY"),
 		JellyfinWebhookToken: strings.TrimSpace(os.Getenv("JELLYFIN_WEBHOOK_TOKEN")),
+		RadarrURL:            strings.TrimSpace(os.Getenv("RADARR_URL")),
+		RadarrAPIKey:         strings.TrimSpace(os.Getenv("RADARR_API_KEY")),
+		SonarrURL:            strings.TrimSpace(os.Getenv("SONARR_URL")),
+		SonarrAPIKey:         strings.TrimSpace(os.Getenv("SONARR_API_KEY")),
+		ARRInsecureTLS:       arrInsecureTLS,
 
 		BackfillEnabled:            backfillEnabled,
 		BackfillInterval:           backfillInterval,
