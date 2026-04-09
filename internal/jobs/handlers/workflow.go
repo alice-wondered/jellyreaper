@@ -597,6 +597,7 @@ type ExecuteDeleteHandler struct {
 	repository repo.Repository
 	client     *jellyfin.Client
 	discord    *discord.Service
+	logger     *slog.Logger
 	radarr     radarrRemover
 	sonarr     sonarrRemover
 }
@@ -610,11 +611,17 @@ type sonarrRemover interface {
 }
 
 func NewExecuteDeleteHandler(repository repo.Repository, client *jellyfin.Client) *ExecuteDeleteHandler {
-	return &ExecuteDeleteHandler{repository: repository, client: client}
+	return &ExecuteDeleteHandler{repository: repository, client: client, logger: slog.Default()}
 }
 
 func (h *ExecuteDeleteHandler) SetDiscordService(discordSvc *discord.Service) {
 	h.discord = discordSvc
+}
+
+func (h *ExecuteDeleteHandler) SetLogger(logger *slog.Logger) {
+	if logger != nil {
+		h.logger = logger
+	}
 }
 
 func (h *ExecuteDeleteHandler) SetRadarrService(remover radarrRemover) {
@@ -653,14 +660,15 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 		}
 		deletedChildren = children
 		if h.sonarr != nil {
-			providerIDs := projectionProviderIDs(flow.SubjectType, deletedChildren)
+			providerIDs := domain.NormalizeProviderIDs(flow.ProviderIDs)
 			if len(providerIDs) == 0 {
-				return fmt.Errorf("sonarr primary season delete missing provider ids for %s", flow.ItemID)
+				return fmt.Errorf("sonarr primary season delete missing projection provider ids for %s", flow.ItemID)
 			}
 			seasonNumber := seasonNumberFromDeletedMedia(deletedChildren)
 			if seasonNumber <= 0 {
 				return fmt.Errorf("sonarr primary season delete missing season number for %s", flow.ItemID)
 			}
+			h.logger.Info("execute delete sonarr primary season action", "lex", "DELETE-SONARR", "item_id", flow.ItemID, "season_number", seasonNumber, "child_count", len(deletedChildren))
 			if err := h.sonarr.RemoveSeasonByProviderIDs(ctx, providerIDs, seasonNumber); err != nil {
 				return fmt.Errorf("sonarr primary season delete for %s: %w", flow.ItemID, err)
 			}
@@ -687,9 +695,9 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 		}
 
 		if h.radarr != nil && (flow.SubjectType == "movie" || flow.SubjectType == "item") {
-			providerIDs := projectionProviderIDs(flow.SubjectType, deletedChildren)
+			providerIDs := domain.NormalizeProviderIDs(flow.ProviderIDs)
 			if len(providerIDs) == 0 {
-				return fmt.Errorf("radarr primary delete missing provider ids for %s", flow.ItemID)
+				return fmt.Errorf("radarr primary delete missing projection provider ids for %s", flow.ItemID)
 			}
 			if err := h.radarr.RemoveByProviderIDs(ctx, providerIDs); err != nil {
 				return fmt.Errorf("radarr primary delete for %s: %w", flow.ItemID, err)
@@ -776,8 +784,9 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 				break
 			}
 			if h.radarr != nil {
+				providerIDs = domain.NormalizeProviderIDs(flow.ProviderIDs)
 				if len(providerIDs) == 0 {
-					return fmt.Errorf("radarr removal skipped for %s: missing provider ids", flow.ItemID)
+					return fmt.Errorf("radarr removal skipped for %s: missing projection provider ids", flow.ItemID)
 				}
 				if err := h.radarr.RemoveByProviderIDs(ctx, providerIDs); err != nil {
 					return fmt.Errorf("radarr projection removal for %s: %w", flow.ItemID, err)
@@ -788,13 +797,15 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 				break
 			}
 			if h.sonarr != nil {
+				providerIDs = domain.NormalizeProviderIDs(flow.ProviderIDs)
 				if len(providerIDs) == 0 {
-					return fmt.Errorf("sonarr removal skipped for %s: missing provider ids", flow.ItemID)
+					return fmt.Errorf("sonarr removal skipped for %s: missing projection provider ids", flow.ItemID)
 				}
 				seasonNumber := seasonNumberFromDeletedMedia(deletedChildren)
 				if seasonNumber <= 0 {
 					return fmt.Errorf("sonarr removal skipped for %s: missing season number", flow.ItemID)
 				}
+				h.logger.Info("execute delete sonarr projection season action", "lex", "DELETE-SONARR", "item_id", flow.ItemID, "season_number", seasonNumber, "child_count", len(deletedChildren))
 				if err := h.sonarr.RemoveSeasonByProviderIDs(ctx, providerIDs, seasonNumber); err != nil {
 					return fmt.Errorf("sonarr projection removal for %s: %w", flow.ItemID, err)
 				}

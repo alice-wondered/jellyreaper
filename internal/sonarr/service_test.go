@@ -12,10 +12,14 @@ import (
 func TestRemoveSeasonByProviderIDsUpdatesEpisodeMonitorState(t *testing.T) {
 	var sawBulkDelete bool
 	var sawMonitor bool
+	var sawSeriesDelete bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/series":
 			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 77, "tvdbId": 73244, "imdbId": "tt0386676", "title": "Sample Series"}})
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/v3/series"):
+			sawSeriesDelete = true
+			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/episode":
 			if got := r.URL.Query().Get("seriesId"); got != "77" {
 				t.Fatalf("expected seriesId=77, got %q", got)
@@ -56,6 +60,9 @@ func TestRemoveSeasonByProviderIDsUpdatesEpisodeMonitorState(t *testing.T) {
 	}
 	if !sawBulkDelete {
 		t.Fatal("expected matched season episode files to be deleted")
+	}
+	if sawSeriesDelete {
+		t.Fatal("did not expect any sonarr series delete endpoint call during season operation")
 	}
 }
 

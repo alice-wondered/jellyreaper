@@ -119,6 +119,7 @@ func TestExecuteDeleteHandlerMovieProjectionTriggersRadarrRemoval(t *testing.T) 
 			FlowID:      "flow:target:movie:mv-arr",
 			ItemID:      "target:movie:mv-arr",
 			SubjectType: "movie",
+			ProviderIDs: map[string]string{"tmdb": "603", "imdb": "tt0133093"},
 			DisplayName: "Movie ARR",
 			State:       domain.FlowStateDeleteQueued,
 			Version:     0,
@@ -177,6 +178,7 @@ func TestExecuteDeleteHandlerSeasonProjectionTriggersSonarrSeasonRemoval(t *test
 			FlowID:      "flow:target:season:season-arr",
 			ItemID:      "target:season:season-arr",
 			SubjectType: "season",
+			ProviderIDs: map[string]string{"tvdb": "73244", "imdb": "tt0386676", "tmdb": "2316"},
 			DisplayName: "Season ARR",
 			State:       domain.FlowStateDeleteQueued,
 			Version:     0,
@@ -185,10 +187,10 @@ func TestExecuteDeleteHandlerSeasonProjectionTriggersSonarrSeasonRemoval(t *test
 		}, 0); err != nil {
 			return err
 		}
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-arr-1", ItemType: "Episode", SeasonID: "season-arr", SeasonName: "Season 3", ProviderIDs: map[string]string{"tvdb": "73244"}, UpdatedAt: now}); err != nil {
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-arr-1", ItemType: "Episode", SeasonID: "season-arr", SeasonName: "Season 3", SeriesID: "series-arr", ProviderIDs: map[string]string{"imdb": "tt6503782", "tmdb": "5957143"}, UpdatedAt: now}); err != nil {
 			return err
 		}
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-arr-2", ItemType: "Episode", SeasonID: "season-arr", SeasonName: "Season 3", ProviderIDs: map[string]string{"tvdb": "73244"}, UpdatedAt: now})
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-arr-2", ItemType: "Episode", SeasonID: "season-arr", SeasonName: "Season 3", SeriesID: "series-arr", ProviderIDs: map[string]string{"imdb": "tt6503782", "tmdb": "5957143"}, UpdatedAt: now})
 	}); err != nil {
 		t.Fatalf("seed season state: %v", err)
 	}
@@ -215,6 +217,15 @@ func TestExecuteDeleteHandlerSeasonProjectionTriggersSonarrSeasonRemoval(t *test
 	}
 	if sonarrSpy.season != 3 {
 		t.Fatalf("expected sonarr season operation to target season 3, got %d", sonarrSpy.season)
+	}
+	if sonarrSpy.last["tvdb"] != "73244" {
+		t.Fatalf("expected season operation to use series-level tvdb id, got %q", sonarrSpy.last["tvdb"])
+	}
+	if sonarrSpy.last["imdb"] != "tt0386676" {
+		t.Fatalf("expected season operation to use series-level imdb id, got %q", sonarrSpy.last["imdb"])
+	}
+	if sonarrSpy.last["tmdb"] != "2316" {
+		t.Fatalf("expected season operation to use series-level tmdb id, got %q", sonarrSpy.last["tmdb"])
 	}
 }
 
