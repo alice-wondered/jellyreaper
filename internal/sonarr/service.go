@@ -1,6 +1,7 @@
 package sonarr
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -38,9 +39,12 @@ func (s *Service) Enabled() bool {
 	return s != nil && s.baseURL != "" && s.apiKey != ""
 }
 
-func (s *Service) RemoveByProviderIDs(ctx context.Context, providerIDs map[string]string) error {
+func (s *Service) RemoveSeasonByProviderIDs(ctx context.Context, providerIDs map[string]string, seasonNumber int) error {
 	if !s.Enabled() {
 		return nil
+	}
+	if seasonNumber <= 0 {
+		return fmt.Errorf("invalid season number: %d", seasonNumber)
 	}
 	series, found, err := s.findSeries(ctx, providerIDs)
 	if err != nil {
@@ -49,21 +53,33 @@ func (s *Service) RemoveByProviderIDs(ctx context.Context, providerIDs map[strin
 	if !found {
 		return fmt.Errorf("sonarr series not found for provider ids: %v", providerIDs)
 	}
-	endpoint := fmt.Sprintf("%s/api/v3/series/%d?deleteFiles=false&addImportListExclusion=false", s.baseURL, series.ID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	episodeIDs, err := s.listSeasonEpisodeIDs(ctx, series.ID, seasonNumber)
 	if err != nil {
-		return fmt.Errorf("build sonarr delete request: %w", err)
+		return err
+	}
+	if len(episodeIDs) == 0 {
+		return fmt.Errorf("sonarr season not found or empty for series %d season %d", series.ID, seasonNumber)
+	}
+	body, err := json.Marshal(map[string]any{"episodeIds": episodeIDs, "monitored": false})
+	if err != nil {
+		return fmt.Errorf("encode sonarr season monitor payload: %w", err)
+	}
+	endpoint := fmt.Sprintf("%s/api/v3/episode/monitor", s.baseURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build sonarr season monitor request: %w", err)
 	}
 	req.Header.Set("X-Api-Key", s.apiKey)
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("perform sonarr delete request: %w", err)
+		return fmt.Errorf("perform sonarr season monitor request: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
 	}
-	return fmt.Errorf("sonarr delete returned status %d", resp.StatusCode)
+	return fmt.Errorf("sonarr season monitor returned status %d", resp.StatusCode)
 }
 
 func (s *Service) findSeries(ctx context.Context, providerIDs map[string]string) (seriesResource, bool, error) {
@@ -116,4 +132,40 @@ func (s *Service) listSeries(ctx context.Context) ([]seriesResource, error) {
 		return nil, fmt.Errorf("decode sonarr series response: %w", err)
 	}
 	return out, nil
+}
+
+type episodeResource struct {
+	ID int `json:"id"`
+}
+
+func (s *Service) listSeasonEpisodeIDs(ctx context.Context, seriesID int, seasonNumber int) ([]int, error) {
+	endpoint := fmt.Sprintf("%s/api/v3/episode?seriesId=%d&seasonNumber=%d", s.baseURL, seriesID, seasonNumber)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build sonarr episodes request: %w", err)
+	}
+	req.Header.Set("X-Api-Key", s.apiKey)
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("perform sonarr episodes request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("sonarr episodes returned status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read sonarr episodes response: %w", err)
+	}
+	var out []episodeResource
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("decode sonarr episodes response: %w", err)
+	}
+	ids := make([]int, 0, len(out))
+	for _, ep := range out {
+		if ep.ID > 0 {
+			ids = append(ids, ep.ID)
+		}
+	}
+	return ids, nil
 }
