@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"jellyreaper/internal/domain"
 	gen "jellyreaper/internal/jellyfin/gen"
 )
 
@@ -85,7 +86,7 @@ func TestBackfillFetchChangedItemsSince(t *testing.T) {
 	if len(items) != 1 {
 		t.Fatalf("unexpected changed item count: %d", len(items))
 	}
-	if items[0].ItemID != id.String() || items[0].Name != "Movie C" {
+	if items[0].ItemID != domain.NormalizeID(id.String()) || items[0].Name != "Movie C" {
 		t.Fatalf("unexpected changed item: %#v", items[0])
 	}
 	if items[0].PlayCount != 7 {
@@ -303,7 +304,7 @@ func TestBackfillFetchChangedItemsPageIncludesRecentUserPlaysWhenCatalogPageEmpt
 	if len(page.Items) != 1 {
 		t.Fatalf("expected one merged recent-play item, got %d", len(page.Items))
 	}
-	if page.Items[0].ItemID != itemID.String() {
+	if page.Items[0].ItemID != domain.NormalizeID(itemID.String()) {
 		t.Fatalf("unexpected merged item id: %q", page.Items[0].ItemID)
 	}
 	if !page.Items[0].LastPlayedAt.Equal(recentPlay) {
@@ -450,7 +451,7 @@ func TestBackfillFetchChangedItemsSinceRealisticAnonymizedUserPlaybackPattern(t 
 	var movie ItemSnapshot
 	foundMovie := false
 	for _, it := range items {
-		if it.ItemID == movieID.String() {
+		if it.ItemID == domain.NormalizeID(movieID.String()) {
 			movie = it
 			foundMovie = true
 			break

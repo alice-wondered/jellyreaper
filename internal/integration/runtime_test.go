@@ -447,7 +447,8 @@ func TestIntegrationBackfillUsesUserPlaybackToDeferReviewScheduling(t *testing.T
 			t.Fatalf("unexpected movie last played: got=%s want~=%s", media.LastPlayedAt, recentPlay)
 		}
 
-		jobID := "job:eval:scheduled:target:movie:" + movieID
+		canonicalMovieID := domain.NormalizeID(movieID)
+		jobID := "job:eval:scheduled:target:movie:" + canonicalMovieID
 		job, found, err := tx.GetJob(context.Background(), jobID)
 		if err != nil {
 			return err
@@ -469,7 +470,7 @@ func TestIntegrationBackfillUsesUserPlaybackToDeferReviewScheduling(t *testing.T
 		t.Fatalf("lease due jobs: %v", err)
 	}
 	for _, job := range leased {
-		if job.Kind == domain.JobKindSendHITLPrompt && job.ItemID == "target:movie:"+movieID {
+		if job.Kind == domain.JobKindSendHITLPrompt && job.ItemID == "target:movie:"+domain.NormalizeID(movieID) {
 			t.Fatalf("did not expect immediate HITL prompt job for recently played movie")
 		}
 	}
@@ -555,13 +556,14 @@ func TestIntegrationCanonicalizesIDsAcrossBackfillAndWebhookSources(t *testing.T
 			return err
 		}
 		if !found {
-			t.Fatalf("expected canonical dashed media record")
+			t.Fatalf("expected canonical media record")
 		}
 		if media.LastPlayedAt.Before(webhookPlay.Add(-time.Second)) || media.LastPlayedAt.After(webhookPlay.Add(time.Second)) {
 			t.Fatalf("expected webhook playback timestamp to win, got=%s want~=%s", media.LastPlayedAt, webhookPlay)
 		}
 
-		flowID := "target:movie:" + dashedID
+		canonicalID := domain.NormalizeID(dashedID)
+		flowID := "target:movie:" + canonicalID
 		flow, found, err := tx.GetFlow(context.Background(), flowID)
 		if err != nil {
 			return err
@@ -573,13 +575,13 @@ func TestIntegrationCanonicalizesIDsAcrossBackfillAndWebhookSources(t *testing.T
 			t.Fatalf("unexpected flow item id: %s", flow.ItemID)
 		}
 
-		if _, found, err := tx.GetFlow(context.Background(), "target:movie:"+nonDashedID); err != nil {
+		if _, found, err := tx.GetFlow(context.Background(), "target:movie:"+dashedID); err != nil {
 			return err
 		} else if found {
-			t.Fatalf("did not expect non-canonical movie flow key")
+			t.Fatalf("did not expect dashed movie flow key")
 		}
 
-		canonicalJobID := "job:eval:scheduled:target:movie:" + dashedID
+		canonicalJobID := "job:eval:scheduled:target:movie:" + canonicalID
 		job, found, err := tx.GetJob(context.Background(), canonicalJobID)
 		if err != nil {
 			return err
@@ -587,13 +589,13 @@ func TestIntegrationCanonicalizesIDsAcrossBackfillAndWebhookSources(t *testing.T
 		if !found {
 			t.Fatalf("expected canonical scheduled evaluate job")
 		}
-		if job.ItemID != "target:movie:"+dashedID {
+		if job.ItemID != "target:movie:"+canonicalID {
 			t.Fatalf("expected canonical job item id, got %s", job.ItemID)
 		}
-		if _, found, err := tx.GetJob(context.Background(), "job:eval:scheduled:target:movie:"+nonDashedID); err != nil {
+		if _, found, err := tx.GetJob(context.Background(), "job:eval:scheduled:target:movie:"+dashedID); err != nil {
 			return err
 		} else if found {
-			t.Fatalf("did not expect non-canonical scheduled evaluate job")
+			t.Fatalf("did not expect dashed scheduled evaluate job")
 		}
 		return nil
 	})

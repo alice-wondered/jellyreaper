@@ -1,21 +1,26 @@
 package domain
 
 import (
+	"regexp"
 	"strings"
-
-	"github.com/google/uuid"
 )
+
+var dashedHexIDPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+var nodashHexIDPattern = regexp.MustCompile(`(?i)^[0-9a-f]{32}$`)
 
 func NormalizeID(raw string) string {
 	id := strings.TrimSpace(raw)
 	if id == "" {
 		return ""
 	}
-	parsed, err := uuid.Parse(id)
-	if err != nil {
-		return id
+	lower := strings.ToLower(id)
+	if dashedHexIDPattern.MatchString(lower) {
+		return strings.ReplaceAll(lower, "-", "")
 	}
-	return strings.ToLower(parsed.String())
+	if nodashHexIDPattern.MatchString(lower) {
+		return lower
+	}
+	return id
 }
 
 func AlternateIDForms(raw string) []string {
@@ -24,12 +29,12 @@ func AlternateIDForms(raw string) []string {
 		return nil
 	}
 	forms := []string{normalized}
-	if _, err := uuid.Parse(normalized); err != nil {
+	if !nodashHexIDPattern.MatchString(normalized) {
 		return forms
 	}
-	nodash := strings.ReplaceAll(normalized, "-", "")
-	if nodash != normalized {
-		forms = append(forms, nodash)
+	dashed := normalized[:8] + "-" + normalized[8:12] + "-" + normalized[12:16] + "-" + normalized[16:20] + "-" + normalized[20:]
+	if dashed != normalized {
+		forms = append(forms, dashed)
 	}
 	return forms
 }
