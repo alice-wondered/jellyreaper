@@ -308,6 +308,10 @@ func TestIntegrationBackfillIndexesStateFromGeneratedTypes(t *testing.T) {
 					{"Id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8", "Name": "BF Movie", "DateCreated": now.Format(time.RFC3339), "DateLastMediaAdded": now.Format(time.RFC3339)},
 				},
 			})
+		case "/Users":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"Id": "u1"}})
+		case "/Users/u1/Items":
+			_ = json.NewEncoder(w).Encode(map[string]any{"Items": []map[string]any{}})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
