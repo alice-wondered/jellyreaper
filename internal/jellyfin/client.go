@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"jellyreaper/internal/domain"
 )
 
@@ -75,7 +77,8 @@ func (c *Client) FetchProviderIDs(ctx context.Context, itemID string) (map[strin
 		return nil, fmt.Errorf("item id is required")
 	}
 
-	endpoint := c.baseURL + "/Items/" + url.PathEscape(itemID) + "?Fields=ProviderIds"
+	candidate := providerIDCandidate(itemID)
+	endpoint := c.baseURL + "/Items/" + url.PathEscape(candidate) + "?Fields=ProviderIds"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build jellyfin provider ids request: %w", err)
@@ -86,14 +89,15 @@ func (c *Client) FetchProviderIDs(ctx context.Context, itemID string) (map[strin
 	if err != nil {
 		return nil, fmt.Errorf("perform jellyfin provider ids request: %w", err)
 	}
-	defer resp.Body.Close()
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	_ = resp.Body.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("read jellyfin provider ids response: %w", readErr)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("jellyfin provider ids request failed with status %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, fmt.Errorf("read jellyfin provider ids response: %w", err)
-	}
+
 	var payload struct {
 		ProviderIds map[string]string `json:"ProviderIds"`
 	}
@@ -101,4 +105,15 @@ func (c *Client) FetchProviderIDs(ctx context.Context, itemID string) (map[strin
 		return nil, fmt.Errorf("decode jellyfin provider ids response: %w", err)
 	}
 	return domain.NormalizeProviderIDs(payload.ProviderIds), nil
+}
+
+func providerIDCandidate(itemID string) string {
+	normalized := domain.NormalizeID(itemID)
+	if normalized == "" {
+		return ""
+	}
+	if _, err := uuid.Parse(normalized); err != nil {
+		return normalized
+	}
+	return strings.ReplaceAll(normalized, "-", "")
 }

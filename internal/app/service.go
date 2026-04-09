@@ -61,6 +61,7 @@ type Service struct {
 	jellyfinClient        *jellyfin.Client
 	providerIDsMu         sync.RWMutex
 	providerIDsCache      map[string]map[string]string
+	providerIDsMissCache  map[string]struct{}
 	backfillBatchSize     int
 	backfillBatchTimeout  time.Duration
 	backfillQueueCapacity int
@@ -82,6 +83,7 @@ func NewService(repository repo.Repository, logger *slog.Logger, wake func(time.
 		defaultExpireDays:     defaultExpireDays,
 		defaultHITLTimeoutHrs: defaultHITLTimeoutH,
 		providerIDsCache:      map[string]map[string]string{},
+		providerIDsMissCache:  map[string]struct{}{},
 		backfillBatchSize:     defaultBackfillBatchSize,
 		backfillBatchTimeout:  defaultBackfillBatchTimeout,
 		backfillQueueCapacity: defaultBackfillQueueCapacity,
@@ -182,6 +184,7 @@ func (s *Service) SetJellyfinClient(client *jellyfin.Client) {
 	s.jellyfinClient = client
 	s.providerIDsMu.Lock()
 	s.providerIDsCache = map[string]map[string]string{}
+	s.providerIDsMissCache = map[string]struct{}{}
 	s.providerIDsMu.Unlock()
 }
 
@@ -1230,16 +1233,28 @@ func (s *Service) fetchProviderIDsCached(ctx context.Context, itemID string) (ma
 		s.providerIDsMu.RUnlock()
 		return domain.NormalizeProviderIDs(cached), nil
 	}
+	if _, missed := s.providerIDsMissCache[itemID]; missed {
+		s.providerIDsMu.RUnlock()
+		return nil, nil
+	}
 	s.providerIDsMu.RUnlock()
 
 	ids, err := s.jellyfinClient.FetchProviderIDs(ctx, itemID)
 	if err != nil {
+		s.providerIDsMu.Lock()
+		s.providerIDsMissCache[itemID] = struct{}{}
+		s.providerIDsMu.Unlock()
 		return nil, err
 	}
 	norm := domain.NormalizeProviderIDs(ids)
 
 	s.providerIDsMu.Lock()
-	s.providerIDsCache[itemID] = domain.NormalizeProviderIDs(norm)
+	if len(norm) == 0 {
+		s.providerIDsMissCache[itemID] = struct{}{}
+	} else {
+		delete(s.providerIDsMissCache, itemID)
+		s.providerIDsCache[itemID] = domain.NormalizeProviderIDs(norm)
+	}
 	s.providerIDsMu.Unlock()
 
 	return norm, nil
