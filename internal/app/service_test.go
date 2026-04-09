@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -766,6 +768,118 @@ func TestWebhookEpisodeCatalogEventAggregatesToSeasonTarget(t *testing.T) {
 	}
 }
 
+func TestWebhookEpisodeCatalogEventFetchesSeriesProviderIDs(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 7, 15, 30, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	itemFetches := 0
+	seriesFetches := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/Items/ep-provider-1":
+			itemFetches++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ProviderIds":{"Imdb":"tt6503782","Tmdb":"5957143"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/Items/series-provider-1":
+			seriesFetches++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ProviderIds":{"Tvdb":"73244","Imdb":"tt0386676","Tmdb":"2316"}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	svc.SetJellyfinClient(jellyfin.NewClient(server.URL, "api-key", server.Client()))
+
+	event := jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:           "ep-provider-1",
+			ItemType:         "Episode",
+			Name:             "Pilot",
+			SeasonID:         "season-provider-1",
+			SeasonName:       "Season 1",
+			SeriesID:         "series-provider-1",
+			SeriesName:       "My Show",
+			NotificationType: "ItemUpdated",
+			EventID:          "evt-provider-1",
+		},
+		Raw:       map[string]any{"EventId": "evt-provider-1"},
+		ItemID:    "ep-provider-1",
+		EventID:   "evt-provider-1",
+		EventType: "ItemUpdated",
+		DedupeKey: "jellyfin:evt-provider-1",
+	}
+
+	if err := svc.HandleJellyfinWebhook(context.Background(), event); err != nil {
+		t.Fatalf("handle webhook: %v", err)
+	}
+
+	media := mustGetMedia(t, store, "ep-provider-1")
+	if media.ProviderIDs["tvdb"] != "73244" {
+		t.Fatalf("expected episode media tvdb id from series provider ids, got %q", media.ProviderIDs["tvdb"])
+	}
+	if media.ProviderIDs["imdb"] != "tt0386676" {
+		t.Fatalf("expected episode media imdb id from series provider ids, got %q", media.ProviderIDs["imdb"])
+	}
+	if media.ProviderIDs["tmdb"] != "2316" {
+		t.Fatalf("expected episode media tmdb id from series provider ids, got %q", media.ProviderIDs["tmdb"])
+	}
+	seasonFlow := mustGetFlow(t, store, "target:season:season-provider-1")
+	if seasonFlow.ProviderIDs["tvdb"] != "73244" {
+		t.Fatalf("expected season flow tvdb id from series provider ids, got %q", seasonFlow.ProviderIDs["tvdb"])
+	}
+	if seasonFlow.ProviderIDs["imdb"] != "tt0386676" {
+		t.Fatalf("expected season flow imdb id from series provider ids, got %q", seasonFlow.ProviderIDs["imdb"])
+	}
+	if seasonFlow.ProviderIDs["tmdb"] != "2316" {
+		t.Fatalf("expected season flow tmdb id from series provider ids, got %q", seasonFlow.ProviderIDs["tmdb"])
+	}
+	if itemFetches != 1 {
+		t.Fatalf("expected one episode provider id fetch, got %d", itemFetches)
+	}
+	if seriesFetches != 1 {
+		t.Fatalf("expected one series provider id fetch, got %d", seriesFetches)
+	}
+}
+
+func TestWebhookMovieCatalogEventStoresProjectionProviderIDs(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 7, 15, 45, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	event := jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:           "movie-provider-1",
+			ItemType:         "Movie",
+			Name:             "Movie Provider",
+			ProviderIDs:      map[string]string{"tmdb": "603", "imdb": "tt0133093"},
+			NotificationType: "ItemUpdated",
+			EventID:          "evt-movie-provider-1",
+		},
+		Raw:       map[string]any{"EventId": "evt-movie-provider-1"},
+		ItemID:    "movie-provider-1",
+		EventID:   "evt-movie-provider-1",
+		EventType: "ItemUpdated",
+		DedupeKey: "jellyfin:evt-movie-provider-1",
+	}
+
+	if err := svc.HandleJellyfinWebhook(context.Background(), event); err != nil {
+		t.Fatalf("handle webhook: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, "target:movie:movie-provider-1")
+	if flow.ProviderIDs["tmdb"] != "603" {
+		t.Fatalf("expected movie flow tmdb provider id, got %q", flow.ProviderIDs["tmdb"])
+	}
+	if flow.ProviderIDs["imdb"] != "tt0133093" {
+		t.Fatalf("expected movie flow imdb provider id, got %q", flow.ProviderIDs["imdb"])
+	}
+}
+
 func TestParseCustomIDWithColonsInTargetID(t *testing.T) {
 	parsed, err := parseCustomID("jr:v1:archive:target:series:series:part:1:42")
 	if err != nil {
@@ -860,6 +974,85 @@ func TestIngestBackfillItemsSchedulesDeferredEvaluateFromLastPlay(t *testing.T) 
 	}
 	if len(jobsDue) != 1 || jobsDue[0].Kind != domain.JobKindEvaluatePolicy {
 		t.Fatalf("unexpected due jobs: %#v", jobsDue)
+	}
+}
+
+func TestIngestBackfillItemsEpisodeUsesSeriesProviderIDsAndCache(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 8, 9, 30, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	seriesFetches := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/Items/series-backfill-1":
+			seriesFetches++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ProviderIds":{"Tvdb":"9000","Imdb":"tt-series-backfill","Tmdb":"9001"}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	svc.SetJellyfinClient(jellyfin.NewClient(server.URL, "api-key", server.Client()))
+
+	err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{
+		{
+			ItemID:       "ep-backfill-provider-1",
+			ItemType:     "Episode",
+			SeasonID:     "season-backfill-1",
+			SeasonName:   "Season 1",
+			SeriesID:     "series-backfill-1",
+			SeriesName:   "Show B",
+			Name:         "Episode 1",
+			ProviderIDs:  map[string]string{"imdb": "tt-episode-1", "tmdb": "7001"},
+			LastPlayedAt: now,
+		},
+		{
+			ItemID:       "ep-backfill-provider-2",
+			ItemType:     "Episode",
+			SeasonID:     "season-backfill-1",
+			SeasonName:   "Season 1",
+			SeriesID:     "series-backfill-1",
+			SeriesName:   "Show B",
+			Name:         "Episode 2",
+			ProviderIDs:  map[string]string{"imdb": "tt-episode-2", "tmdb": "7002"},
+			LastPlayedAt: now,
+		},
+	})
+	if err != nil {
+		t.Fatalf("ingest backfill items: %v", err)
+	}
+
+	media1 := mustGetMedia(t, store, "ep-backfill-provider-1")
+	if media1.ProviderIDs["tvdb"] != "9000" {
+		t.Fatalf("expected tvdb id from series provider ids for backfill episode, got %q", media1.ProviderIDs["tvdb"])
+	}
+	if media1.ProviderIDs["imdb"] != "tt-series-backfill" {
+		t.Fatalf("expected imdb id from series provider ids for backfill episode, got %q", media1.ProviderIDs["imdb"])
+	}
+	if media1.ProviderIDs["tmdb"] != "9001" {
+		t.Fatalf("expected tmdb id from series provider ids for backfill episode, got %q", media1.ProviderIDs["tmdb"])
+	}
+
+	media2 := mustGetMedia(t, store, "ep-backfill-provider-2")
+	if media2.ProviderIDs["tvdb"] != "9000" {
+		t.Fatalf("expected tvdb id from series provider ids for second backfill episode, got %q", media2.ProviderIDs["tvdb"])
+	}
+	seasonFlow := mustGetFlow(t, store, "target:season:season-backfill-1")
+	if seasonFlow.ProviderIDs["tvdb"] != "9000" {
+		t.Fatalf("expected season projection tvdb id from series provider ids, got %q", seasonFlow.ProviderIDs["tvdb"])
+	}
+	if seasonFlow.ProviderIDs["imdb"] != "tt-series-backfill" {
+		t.Fatalf("expected season projection imdb id from series provider ids, got %q", seasonFlow.ProviderIDs["imdb"])
+	}
+	if seasonFlow.ProviderIDs["tmdb"] != "9001" {
+		t.Fatalf("expected season projection tmdb id from series provider ids, got %q", seasonFlow.ProviderIDs["tmdb"])
+	}
+	if seriesFetches != 1 {
+		t.Fatalf("expected one series provider id fetch across multiple episodes, got %d", seriesFetches)
 	}
 }
 

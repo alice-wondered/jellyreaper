@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -58,6 +59,8 @@ type Service struct {
 	defaultExpireDays     int
 	defaultHITLTimeoutHrs int
 	jellyfinClient        *jellyfin.Client
+	providerIDsMu         sync.RWMutex
+	providerIDsCache      map[string]map[string]string
 	backfillBatchSize     int
 	backfillBatchTimeout  time.Duration
 	backfillQueueCapacity int
@@ -78,6 +81,7 @@ func NewService(repository repo.Repository, logger *slog.Logger, wake func(time.
 		defaultDelayWindow:    defaultDelayDuration,
 		defaultExpireDays:     defaultExpireDays,
 		defaultHITLTimeoutHrs: defaultHITLTimeoutH,
+		providerIDsCache:      map[string]map[string]string{},
 		backfillBatchSize:     defaultBackfillBatchSize,
 		backfillBatchTimeout:  defaultBackfillBatchTimeout,
 		backfillQueueCapacity: defaultBackfillQueueCapacity,
@@ -176,17 +180,13 @@ func (s *Service) SetDiscordService(discordSvc *discord.Service) {
 
 func (s *Service) SetJellyfinClient(client *jellyfin.Client) {
 	s.jellyfinClient = client
+	s.providerIDsMu.Lock()
+	s.providerIDsCache = map[string]map[string]string{}
+	s.providerIDsMu.Unlock()
 }
 
 func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.WebhookEvent) error {
-	if s.jellyfinClient != nil && isCatalogIndexEvent(event.EventType) && !isRemovalEvent(event.EventType) && event.ItemID != "" && len(event.Payload.ProviderIDs) == 0 {
-		providerIDs, err := s.jellyfinClient.FetchProviderIDs(ctx, event.ItemID)
-		if err != nil {
-			s.logger.Warn("failed to lazy-fetch jellyfin provider ids", "item_id", event.ItemID, "error", err)
-		} else if len(providerIDs) > 0 {
-			event.Payload.ProviderIDs = providerIDs
-		}
-	}
+	s.enrichProviderIDsFromJellyfin(ctx, &event)
 
 	now := s.now().UTC()
 	if sourceNow, ok := sourceTimestampForJellyfinEvent(event); ok {
@@ -442,6 +442,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 	}
 
 	for _, target := range targets {
+		targetProviderIDs := projectionProviderIDsForTarget(target, event)
 		flow, found, err := tx.GetFlow(ctx, target.Canonical)
 		if err != nil {
 			return err
@@ -457,6 +458,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 				FlowID:      flowIDFromItem(target.Canonical),
 				ItemID:      target.Canonical,
 				SubjectType: target.Type,
+				ProviderIDs: targetProviderIDs,
 				DisplayName: target.Name,
 				ImageURL:    target.ImageURL,
 				State:       domain.FlowStateActive,
@@ -480,6 +482,11 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 				catalogFlowUpdateAllowed = false
 			}
 			if catalogIndexEvent {
+				mergedProviderIDs := domain.MergeProviderIDs(flow.ProviderIDs, targetProviderIDs)
+				if !providerIDMapsEqual(flow.ProviderIDs, mergedProviderIDs) {
+					flow.ProviderIDs = mergedProviderIDs
+					flowNeedsWrite = true
+				}
 				if catalogFlowUpdateAllowed && target.Name != "" && flow.DisplayName != target.Name {
 					flow.DisplayName = target.Name
 					flowNeedsWrite = true
@@ -1113,6 +1120,7 @@ func (s *Service) processWebhookBatches(ctx context.Context, ops <-chan backfill
 					continue
 				}
 				event := *op.event
+				s.enrichProviderIDsFromJellyfin(ctx, &event)
 				now := s.now().UTC()
 				if sourceNow, ok := sourceTimestampForJellyfinEvent(event); ok {
 					now = sourceNow
@@ -1172,6 +1180,69 @@ func (s *Service) processWebhookBatches(ctx context.Context, ops <-chan backfill
 			timer.Reset(flushTimeout)
 		}
 	}
+}
+
+func (s *Service) enrichProviderIDsFromJellyfin(ctx context.Context, event *jellyfin.WebhookEvent) {
+	if s.jellyfinClient == nil || event == nil || !isCatalogIndexEvent(event.EventType) || isRemovalEvent(event.EventType) {
+		return
+	}
+
+	providerIDs := domain.NormalizeProviderIDs(event.Payload.ProviderIDs)
+	if len(providerIDs) == 0 && strings.TrimSpace(event.ItemID) != "" {
+		ids, err := s.fetchProviderIDsCached(ctx, event.ItemID)
+		if err != nil {
+			s.logger.Warn("failed to lazy-fetch jellyfin provider ids", "item_id", event.ItemID, "error", err)
+		} else {
+			providerIDs = domain.MergeProviderIDs(providerIDs, ids)
+		}
+	}
+
+	if strings.EqualFold(strings.TrimSpace(event.Payload.ItemType), "episode") {
+		seriesID := strings.TrimSpace(event.Payload.SeriesID)
+		if seriesID != "" {
+			seriesIDs, err := s.fetchProviderIDsCached(ctx, seriesID)
+			if err != nil {
+				s.logger.Warn("failed to fetch jellyfin series provider ids for episode", "item_id", event.ItemID, "series_id", seriesID, "error", err)
+			} else {
+				if providerIDs == nil {
+					providerIDs = map[string]string{}
+				}
+				for _, key := range []string{"tvdb", "tmdb", "imdb"} {
+					if val := strings.TrimSpace(seriesIDs[key]); val != "" {
+						providerIDs[key] = val
+					}
+				}
+			}
+		}
+	}
+
+	event.Payload.ProviderIDs = providerIDs
+}
+
+func (s *Service) fetchProviderIDsCached(ctx context.Context, itemID string) (map[string]string, error) {
+	itemID = domain.NormalizeID(itemID)
+	if itemID == "" || s.jellyfinClient == nil {
+		return nil, nil
+	}
+
+	s.providerIDsMu.RLock()
+	if cached, ok := s.providerIDsCache[itemID]; ok {
+		s.providerIDsMu.RUnlock()
+		return domain.NormalizeProviderIDs(cached), nil
+	}
+	s.providerIDsMu.RUnlock()
+
+	ids, err := s.jellyfinClient.FetchProviderIDs(ctx, itemID)
+	if err != nil {
+		return nil, err
+	}
+	norm := domain.NormalizeProviderIDs(ids)
+
+	s.providerIDsMu.Lock()
+	s.providerIDsCache[itemID] = domain.NormalizeProviderIDs(norm)
+	s.providerIDsMu.Unlock()
+
+	return norm, nil
 }
 
 type customID struct {
@@ -1537,6 +1608,46 @@ func upsertEvaluatePolicyJob(ctx context.Context, tx repo.TxRepository, flow dom
 
 func targetKey(targetType, id string) string {
 	return "target:" + targetType + ":" + domain.NormalizeID(id)
+}
+
+func projectionProviderIDsForTarget(target targetRef, event jellyfin.WebhookEvent) map[string]string {
+	norm := domain.NormalizeProviderIDs(event.Payload.ProviderIDs)
+	if len(norm) == 0 {
+		return nil
+	}
+	out := map[string]string{}
+	switch target.Type {
+	case "season":
+		for _, key := range []string{"tvdb", "tmdb", "imdb"} {
+			if v := strings.TrimSpace(norm[key]); v != "" {
+				out[key] = v
+			}
+		}
+	case "movie":
+		for _, key := range []string{"tmdb", "imdb"} {
+			if v := strings.TrimSpace(norm[key]); v != "" {
+				out[key] = v
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func providerIDMapsEqual(a map[string]string, b map[string]string) bool {
+	an := domain.NormalizeProviderIDs(a)
+	bn := domain.NormalizeProviderIDs(b)
+	if len(an) != len(bn) {
+		return false
+	}
+	for k, v := range an {
+		if bn[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 func inferSubjectType(canonical string) string {

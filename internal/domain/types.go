@@ -75,23 +75,24 @@ type DiscordContext struct {
 }
 
 type Flow struct {
-	FlowID             string         `json:"flow_id"`
-	ItemID             string         `json:"item_id"`
-	SubjectType        string         `json:"subject_type"`
-	EpisodeCount       int            `json:"episode_count"`
-	DisplayName        string         `json:"display_name"`
-	ImageURL           string         `json:"image_url"`
-	State              FlowState      `json:"state"`
-	Version            int64          `json:"version"`
-	PolicySnapshot     PolicySnapshot `json:"policy_snapshot"`
-	NextActionAt       time.Time      `json:"next_action_at"`
-	DecisionDeadlineAt time.Time      `json:"decision_deadline_at"`
-	Discord            DiscordContext `json:"discord"`
-	LastError          string         `json:"last_error"`
-	HITLOutcome        string         `json:"hitl_outcome"`
-	LastCatalogEventAt time.Time      `json:"last_catalog_event_at"`
-	CreatedAt          time.Time      `json:"created_at"`
-	UpdatedAt          time.Time      `json:"updated_at"`
+	FlowID             string            `json:"flow_id"`
+	ItemID             string            `json:"item_id"`
+	SubjectType        string            `json:"subject_type"`
+	ProviderIDs        map[string]string `json:"provider_ids,omitempty"`
+	EpisodeCount       int               `json:"episode_count"`
+	DisplayName        string            `json:"display_name"`
+	ImageURL           string            `json:"image_url"`
+	State              FlowState         `json:"state"`
+	Version            int64             `json:"version"`
+	PolicySnapshot     PolicySnapshot    `json:"policy_snapshot"`
+	NextActionAt       time.Time         `json:"next_action_at"`
+	DecisionDeadlineAt time.Time         `json:"decision_deadline_at"`
+	Discord            DiscordContext    `json:"discord"`
+	LastError          string            `json:"last_error"`
+	HITLOutcome        string            `json:"hitl_outcome"`
+	LastCatalogEventAt time.Time         `json:"last_catalog_event_at"`
+	CreatedAt          time.Time         `json:"created_at"`
+	UpdatedAt          time.Time         `json:"updated_at"`
 }
 
 type Event struct {

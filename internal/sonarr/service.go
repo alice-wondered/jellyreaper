@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ type Service struct {
 	baseURL string
 	apiKey  string
 	http    *http.Client
+	logger  *slog.Logger
 }
 
 type seriesResource struct {
@@ -32,6 +34,13 @@ func NewService(baseURL, apiKey string) *Service {
 		baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
 		apiKey:  strings.TrimSpace(apiKey),
 		http:    &http.Client{Timeout: 20 * time.Second, Transport: transport},
+		logger:  slog.Default(),
+	}
+}
+
+func (s *Service) SetLogger(logger *slog.Logger) {
+	if logger != nil {
+		s.logger = logger
 	}
 }
 
@@ -46,6 +55,7 @@ func (s *Service) RemoveSeasonByProviderIDs(ctx context.Context, providerIDs map
 	if seasonNumber <= 0 {
 		return fmt.Errorf("invalid season number: %d", seasonNumber)
 	}
+	s.logger.Info("sonarr season delete start", "lex", "SONARR-DELETE", "season_number", seasonNumber, "tvdb", strings.TrimSpace(providerIDs["tvdb"]), "tmdb", strings.TrimSpace(providerIDs["tmdb"]), "imdb", strings.TrimSpace(providerIDs["imdb"]))
 	series, found, err := s.findSeries(ctx, providerIDs)
 	if err != nil {
 		return err
@@ -53,6 +63,7 @@ func (s *Service) RemoveSeasonByProviderIDs(ctx context.Context, providerIDs map
 	if !found {
 		return fmt.Errorf("sonarr series not found for provider ids: %v", providerIDs)
 	}
+	s.logger.Info("sonarr season delete resolved series", "lex", "SONARR-DELETE", "series_id", series.ID, "series_title", strings.TrimSpace(series.Title), "season_number", seasonNumber)
 	episodeIDs, err := s.listSeasonEpisodeIDs(ctx, series.ID, seasonNumber)
 	if err != nil {
 		return err
@@ -60,11 +71,14 @@ func (s *Service) RemoveSeasonByProviderIDs(ctx context.Context, providerIDs map
 	if len(episodeIDs) == 0 {
 		return fmt.Errorf("sonarr season not found or empty for series %d season %d", series.ID, seasonNumber)
 	}
+	s.logger.Info("sonarr season delete loaded episodes", "lex", "SONARR-DELETE", "series_id", series.ID, "season_number", seasonNumber, "episode_count", len(episodeIDs), "endpoint", "/api/v3/episode")
 	episodeFileIDs, err := s.listSeasonEpisodeFileIDs(ctx, series.ID, seasonNumber)
 	if err != nil {
 		return err
 	}
+	s.logger.Info("sonarr season delete loaded episode files", "lex", "SONARR-DELETE", "series_id", series.ID, "season_number", seasonNumber, "episode_file_count", len(episodeFileIDs), "endpoint", "/api/v3/episode")
 	if len(episodeFileIDs) > 0 {
+		s.logger.Info("sonarr season delete deleting episode files", "lex", "SONARR-DELETE", "series_id", series.ID, "season_number", seasonNumber, "episode_file_count", len(episodeFileIDs), "endpoint", "/api/v3/episodefile/bulk")
 		if err := s.deleteEpisodeFiles(ctx, episodeFileIDs); err != nil {
 			return err
 		}
@@ -74,6 +88,7 @@ func (s *Service) RemoveSeasonByProviderIDs(ctx context.Context, providerIDs map
 		return fmt.Errorf("encode sonarr season monitor payload: %w", err)
 	}
 	endpoint := fmt.Sprintf("%s/api/v3/episode/monitor", s.baseURL)
+	s.logger.Info("sonarr season delete unmonitoring episodes", "lex", "SONARR-DELETE", "series_id", series.ID, "season_number", seasonNumber, "episode_count", len(episodeIDs), "endpoint", "/api/v3/episode/monitor")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("build sonarr season monitor request: %w", err)
@@ -86,6 +101,7 @@ func (s *Service) RemoveSeasonByProviderIDs(ctx context.Context, providerIDs map
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		s.logger.Info("sonarr season delete complete", "lex", "SONARR-DELETE", "series_id", series.ID, "season_number", seasonNumber, "episode_count", len(episodeIDs), "episode_file_count", len(episodeFileIDs))
 		return nil
 	}
 	return fmt.Errorf("sonarr season monitor returned status %d", resp.StatusCode)
