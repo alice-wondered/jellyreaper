@@ -28,12 +28,14 @@ type BackfillService struct {
 	apiKey        string
 	httpClient    *http.Client
 	progressHook  func(FetchProgress)
+	warningHook   func(string, error)
 	usersMu       sync.Mutex
 	cachedUsers   []userSummary
 	usersCachedAt time.Time
 }
 
 const usersCacheTTL = 30 * time.Minute
+const userItemsIDsChunkSize = 80
 
 type FetchProgress struct {
 	Stream           string
@@ -114,6 +116,10 @@ func NewBackfillServiceWithClient(client BackfillClient) *BackfillService {
 
 func (s *BackfillService) SetProgressHook(hook func(FetchProgress)) {
 	s.progressHook = hook
+}
+
+func (s *BackfillService) SetWarningHook(hook func(string, error)) {
+	s.warningHook = hook
 }
 
 func (s *BackfillService) FetchPlaybackEventsSince(ctx context.Context, since time.Time, limit int32) ([]PlaybackEvent, error) {
@@ -300,40 +306,54 @@ func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.
 			return ItemPage{}, htmlResponseError("items endpoint", resp.HTTPResponse, resp.Body)
 		}
 	}
-	if body == nil || body.Items == nil || len(*body.Items) == 0 {
-		return ItemPage{Items: []ItemSnapshot{}, NextStartIndex: startIndex, HasMore: false, TotalRecordCount: 0}, nil
+	out := make([]ItemSnapshot, 0)
+	nextStart := startIndex
+	hasMore := false
+	totalCount := 0
+	if body != nil && body.Items != nil {
+		totalCount = safeTotalCount(body.TotalRecordCount)
+		nextStart = startIndex + int32(len(*body.Items))
+		hasMore = int32(len(*body.Items)) >= pageSize
+		out = make([]ItemSnapshot, 0, len(*body.Items))
+		for _, item := range *body.Items {
+			itemID := uuidString(item.Id)
+			itemType := stringValueFromKind(item.Type)
+			imageURL := buildPrimaryImageURL(s.baseURL, itemID, item.ImageTags)
+			out = append(out, ItemSnapshot{
+				ItemID:             itemID,
+				ItemType:           itemType,
+				SeasonID:           uuidString(item.SeasonId),
+				SeasonName:         safeString(item.SeasonName),
+				SeriesID:           uuidString(item.SeriesId),
+				SeriesName:         safeString(item.SeriesName),
+				Name:               safeString(item.Name),
+				ImageURL:           imageURL,
+				LastPlayedAt:       safeNestedLastPlayed(item.UserData),
+				PlayCount:          safeNestedPlayCount(item.UserData),
+				DateCreated:        safeTime(item.DateCreated),
+				DateLastMediaAdded: safeTime(item.DateLastMediaAdded),
+			})
+		}
 	}
 
-	out := make([]ItemSnapshot, 0, len(*body.Items))
-	for _, item := range *body.Items {
-		itemID := uuidString(item.Id)
-		itemType := stringValueFromKind(item.Type)
-		imageURL := buildPrimaryImageURL(s.baseURL, itemID, item.ImageTags)
-		out = append(out, ItemSnapshot{
-			ItemID:             itemID,
-			ItemType:           itemType,
-			SeasonID:           uuidString(item.SeasonId),
-			SeasonName:         safeString(item.SeasonName),
-			SeriesID:           uuidString(item.SeriesId),
-			SeriesName:         safeString(item.SeriesName),
-			Name:               safeString(item.Name),
-			ImageURL:           imageURL,
-			LastPlayedAt:       safeNestedLastPlayed(item.UserData),
-			PlayCount:          safeNestedPlayCount(item.UserData),
-			DateCreated:        safeTime(item.DateCreated),
-			DateLastMediaAdded: safeTime(item.DateLastMediaAdded),
-		})
+	if !since.IsZero() && startIndex == 0 {
+		if recent, err := s.fetchRecentlyPlayedAcrossUsersSince(ctx, since, pageSize); err == nil && len(recent) > 0 {
+			out = mergeRecentSnapshots(out, recent)
+		}
 	}
 
-	if enriched, err := s.enrichItemsWithAllUsersPlayback(ctx, out); err == nil {
+	if enriched, err := s.enrichItemsWithAllUsersPlayback(ctx, out); err != nil {
+		out = enriched
+		s.emitWarning("user-playback-enrichment", err)
+	} else {
 		out = enriched
 	}
 
 	return ItemPage{
 		Items:            out,
-		NextStartIndex:   startIndex + int32(len(*body.Items)),
-		HasMore:          int32(len(*body.Items)) >= pageSize,
-		TotalRecordCount: safeTotalCount(body.TotalRecordCount),
+		NextStartIndex:   nextStart,
+		HasMore:          hasMore,
+		TotalRecordCount: totalCount,
 	}, nil
 }
 
@@ -343,8 +363,16 @@ type userSummary struct {
 
 type usersItemsResponse struct {
 	Items []struct {
-		ID       string `json:"Id"`
-		UserData *struct {
+		ID                 string     `json:"Id"`
+		Type               string     `json:"Type"`
+		Name               string     `json:"Name"`
+		SeasonID           string     `json:"SeasonId"`
+		SeasonName         string     `json:"SeasonName"`
+		SeriesID           string     `json:"SeriesId"`
+		SeriesName         string     `json:"SeriesName"`
+		DateCreated        *time.Time `json:"DateCreated"`
+		DateLastMediaAdded *time.Time `json:"DateLastMediaAdded"`
+		UserData           *struct {
 			LastPlayedDate *time.Time `json:"LastPlayedDate"`
 			PlayCount      *int32     `json:"PlayCount"`
 		} `json:"UserData"`
@@ -377,24 +405,32 @@ func (s *BackfillService) enrichItemsWithAllUsersPlayback(ctx context.Context, i
 
 	lastPlayed := map[string]time.Time{}
 	playCount := map[string]int32{}
+	chunkFailures := 0
+	var firstErr error
 	for _, user := range users {
-		userItems, err := s.fetchUserItemsPlayback(ctx, user.ID, ids)
-		if err != nil {
-			continue
-		}
-		for _, it := range userItems.Items {
-			id := strings.TrimSpace(it.ID)
-			if id == "" || it.UserData == nil {
+		for _, chunk := range chunkItemIDs(ids, userItemsIDsChunkSize) {
+			userItems, err := s.fetchUserItemsPlayback(ctx, user.ID, chunk)
+			if err != nil {
+				chunkFailures++
+				if firstErr == nil {
+					firstErr = err
+				}
 				continue
 			}
-			if it.UserData.LastPlayedDate != nil {
-				ts := it.UserData.LastPlayedDate.UTC()
-				if ts.After(lastPlayed[id]) {
-					lastPlayed[id] = ts
+			for _, it := range userItems.Items {
+				id := strings.TrimSpace(it.ID)
+				if id == "" || it.UserData == nil {
+					continue
 				}
-			}
-			if it.UserData.PlayCount != nil && *it.UserData.PlayCount > playCount[id] {
-				playCount[id] = *it.UserData.PlayCount
+				if it.UserData.LastPlayedDate != nil {
+					ts := it.UserData.LastPlayedDate.UTC()
+					if ts.After(lastPlayed[id]) {
+						lastPlayed[id] = ts
+					}
+				}
+				if it.UserData.PlayCount != nil && *it.UserData.PlayCount > playCount[id] {
+					playCount[id] = *it.UserData.PlayCount
+				}
 			}
 		}
 	}
@@ -406,6 +442,9 @@ func (s *BackfillService) enrichItemsWithAllUsersPlayback(ctx context.Context, i
 		if pc, ok := playCount[id]; ok && pc > items[idx].PlayCount {
 			items[idx].PlayCount = pc
 		}
+	}
+	if chunkFailures > 0 {
+		return items, fmt.Errorf("user playback enrichment had %d failed user-item chunks: %w", chunkFailures, firstErr)
 	}
 	return items, nil
 }
@@ -488,10 +527,184 @@ func (s *BackfillService) fetchUserItemsPlayback(ctx context.Context, userID str
 	return out, nil
 }
 
+func (s *BackfillService) fetchRecentlyPlayedAcrossUsersSince(ctx context.Context, since time.Time, limit int32) ([]ItemSnapshot, error) {
+	if since.IsZero() {
+		return nil, nil
+	}
+	users, err := s.fetchUsersCached(ctx)
+	if err != nil || len(users) == 0 {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 500
+	}
+
+	merged := map[string]ItemSnapshot{}
+	for _, user := range users {
+		start := int32(0)
+		for {
+			page, hasMore, nextStart, err := s.fetchUserRecentlyPlayedPage(ctx, user.ID, since, start, limit)
+			if err != nil {
+				break
+			}
+			if len(page.Items) == 0 {
+				break
+			}
+
+			for _, raw := range page.Items {
+				if raw.UserData == nil || raw.UserData.LastPlayedDate == nil {
+					continue
+				}
+				played := raw.UserData.LastPlayedDate.UTC()
+				if played.Before(since) {
+					continue
+				}
+				id := strings.TrimSpace(raw.ID)
+				if id == "" {
+					continue
+				}
+				item := merged[id]
+				item.ItemID = id
+				if strings.TrimSpace(item.ItemType) == "" {
+					item.ItemType = strings.TrimSpace(raw.Type)
+				}
+				if strings.TrimSpace(item.Name) == "" {
+					item.Name = strings.TrimSpace(raw.Name)
+				}
+				if strings.TrimSpace(item.SeasonID) == "" {
+					item.SeasonID = strings.TrimSpace(raw.SeasonID)
+				}
+				if strings.TrimSpace(item.SeasonName) == "" {
+					item.SeasonName = strings.TrimSpace(raw.SeasonName)
+				}
+				if strings.TrimSpace(item.SeriesID) == "" {
+					item.SeriesID = strings.TrimSpace(raw.SeriesID)
+				}
+				if strings.TrimSpace(item.SeriesName) == "" {
+					item.SeriesName = strings.TrimSpace(raw.SeriesName)
+				}
+				if played.After(item.LastPlayedAt) {
+					item.LastPlayedAt = played
+				}
+				if raw.UserData.PlayCount != nil && *raw.UserData.PlayCount > item.PlayCount {
+					item.PlayCount = *raw.UserData.PlayCount
+				}
+				if raw.DateCreated != nil {
+					item.DateCreated = raw.DateCreated.UTC()
+				}
+				if raw.DateLastMediaAdded != nil {
+					item.DateLastMediaAdded = raw.DateLastMediaAdded.UTC()
+				}
+				merged[id] = item
+			}
+
+			if !hasMore {
+				break
+			}
+			start = nextStart
+		}
+	}
+
+	out := make([]ItemSnapshot, 0, len(merged))
+	for _, v := range merged {
+		out = append(out, v)
+	}
+	return out, nil
+}
+
+func (s *BackfillService) fetchUserRecentlyPlayedPage(ctx context.Context, userID string, since time.Time, startIndex int32, limit int32) (usersItemsResponse, bool, int32, error) {
+	values := url.Values{}
+	values.Set("Recursive", "true")
+	values.Set("EnableUserData", "true")
+	values.Set("Fields", "UserData")
+	values.Set("SortBy", "DatePlayed")
+	values.Set("SortOrder", "Descending")
+	values.Set("IsPlayed", "true")
+	values.Set("StartIndex", fmt.Sprintf("%d", startIndex))
+	values.Set("Limit", fmt.Sprintf("%d", limit))
+	values.Set("MinDateLastSavedForUser", since.UTC().Format(time.RFC3339Nano))
+
+	endpoint := s.baseURL + "/Users/" + url.PathEscape(strings.TrimSpace(userID)) + "/Items?" + values.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return usersItemsResponse{}, false, startIndex, err
+	}
+	req.Header.Set("X-Emby-Token", s.apiKey)
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return usersItemsResponse{}, false, startIndex, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return usersItemsResponse{}, false, startIndex, fmt.Errorf("fetch user played items returned status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return usersItemsResponse{}, false, startIndex, err
+	}
+	var out usersItemsResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return usersItemsResponse{}, false, startIndex, err
+	}
+	next := startIndex + int32(len(out.Items))
+	return out, int32(len(out.Items)) >= limit, next, nil
+}
+
+func mergeRecentSnapshots(base []ItemSnapshot, recent []ItemSnapshot) []ItemSnapshot {
+	index := make(map[string]int, len(base))
+	for i := range base {
+		id := strings.TrimSpace(base[i].ItemID)
+		if id != "" {
+			index[id] = i
+		}
+	}
+	for _, rec := range recent {
+		id := strings.TrimSpace(rec.ItemID)
+		if id == "" {
+			continue
+		}
+		if idx, ok := index[id]; ok {
+			if rec.LastPlayedAt.After(base[idx].LastPlayedAt) {
+				base[idx].LastPlayedAt = rec.LastPlayedAt
+			}
+			if rec.PlayCount > base[idx].PlayCount {
+				base[idx].PlayCount = rec.PlayCount
+			}
+			continue
+		}
+		index[id] = len(base)
+		base = append(base, rec)
+	}
+	return base
+}
+
+func chunkItemIDs(ids []string, chunkSize int) [][]string {
+	if chunkSize <= 0 {
+		chunkSize = len(ids)
+	}
+	out := make([][]string, 0, (len(ids)+chunkSize-1)/chunkSize)
+	for start := 0; start < len(ids); start += chunkSize {
+		end := start + chunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		piece := append([]string(nil), ids[start:end]...)
+		out = append(out, piece)
+	}
+	return out
+}
+
 func (s *BackfillService) emitProgress(progress FetchProgress) {
 	if s.progressHook != nil {
 		s.progressHook(progress)
 	}
+}
+
+func (s *BackfillService) emitWarning(stage string, err error) {
+	if err == nil || s.warningHook == nil {
+		return
+	}
+	s.warningHook(stage, err)
 }
 
 func safeTotalCount(value *int32) int {

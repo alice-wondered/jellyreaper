@@ -52,6 +52,9 @@ func main() {
 		logger.Error("load config", "error", err)
 		os.Exit(1)
 	}
+	if cfg.BackfillPlaybackEnabled {
+		logger.Warn("BACKFILL_PLAYBACK_ENABLED is deprecated and ignored; backfill is item/userdata based")
+	}
 
 	if err := os.MkdirAll(cfg.LogDir, 0o755); err != nil {
 		logger.Error("create log directory", "error", err, "dir", cfg.LogDir)
@@ -185,6 +188,9 @@ func main() {
 			if err != nil {
 				logger.Error("create backfill service", "error", err)
 			} else {
+				backfillSvc.SetWarningHook(func(stage string, warnErr error) {
+					logger.Warn("backfill warning", "stage", stage, "error", warnErr)
+				})
 				backfillSvc.SetProgressHook(func(progress jellyfin.FetchProgress) {
 					remaining := 0
 					if progress.TotalRecordCount > 0 && progress.TotalRecordCount > progress.Fetched {
@@ -294,17 +300,13 @@ func runBackfillOnce(ctx context.Context, logger *slog.Logger, repository repo.R
 		if err != nil {
 			return fmt.Errorf("resolve backfill checkpoint: %w", err)
 		}
-		phase := "items"
-		if cfg.BackfillPlaybackEnabled {
-			phase = "playback"
-		}
-		cursor = backfillCursorState{Active: true, Since: since, Phase: phase, MaxSeen: time.Now().UTC()}
+		cursor = backfillCursorState{Active: true, Since: since, Phase: "items", MaxSeen: time.Now().UTC()}
 		if err := saveBackfillCursor(ctx, repository, cursor); err != nil {
 			return fmt.Errorf("save backfill cursor: %w", err)
 		}
 		logger.Info("backfill cursor initialized", "since", since, "phase", cursor.Phase)
 	} else {
-		if !cfg.BackfillPlaybackEnabled && cursor.Phase == "playback" {
+		if cursor.Phase == "playback" {
 			cursor.Phase = "items"
 			cursor.PlaybackStartIndex = 0
 			if err := saveBackfillCursor(ctx, repository, cursor); err != nil {
@@ -317,40 +319,6 @@ func runBackfillOnce(ctx context.Context, logger *slog.Logger, repository repo.R
 
 	startedAt := time.Now().UTC()
 	logger.Info("backfill fetch started", "since", cursor.Since, "page_limit", cfg.BackfillLimit)
-
-	for cfg.BackfillPlaybackEnabled && cursor.Phase == "playback" {
-		page, err := fetchPlaybackPageWithRetry(ctx, logger, backfillSvc, cursor.Since, cursor.PlaybackStartIndex, cfg.BackfillLimit)
-		if err != nil {
-			return fmt.Errorf("backfill playback page fetch failed (since=%s,start=%d): %w", cursor.Since.Format(time.RFC3339), cursor.PlaybackStartIndex, err)
-		}
-		if len(page.Events) == 0 {
-			cursor.Phase = "items"
-			cursor.PlaybackStartIndex = 0
-			if err := saveBackfillCursor(ctx, repository, cursor); err != nil {
-				return fmt.Errorf("save backfill cursor: %w", err)
-			}
-			break
-		}
-
-		logger.Info("backfill playback ingest page", "page_events", len(page.Events), "start_index", cursor.PlaybackStartIndex)
-		nextCursor := cursor
-		nextCursor.PlaysProcessed += len(page.Events)
-		nextCursor.MaxSeen = maxBackfillTimestamp(nextCursor.MaxSeen, computeBackfillCheckpoint(nextCursor.MaxSeen, page.Events, nil))
-		if page.HasMore {
-			nextCursor.PlaybackStartIndex = page.NextStartIndex
-		} else {
-			nextCursor.Phase = "items"
-			nextCursor.PlaybackStartIndex = 0
-		}
-		cursorJSON, err := marshalBackfillCursor(nextCursor)
-		if err != nil {
-			return err
-		}
-		if err := appService.IngestBackfillPlaybackWithCursor(ctx, page.Events, backfillCursorKey, cursorJSON); err != nil {
-			return fmt.Errorf("playback ingest: %w", err)
-		}
-		cursor = nextCursor
-	}
 
 	for cursor.Phase == "items" {
 		page, err := fetchChangedItemsPageWithRetry(ctx, logger, backfillSvc, cursor.Since, cursor.ItemsStartIndex, cfg.BackfillLimit)

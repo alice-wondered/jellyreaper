@@ -147,7 +147,6 @@ func (s *Service) HandleIncomingInteraction(ctx context.Context, interaction Inc
 }
 
 func (s *Service) SendHITLPrompt(ctx context.Context, channelID, itemID string, version int64, displayName string, imageURL string, statusLine string) (string, error) {
-	_ = statusLine
 	if s.sendHook != nil {
 		return s.sendHook(ctx, channelID, itemID, version, displayName, imageURL, statusLine)
 	}
@@ -164,7 +163,12 @@ func (s *Service) SendHITLPrompt(ctx context.Context, channelID, itemID string, 
 		contentName = itemID
 	}
 
-	content := fmt.Sprintf("**%s**", contentName)
+	resolvedStatus := strings.TrimSpace(statusLine)
+	if resolvedStatus == "" {
+		resolvedStatus = "Last played at: unknown"
+	}
+
+	content := fmt.Sprintf("**%s**\n%s", contentName, resolvedStatus)
 
 	send := &discordgo.MessageSend{
 		Content: content,
