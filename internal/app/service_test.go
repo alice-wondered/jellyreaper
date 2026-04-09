@@ -1837,6 +1837,40 @@ func TestCatalogEventFallsBackToServiceClockWhenPayloadDatesMissing(t *testing.T
 	}
 }
 
+func TestItemAddedUsesEventTimestampWhenDateLastMediaAddedMissing(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 12, 10, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	oldCreated := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	eventAddedAt := time.Date(2026, 4, 10, 12, 30, 0, 0, time.UTC)
+	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:           "movie-ts-item-added",
+			ItemType:         "Movie",
+			Name:             "Added Movie",
+			NotificationType: "ItemAdded",
+			DateCreated:      oldCreated,
+			EventID:          "evt-ts-item-added",
+		},
+		Raw:        map[string]any{"EventId": "evt-ts-item-added"},
+		ItemID:     "movie-ts-item-added",
+		EventID:    "evt-ts-item-added",
+		EventType:  "ItemAdded",
+		DedupeKey:  "jellyfin:evt-ts-item-added",
+		OccurredAt: eventAddedAt,
+	})
+	if err != nil {
+		t.Fatalf("handle webhook: %v", err)
+	}
+
+	media := mustGetMedia(t, store, "movie-ts-item-added")
+	if !media.CreatedAt.Equal(eventAddedAt) {
+		t.Fatalf("expected media created timestamp from item-added event time, got=%s want=%s", media.CreatedAt, eventAddedAt)
+	}
+}
+
 func TestCollectionWebhookDoesNotCreateOperationalFlow(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)

@@ -333,6 +333,11 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		if catalogIndexEvent && catalogUpdateAllowed {
 			created := event.Payload.DateLastMediaAdded.UTC()
 			if created.IsZero() {
+				if isItemAddedEvent(event.EventType) && !eventAt.IsZero() {
+					created = eventAt.UTC()
+				}
+			}
+			if created.IsZero() {
 				created = event.Payload.DateCreated.UTC()
 			}
 			if created.IsZero() {
@@ -1707,6 +1712,17 @@ func isRemovalEvent(eventType string) bool {
 		return false
 	}
 	return strings.Contains(t, "removed") || strings.Contains(t, "deleted")
+}
+
+func isItemAddedEvent(eventType string) bool {
+	t := strings.ToLower(strings.TrimSpace(eventType))
+	if t == "" {
+		return false
+	}
+	if strings.Contains(t, "itemadded") {
+		return true
+	}
+	return strings.Contains(t, "item") && strings.Contains(t, "added")
 }
 
 func catalogEventTimestamp(payload jellyfin.WebhookPayload) time.Time {
