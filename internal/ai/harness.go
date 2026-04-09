@@ -25,7 +25,7 @@ const (
 	historyLineCapacity = 20
 	maxThreadContexts   = 256
 
-	storageSkill = "Domain skill: A flow is the scheduler-owned lifecycle record for a projection target. Flows have ids like target:<subject_type>:<subject_id>, policy state (active, pending_review, archived, delete_queued), policy knobs (review days, defer days, HITL timeout hours), scheduling fields (next_action_at/deadlines), and Discord/HITL context. Scheduler/HITL operational subject types are movie and season only. A movie projection maps one movie; a season projection maps all episodes in that season. Higher-level user intents (for example series-level requests) should be translated into movie/season operations before handoff. Media items are catalog/playback records and are not direct AI operation targets. The assistant should discover projection flows, then hand off actions to domain services (which enqueue jobs, drive scheduler transitions, and perform cleanup fanout). For deletion, only schedule projection flow deletes; do not attempt individual item-level deletes."
+	storageSkill = "Domain skill: The core object is a projection flow (`target:<subject_type>:<subject_id>`). Think of flows as user-visible review entries. `subject_type=movie` is one movie; `subject_type=season` is one TV season projection (episodes grouped by season). States: `pending_review` means ready now, `active` means scheduled for later, `archived` means hidden from normal review, `delete_queued` means deletion is in progress/queued. User wording mapping: 'next up for review' means first ready flow ordered by next action time; 'how many movies' means count projection flows with `subject_type=movie`; 'how many TV shows' means distinct series names represented by season projection flows. Operational actions are on projection flows only (movie/season), never on raw media-item IDs."
 )
 
 type Harness struct {
@@ -177,9 +177,11 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 		"Only handle requests related to this media server and its review/archive workflow.",
 		storageSkill,
 		"Use tools to gather data and take actions.",
-		"Tool usage guide: list_ready for queue overviews; fuzzy_search_targets for discovery; query_target_state to inspect one target; remember_alias to bind user phrases to a target; archive_target for archive/unarchive intents; schedule_delete for deletion scheduling on one projection target; schedule_delete_many for show-level intents mapped to multiple season targets; delay_target_days to defer a target by an explicit number of days; choose_candidate when user provides a numbered option; confirm_pending for yes/no confirmations; set_review_days, set_defer_days, and set_hitl_timeout_hours for policy tuning.",
+		"Tool usage guide: list_ready for queue overviews and next-up questions; query_library for generalized counting/filtering across flows and indexed media; fuzzy_search_targets for discovery; query_target_state to inspect one target; remember_alias to bind user phrases to a target; archive_target for archive/unarchive intents; schedule_delete for deletion scheduling on one projection target; schedule_delete_many for show-level intents mapped to multiple season targets; delay_target_days to defer a target by an explicit number of days; choose_candidate when user provides a numbered option; confirm_pending for yes/no confirmations; set_review_days, set_defer_days, and set_hitl_timeout_hours for policy tuning.",
 		"Use schedule_delete for deletion requests; rely on domain logic for item vs projection delete semantics.",
 		"When asked to change how long HITL waits before timeout, use set_hitl_timeout_hours.",
+		"When asked 'what is next up for review', call list_ready with limit=1.",
+		"When asked for counts, do not guess; call query_library first.",
 		"Natural-language target resolution guide: prefer known aliases from thread memory first, then exact title, then partial title, and ask clarifying follow-up when ambiguous.",
 		"When multiple targets are possible, present concise choices and invite a short follow-up reply (for example: `title a`, `title b`, or a clearer title).",
 		"When you reply, use Discord markdown and keep it conversational and concise.",
@@ -196,6 +198,7 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 	tools := []responses.ToolUnionParam{
 		{OfFunction: &responses.FunctionToolParam{Name: "response", Description: openai.String("Send a Discord markdown response back to the user."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"message": map[string]any{"type": "string"}}, "required": []string{"message"}}}},
 		{OfFunction: &responses.FunctionToolParam{Name: "list_ready", Description: openai.String("List targets currently ready for review."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 20}}}}},
+		{OfFunction: &responses.FunctionToolParam{Name: "query_library", Description: openai.String("Generalized query over projection flows and indexed media. Use this for counts and lightweight discovery."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "scope": map[string]any{"type": "string", "enum": []string{"", "flows", "media", "both"}}, "subject_type": map[string]any{"type": "string", "enum": []string{"", "movie", "season", "episode"}}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 50}}}}},
 		{OfFunction: &responses.FunctionToolParam{Name: "fuzzy_search_targets", Description: openai.String("Find projection targets by fuzzy title/series/season text, optionally filtered by subject type."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "subject_type": map[string]any{"type": "string", "enum": []string{"", "movie", "season"}}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 30}}, "required": []string{"query"}}}},
 		{OfFunction: &responses.FunctionToolParam{Name: "query_target_state", Description: openai.String("Inspect state for a target by title text, or current selection when query omitted."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}}}},
 		{OfFunction: &responses.FunctionToolParam{Name: "remember_alias", Description: openai.String("Store a natural-language alias for a specific target so future follow-ups can resolve quickly."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"alias": map[string]any{"type": "string"}, "target_ref": map[string]any{"type": "string"}}, "required": []string{"alias"}}}},
@@ -313,7 +316,20 @@ func (h *Harness) executeToolCall(ctx context.Context, threadID string, toolName
 		}
 		return `{"ok":true}`, msg, nil
 	case "list_ready":
-		return h.listReady(ctx)
+		args, err := decodeToolArgs[toolListReadyArgs](rawArguments)
+		if err != nil {
+			return "", "", err
+		}
+		return h.listReady(ctx, args.Limit)
+	case "query_library":
+		args, err := decodeToolArgs[toolQueryLibraryArgs](rawArguments)
+		if err != nil {
+			return "", "", err
+		}
+		if args.Limit <= 0 {
+			args.Limit = 12
+		}
+		return h.queryLibrary(ctx, args.Query, args.Scope, args.SubjectType, args.Limit)
 	case "fuzzy_search_targets":
 		args, err := decodeToolArgs[toolFuzzySearchArgs](rawArguments)
 		if err != nil {
@@ -410,6 +426,17 @@ type toolResponseArgs struct {
 	Message string `json:"message"`
 }
 
+type toolListReadyArgs struct {
+	Limit int `json:"limit"`
+}
+
+type toolQueryLibraryArgs struct {
+	Query       string `json:"query"`
+	Scope       string `json:"scope"`
+	SubjectType string `json:"subject_type"`
+	Limit       int    `json:"limit"`
+}
+
 type toolFuzzySearchArgs struct {
 	Query       string `json:"query"`
 	SubjectType string `json:"subject_type"`
@@ -474,7 +501,7 @@ func decodeToolArgs[T any](raw string) (T, error) {
 	return out, nil
 }
 
-func (h *Harness) listReady(ctx context.Context) (string, string, error) {
+func (h *Harness) listReady(ctx context.Context, limit int) (string, string, error) {
 	type row struct {
 		flow domain.Flow
 		next time.Time
@@ -506,14 +533,230 @@ func (h *Harness) listReady(ctx context.Context) (string, string, error) {
 		return marshalToolResult(map[string]any{"status": "ok", "ready": []map[string]any{}}), "", nil
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].next.Before(rows[j].next) })
-	if len(rows) > 10 {
-		rows = rows[:10]
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 20 {
+		limit = 20
+	}
+	if len(rows) > limit {
+		rows = rows[:limit]
 	}
 	ready := make([]map[string]any, 0, len(rows))
 	for _, r := range rows {
 		ready = append(ready, h.flowToolPayload(ctx, r.flow))
 	}
 	return marshalToolResult(map[string]any{"status": "ok", "ready": ready}), "", nil
+}
+
+func (h *Harness) queryLibrary(ctx context.Context, query string, scope string, subjectType string, limit int) (string, string, error) {
+	query = strings.TrimSpace(strings.ToLower(query))
+	scope = strings.TrimSpace(strings.ToLower(scope))
+	if scope == "" {
+		scope = "both"
+	}
+	if scope != "flows" && scope != "media" && scope != "both" {
+		return marshalToolResult(map[string]any{"status": "invalid_scope", "scope": scope}), "", nil
+	}
+	subjectType = strings.TrimSpace(strings.ToLower(subjectType))
+	if subjectType != "" && subjectType != "movie" && subjectType != "season" && subjectType != "episode" {
+		return marshalToolResult(map[string]any{"status": "invalid_subject_type", "subject_type": subjectType}), "", nil
+	}
+	if limit <= 0 {
+		limit = 12
+	}
+	if limit > 50 {
+		limit = 50
+	}
+
+	flowResults := make([]map[string]any, 0, limit)
+	mediaResults := make([]map[string]any, 0, limit)
+	flowTotal := 0
+	mediaTotal := 0
+	movieFlowCount := 0
+	seasonFlowCount := 0
+	showNames := map[string]struct{}{}
+
+	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		flows, err := tx.ListFlows(ctx)
+		if err != nil {
+			return err
+		}
+		for _, flow := range flows {
+			typeLower := strings.ToLower(strings.TrimSpace(flow.SubjectType))
+			if !isProjectionSubjectType(typeLower) || flow.State == domain.FlowStateDeleteQueued {
+				continue
+			}
+			switch typeLower {
+			case "movie":
+				movieFlowCount++
+			case "season":
+				seasonFlowCount++
+				if name := h.seasonSeriesName(ctx, tx, flow); name != "" {
+					showNames[name] = struct{}{}
+				}
+			}
+
+			if subjectType != "" && subjectType != typeLower && !(subjectType == "episode" && typeLower == "season") {
+				continue
+			}
+			if scope == "flows" || scope == "both" {
+				title := strings.ToLower(strings.TrimSpace(flow.DisplayName))
+				if query == "" || strings.Contains(title, query) {
+					flowTotal++
+					if len(flowResults) < limit {
+						flowResults = append(flowResults, flowToolPayloadInTx(flow, h.seasonSeriesName(ctx, tx, flow)))
+					}
+				}
+			}
+
+			if scope == "media" || scope == "both" {
+				if typeLower == "movie" {
+					itemID := flowSubjectID(flow.ItemID)
+					if itemID != "" {
+						if m, ok, err := tx.GetMedia(ctx, itemID); err == nil && ok {
+							if subjectType == "" || subjectType == "movie" {
+								if mediaMatchesQuery(m, query) {
+									mediaTotal++
+									if len(mediaResults) < limit {
+										mediaResults = append(mediaResults, mediaToolPayload(m))
+									}
+								}
+							}
+						}
+					}
+				}
+				if typeLower == "season" {
+					seasonID := flowSubjectID(flow.ItemID)
+					if seasonID == "" {
+						continue
+					}
+					media, err := tx.ListMediaBySubject(ctx, "season", seasonID)
+					if err != nil {
+						continue
+					}
+					for _, m := range media {
+						itemType := strings.ToLower(strings.TrimSpace(m.ItemType))
+						if subjectType != "" && subjectType != itemType && !(subjectType == "season" && itemType == "episode") {
+							continue
+						}
+						if !mediaMatchesQuery(m, query) {
+							continue
+						}
+						mediaTotal++
+						if len(mediaResults) < limit {
+							mediaResults = append(mediaResults, mediaToolPayload(m))
+						}
+					}
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return "", "", err
+	}
+
+	payload := map[string]any{
+		"status":                  "ok",
+		"scope":                   scope,
+		"query":                   query,
+		"subject_type":            subjectType,
+		"flow_total":              flowTotal,
+		"media_total":             mediaTotal,
+		"movie_projection_count":  movieFlowCount,
+		"season_projection_count": seasonFlowCount,
+		"tv_show_count":           len(showNames),
+	}
+	if scope == "flows" || scope == "both" {
+		payload["flows"] = flowResults
+	}
+	if scope == "media" || scope == "both" {
+		payload["media"] = mediaResults
+	}
+	return marshalToolResult(payload), "", nil
+}
+
+func (h *Harness) seasonSeriesName(ctx context.Context, tx repo.TxRepository, flow domain.Flow) string {
+	if seasonID := flowSubjectID(flow.ItemID); seasonID != "" {
+		if seasonID != "" {
+			media, err := tx.ListMediaBySubject(ctx, "season", seasonID)
+			if err == nil {
+				for _, item := range media {
+					name := strings.TrimSpace(item.SeriesName)
+					if name != "" {
+						return strings.ToLower(name)
+					}
+				}
+			}
+		}
+	}
+	label := strings.TrimSpace(flow.DisplayName)
+	if label == "" {
+		return ""
+	}
+	lower := strings.ToLower(label)
+	if idx := strings.LastIndex(lower, " of "); idx >= 0 && idx+4 < len(lower) {
+		return strings.TrimSpace(lower[idx+4:])
+	}
+	return ""
+}
+
+func flowSubjectID(itemID string) string {
+	parts := strings.SplitN(strings.TrimSpace(itemID), ":", 3)
+	if len(parts) != 3 || parts[0] != "target" {
+		return ""
+	}
+	return domain.NormalizeID(parts[2])
+}
+
+func mediaMatchesQuery(m domain.MediaItem, query string) bool {
+	if query == "" {
+		return true
+	}
+	haystack := strings.ToLower(strings.TrimSpace(strings.Join([]string{m.Name, m.Title, m.SeriesName, m.SeasonName}, " ")))
+	return strings.Contains(haystack, query)
+}
+
+func mediaToolPayload(m domain.MediaItem) map[string]any {
+	payload := map[string]any{
+		"name":      strings.TrimSpace(m.Name),
+		"item_type": strings.ToLower(strings.TrimSpace(m.ItemType)),
+	}
+	if strings.TrimSpace(m.SeriesName) != "" {
+		payload["series_name"] = strings.TrimSpace(m.SeriesName)
+	}
+	if strings.TrimSpace(m.SeasonName) != "" {
+		payload["season_name"] = strings.TrimSpace(m.SeasonName)
+	}
+	if !m.LastPlayedAt.IsZero() {
+		payload["last_played_at"] = m.LastPlayedAt.UTC().Format(time.RFC3339)
+	}
+	if !m.CreatedAt.IsZero() {
+		payload["created_at"] = m.CreatedAt.UTC().Format(time.RFC3339)
+	}
+	return payload
+}
+
+func flowToolPayloadInTx(flow domain.Flow, seriesName string) map[string]any {
+	title := strings.TrimSpace(flow.DisplayName)
+	if title == "" {
+		title = "Untitled target"
+	}
+	payload := map[string]any{
+		"title":        title,
+		"subject_type": strings.ToLower(strings.TrimSpace(flow.SubjectType)),
+		"flow_state":   string(flow.State),
+		"archived":     flow.State == domain.FlowStateArchived,
+		"ready":        flow.State == domain.FlowStatePendingReview || (flow.State == domain.FlowStateActive && !flow.NextActionAt.IsZero() && !flow.NextActionAt.After(time.Now().UTC())),
+	}
+	if !flow.NextActionAt.IsZero() {
+		payload["next_action_at"] = flow.NextActionAt.UTC().Format(time.RFC3339)
+	}
+	if strings.TrimSpace(seriesName) != "" {
+		payload["series_name"] = strings.TrimSpace(seriesName)
+	}
+	return payload
 }
 
 func (h *Harness) setReviewDays(ctx context.Context, days int) (string, string, error) {

@@ -2,6 +2,7 @@ package ai
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -506,5 +507,88 @@ func TestFuzzySearchTargets_FiltersBySubjectType(t *testing.T) {
 	}
 	if !strings.Contains(out, "\"item_id\":\"target:movie:m-1\"") {
 		t.Fatalf("expected movie target in search results, got: %s", out)
+	}
+}
+
+func TestQueryLibrary_CountsMoviesByTitleQuery(t *testing.T) {
+	store := newTestStore(t)
+	seedFlow(t, store, "target:movie:m-1", "Scooby-Doo and the Witch's Ghost", domain.FlowStateActive)
+	seedFlow(t, store, "target:movie:m-2", "Scooby-Doo on Zombie Island", domain.FlowStateActive)
+	seedFlow(t, store, "target:movie:m-3", "Interstellar", domain.FlowStateActive)
+
+	h := NewHarness(store, "", "")
+	out, _, err := h.queryLibrary(context.Background(), "scooby", "flows", "movie", 10)
+	if err != nil {
+		t.Fatalf("query library: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("decode query payload: %v", err)
+	}
+	if got := int(payload["flow_total"].(float64)); got != 2 {
+		t.Fatalf("expected 2 matching movie flows, got %d", got)
+	}
+}
+
+func TestQueryLibrary_ReturnsDistinctTVShowCount(t *testing.T) {
+	store := newTestStore(t)
+	seedFlow(t, store, "target:season:s-1", "Season 1 of The Magicians", domain.FlowStateActive)
+	seedFlow(t, store, "target:season:s-2", "Season 2 of The Magicians", domain.FlowStateActive)
+	seedFlow(t, store, "target:season:s-3", "Season 1 of RWBY", domain.FlowStateActive)
+	seedMedia(t, store, "ep-mag-1", "s-1", "series-mag", "The Magicians")
+	seedMedia(t, store, "ep-mag-2", "s-2", "series-mag", "The Magicians")
+	seedMedia(t, store, "ep-rwby-1", "s-3", "series-rwby", "RWBY")
+
+	h := NewHarness(store, "", "")
+	out, _, err := h.queryLibrary(context.Background(), "", "both", "", 10)
+	if err != nil {
+		t.Fatalf("query library summary: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("decode query payload: %v", err)
+	}
+	if got := int(payload["tv_show_count"].(float64)); got != 2 {
+		t.Fatalf("expected 2 distinct TV shows, got %d", got)
+	}
+}
+
+func TestQueryLibrary_ReturnsRichFlowsAndMediaForIntrospection(t *testing.T) {
+	store := newTestStore(t)
+	seedFlow(t, store, "target:movie:m-scooby", "Scooby-Doo on Zombie Island", domain.FlowStateActive)
+	seedFlow(t, store, "target:season:s-mag-1", "Season 1 of The Magicians", domain.FlowStateActive)
+	seedMedia(t, store, "m-scooby", "", "", "")
+	seedMedia(t, store, "ep-mag-1", "s-mag-1", "series-mag", "The Magicians")
+
+	h := NewHarness(store, "", "")
+	fuzzy, _, err := h.fuzzySearchTargets(context.Background(), "magicians", "season", 5)
+	if err != nil {
+		t.Fatalf("fuzzy search: %v", err)
+	}
+	if !strings.Contains(fuzzy, "\"count\":1") {
+		t.Fatalf("expected fuzzy search to find one season target, got: %s", fuzzy)
+	}
+
+	out, _, err := h.queryLibrary(context.Background(), "magicians", "both", "", 10)
+	if err != nil {
+		t.Fatalf("query library introspection: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("decode query payload: %v", err)
+	}
+	if got := int(payload["flow_total"].(float64)); got < 1 {
+		t.Fatalf("expected at least one matching flow, got %d", got)
+	}
+	if got := int(payload["media_total"].(float64)); got < 1 {
+		t.Fatalf("expected at least one matching media item, got %d", got)
+	}
+	flows, ok := payload["flows"].([]any)
+	if !ok || len(flows) == 0 {
+		t.Fatalf("expected non-empty rich flow results, got %#v", payload["flows"])
+	}
+	media, ok := payload["media"].([]any)
+	if !ok || len(media) == 0 {
+		t.Fatalf("expected non-empty rich media results, got %#v", payload["media"])
 	}
 }
