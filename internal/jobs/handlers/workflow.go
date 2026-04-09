@@ -306,6 +306,10 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 			return err
 		} else if ok {
 			statusLine = "Last played at: " + humanTimeLabel(lastPlayedAt)
+		} else if createdAt, createdKnown, err := mostRecentCreatedForFlow(ctx, tx, flow); err != nil {
+			return err
+		} else if createdKnown {
+			statusLine = "Last played at: never (added " + humanTimeLabel(createdAt) + ")"
 		}
 		if flow.Discord.MessageID != "" {
 			shouldSend = false
@@ -593,6 +597,16 @@ type ExecuteDeleteHandler struct {
 	repository repo.Repository
 	client     *jellyfin.Client
 	discord    *discord.Service
+	radarr     radarrRemover
+	sonarr     sonarrRemover
+}
+
+type radarrRemover interface {
+	RemoveByProviderIDs(context.Context, map[string]string) error
+}
+
+type sonarrRemover interface {
+	RemoveSeasonByProviderIDs(context.Context, map[string]string, int) error
 }
 
 func NewExecuteDeleteHandler(repository repo.Repository, client *jellyfin.Client) *ExecuteDeleteHandler {
@@ -601,6 +615,14 @@ func NewExecuteDeleteHandler(repository repo.Repository, client *jellyfin.Client
 
 func (h *ExecuteDeleteHandler) SetDiscordService(discordSvc *discord.Service) {
 	h.discord = discordSvc
+}
+
+func (h *ExecuteDeleteHandler) SetRadarrService(remover radarrRemover) {
+	h.radarr = remover
+}
+
+func (h *ExecuteDeleteHandler) SetSonarrService(remover sonarrRemover) {
+	h.sonarr = remover
 }
 
 func (h *ExecuteDeleteHandler) Kind() domain.JobKind { return domain.JobKindExecuteDelete }
@@ -617,23 +639,72 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 	if !ok {
 		return nil
 	}
+	if flow.SubjectType != "season" && flow.SubjectType != "movie" && flow.SubjectType != "item" {
+		return fmt.Errorf("unsupported delete subject type: %s", flow.SubjectType)
+	}
 
 	deletedChildren := []domain.MediaItem{}
-	if flow.SubjectType == "season" || flow.SubjectType == "series" {
-		children, err := h.deleteAggregateChildren(ctx, flow)
+	radarrPrimaryDelete := false
+	sonarrPrimarySeasonDelete := false
+	if flow.SubjectType == "season" {
+		children, err := h.listChildren(ctx, "season", strings.TrimPrefix(flow.ItemID, "target:season:"))
 		if err != nil {
 			return err
 		}
 		deletedChildren = children
+		if h.sonarr != nil {
+			providerIDs := projectionProviderIDs(flow.SubjectType, deletedChildren)
+			if len(providerIDs) == 0 {
+				return fmt.Errorf("sonarr primary season delete missing provider ids for %s", flow.ItemID)
+			}
+			seasonNumber := seasonNumberFromDeletedMedia(deletedChildren)
+			if seasonNumber <= 0 {
+				return fmt.Errorf("sonarr primary season delete missing season number for %s", flow.ItemID)
+			}
+			if err := h.sonarr.RemoveSeasonByProviderIDs(ctx, providerIDs, seasonNumber); err != nil {
+				return fmt.Errorf("sonarr primary season delete for %s: %w", flow.ItemID, err)
+			}
+			sonarrPrimarySeasonDelete = true
+		}
+		if !sonarrPrimarySeasonDelete {
+			children, err := h.deleteAggregateChildren(ctx, flow)
+			if err != nil {
+				return err
+			}
+			deletedChildren = children
+		}
 	} else {
 		deleteID := flow.ItemID
 		if strings.HasPrefix(deleteID, "target:item:") || strings.HasPrefix(deleteID, "target:movie:") {
 			deleteID = deleteID[strings.LastIndex(deleteID, ":")+1:]
 		}
-		if err := h.client.DeleteItem(ctx, deleteID); err != nil {
+		media, found, err := h.getMedia(ctx, deleteID)
+		if err != nil {
 			return err
 		}
-		deletedChildren = append(deletedChildren, domain.MediaItem{ItemID: deleteID})
+		if found {
+			deletedChildren = append(deletedChildren, media)
+		}
+
+		if h.radarr != nil && (flow.SubjectType == "movie" || flow.SubjectType == "item") {
+			providerIDs := projectionProviderIDs(flow.SubjectType, deletedChildren)
+			if len(providerIDs) == 0 {
+				return fmt.Errorf("radarr primary delete missing provider ids for %s", flow.ItemID)
+			}
+			if err := h.radarr.RemoveByProviderIDs(ctx, providerIDs); err != nil {
+				return fmt.Errorf("radarr primary delete for %s: %w", flow.ItemID, err)
+			}
+			radarrPrimaryDelete = true
+		}
+
+		if !radarrPrimaryDelete {
+			if err := h.client.DeleteItem(ctx, deleteID); err != nil {
+				return err
+			}
+		}
+		if len(deletedChildren) == 0 {
+			deletedChildren = append(deletedChildren, domain.MediaItem{ItemID: deleteID})
+		}
 	}
 
 	now := time.Now().UTC()
@@ -651,14 +722,10 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 			return err
 		}
 
-		seasonIDs := map[string]struct{}{}
 		for _, child := range deletedChildren {
 			childID := strings.TrimSpace(child.ItemID)
 			if childID == "" {
 				continue
-			}
-			if flow.SubjectType == "series" && strings.TrimSpace(child.SeasonID) != "" {
-				seasonIDs[strings.TrimSpace(child.SeasonID)] = struct{}{}
 			}
 			if err := tx.DeleteMedia(ctx, childID); err != nil {
 				return err
@@ -672,14 +739,6 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 				return err
 			}
 		}
-		if flow.SubjectType == "series" {
-			for seasonID := range seasonIDs {
-				if err := tx.DeleteFlow(ctx, "target:season:"+seasonID); err != nil {
-					return err
-				}
-			}
-		}
-
 		if err := tx.AppendEvent(ctx, domain.Event{
 			EventID:        "evt:delete:" + current.ItemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
 			FlowID:         current.FlowID,
@@ -709,7 +768,121 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 			// best effort
 		}
 	}
+	if committed {
+		providerIDs := projectionProviderIDs(flow.SubjectType, deletedChildren)
+		switch flow.SubjectType {
+		case "movie", "item":
+			if radarrPrimaryDelete {
+				break
+			}
+			if h.radarr != nil {
+				if len(providerIDs) == 0 {
+					return fmt.Errorf("radarr removal skipped for %s: missing provider ids", flow.ItemID)
+				}
+				if err := h.radarr.RemoveByProviderIDs(ctx, providerIDs); err != nil {
+					return fmt.Errorf("radarr projection removal for %s: %w", flow.ItemID, err)
+				}
+			}
+		case "season":
+			if sonarrPrimarySeasonDelete {
+				break
+			}
+			if h.sonarr != nil {
+				if len(providerIDs) == 0 {
+					return fmt.Errorf("sonarr removal skipped for %s: missing provider ids", flow.ItemID)
+				}
+				seasonNumber := seasonNumberFromDeletedMedia(deletedChildren)
+				if seasonNumber <= 0 {
+					return fmt.Errorf("sonarr removal skipped for %s: missing season number", flow.ItemID)
+				}
+				if err := h.sonarr.RemoveSeasonByProviderIDs(ctx, providerIDs, seasonNumber); err != nil {
+					return fmt.Errorf("sonarr projection removal for %s: %w", flow.ItemID, err)
+				}
+			}
+		}
+	}
 	return nil
+}
+
+func (h *ExecuteDeleteHandler) getMedia(ctx context.Context, itemID string) (domain.MediaItem, bool, error) {
+	var media domain.MediaItem
+	var found bool
+	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		var err error
+		media, found, err = tx.GetMedia(ctx, itemID)
+		return err
+	})
+	if err != nil {
+		return domain.MediaItem{}, false, err
+	}
+	return media, found, nil
+}
+
+func projectionProviderIDs(subjectType string, deleted []domain.MediaItem) map[string]string {
+	merge := func(dst map[string]string, src map[string]string) map[string]string {
+		for k, v := range src {
+			if strings.TrimSpace(k) == "" || strings.TrimSpace(v) == "" {
+				continue
+			}
+			dst[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
+		}
+		return dst
+	}
+	out := map[string]string{}
+	for _, media := range deleted {
+		out = merge(out, media.ProviderIDs)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	if subjectType == "movie" || subjectType == "item" {
+		movie := map[string]string{}
+		if v := out["tmdb"]; v != "" {
+			movie["tmdb"] = v
+		}
+		if v := out["imdb"]; v != "" {
+			movie["imdb"] = v
+		}
+		if len(movie) == 0 {
+			return nil
+		}
+		return movie
+	}
+	series := map[string]string{}
+	if v := out["tvdb"]; v != "" {
+		series["tvdb"] = v
+	}
+	if v := out["tmdb"]; v != "" {
+		series["tmdb"] = v
+	}
+	if v := out["imdb"]; v != "" {
+		series["imdb"] = v
+	}
+	if len(series) == 0 {
+		return nil
+	}
+	return series
+}
+
+func seasonNumberFromDeletedMedia(deleted []domain.MediaItem) int {
+	for _, media := range deleted {
+		name := strings.TrimSpace(media.SeasonName)
+		if name == "" {
+			continue
+		}
+		tokens := strings.FieldsFunc(name, func(r rune) bool {
+			return r < '0' || r > '9'
+		})
+		for _, tok := range tokens {
+			if tok == "" {
+				continue
+			}
+			if n, err := strconv.Atoi(tok); err == nil && n > 0 {
+				return n
+			}
+		}
+	}
+	return 0
 }
 
 func (h *ExecuteDeleteHandler) deleteAggregateChildren(ctx context.Context, flow domain.Flow) ([]domain.MediaItem, error) {
@@ -784,5 +957,6 @@ func humanTimeLabel(t time.Time) string {
 	if t.IsZero() {
 		return "unknown"
 	}
-	return t.UTC().Format("2006-01-02 15:04 UTC")
+	unix := t.UTC().Unix()
+	return fmt.Sprintf("<t:%d:R> (<t:%d:f>)", unix, unix)
 }

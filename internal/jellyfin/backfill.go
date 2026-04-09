@@ -74,6 +74,7 @@ type PlaybackEvent struct {
 
 type ItemSnapshot struct {
 	ItemID             string
+	ProviderIDs        map[string]string
 	ItemType           string
 	SeasonID           string
 	SeasonName         string
@@ -270,6 +271,7 @@ func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.
 	enableUserData := true
 	sortBy := []gen.ItemSortBy{gen.ItemSortByDateCreated}
 	sortOrder := []gen.SortOrder{gen.SortOrder("Ascending")}
+	fields := []gen.ItemFields{gen.ItemFieldsProviderIds}
 	pageSize := limit
 	if pageSize <= 0 {
 		pageSize = 500
@@ -280,6 +282,7 @@ func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.
 		EnableUserData: &enableUserData,
 		SortBy:         &sortBy,
 		SortOrder:      &sortOrder,
+		Fields:         &fields,
 		Limit:          &pageSize,
 		StartIndex:     &startIndex,
 	}
@@ -331,6 +334,7 @@ func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.
 			imageURL := buildPrimaryImageURL(s.baseURL, itemID, item.ImageTags)
 			out = append(out, ItemSnapshot{
 				ItemID:             itemID,
+				ProviderIDs:        normalizeProviderIDsFromPointers(item.ProviderIds),
 				ItemType:           itemType,
 				SeasonID:           domain.NormalizeID(uuidString(item.SeasonId)),
 				SeasonName:         safeString(item.SeasonName),
@@ -394,6 +398,28 @@ type usersItemsResponse struct {
 			PlayCount      *int32     `json:"PlayCount"`
 		} `json:"UserData"`
 	} `json:"Items"`
+}
+
+func normalizeProviderIDsFromPointers(raw *map[string]*string) map[string]string {
+	if raw == nil || len(*raw) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(*raw))
+	for k, v := range *raw {
+		if v == nil {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(k))
+		val := strings.TrimSpace(*v)
+		if key == "" || val == "" {
+			continue
+		}
+		out[key] = val
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func (s *BackfillService) enrichItemsWithAllUsersPlayback(ctx context.Context, items []ItemSnapshot) ([]ItemSnapshot, error) {

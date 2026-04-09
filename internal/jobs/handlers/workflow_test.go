@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,18 +31,44 @@ func testStore(t *testing.T) *bboltrepo.Store {
 	return store
 }
 
+type arrRemovalSpy struct {
+	calls  int
+	last   map[string]string
+	season int
+}
+
+func (s *arrRemovalSpy) RemoveByProviderIDs(_ context.Context, providerIDs map[string]string) error {
+	s.calls++
+	s.last = make(map[string]string, len(providerIDs))
+	for k, v := range providerIDs {
+		s.last[k] = v
+	}
+	return nil
+}
+
+func (s *arrRemovalSpy) RemoveSeasonByProviderIDs(_ context.Context, providerIDs map[string]string, seasonNumber int) error {
+	s.calls++
+	s.season = seasonNumber
+	s.last = make(map[string]string, len(providerIDs))
+	for k, v := range providerIDs {
+		s.last[k] = v
+	}
+	return nil
+}
+
 func TestExecuteDeleteHandlerTransitionsToDeleted(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
 
 	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
-			FlowID:    "flow:item1",
-			ItemID:    "item1",
-			State:     domain.FlowStateDeleteQueued,
-			Version:   0,
-			CreatedAt: now,
-			UpdatedAt: now,
+			FlowID:      "flow:item1",
+			ItemID:      "item1",
+			SubjectType: "item",
+			State:       domain.FlowStateDeleteQueued,
+			Version:     0,
+			CreatedAt:   now,
+			UpdatedAt:   now,
 		}, 0)
 	}); err != nil {
 		t.Fatalf("seed flow: %v", err)
@@ -80,6 +107,139 @@ func TestExecuteDeleteHandlerTransitionsToDeleted(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("verify flow: %v", err)
+	}
+}
+
+func TestExecuteDeleteHandlerMovieProjectionTriggersRadarrRemoval(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:movie:mv-arr",
+			ItemID:      "target:movie:mv-arr",
+			SubjectType: "movie",
+			DisplayName: "Movie ARR",
+			State:       domain.FlowStateDeleteQueued,
+			Version:     0,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID:      "mv-arr",
+			ItemType:    "Movie",
+			Name:        "Movie ARR",
+			ProviderIDs: map[string]string{"tmdb": "603", "imdb": "tt0133093"},
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		})
+	}); err != nil {
+		t.Fatalf("seed flow/media: %v", err)
+	}
+
+	jellyfinDeleteCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && r.URL.Path == "/Items/mv-arr" {
+			jellyfinDeleteCalls++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	radarrSpy := &arrRemovalSpy{}
+	h := NewExecuteDeleteHandler(store, jellyfin.NewClient(server.URL, "api-key", server.Client()))
+	h.SetRadarrService(radarrSpy)
+
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-arr-movie", ItemID: "target:movie:mv-arr", IdempotencyKey: "dedupe:arr-movie"}); err != nil {
+		t.Fatalf("execute movie delete: %v", err)
+	}
+	if radarrSpy.calls != 1 {
+		t.Fatalf("expected one radarr removal call, got %d", radarrSpy.calls)
+	}
+	if radarrSpy.last["tmdb"] != "603" {
+		t.Fatalf("expected tmdb id forwarded to radarr, got %q", radarrSpy.last["tmdb"])
+	}
+	if jellyfinDeleteCalls != 0 {
+		t.Fatalf("expected movie deletion to use radarr primary path when configured, jellyfin delete calls=%d", jellyfinDeleteCalls)
+	}
+}
+
+func TestExecuteDeleteHandlerSeasonProjectionTriggersSonarrSeasonRemoval(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:season:season-arr",
+			ItemID:      "target:season:season-arr",
+			SubjectType: "season",
+			DisplayName: "Season ARR",
+			State:       domain.FlowStateDeleteQueued,
+			Version:     0,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0); err != nil {
+			return err
+		}
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-arr-1", ItemType: "Episode", SeasonID: "season-arr", SeasonName: "Season 3", ProviderIDs: map[string]string{"tvdb": "73244"}, UpdatedAt: now}); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-arr-2", ItemType: "Episode", SeasonID: "season-arr", SeasonName: "Season 3", ProviderIDs: map[string]string{"tvdb": "73244"}, UpdatedAt: now})
+	}); err != nil {
+		t.Fatalf("seed season state: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && (r.URL.Path == "/Items/ep-arr-1" || r.URL.Path == "/Items/ep-arr-2") {
+			t.Fatalf("did not expect jellyfin episode delete when sonarr season primary delete is enabled")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	sonarrSpy := &arrRemovalSpy{}
+	h := NewExecuteDeleteHandler(store, jellyfin.NewClient(server.URL, "api-key", server.Client()))
+	h.SetSonarrService(sonarrSpy)
+
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-arr-season", ItemID: "target:season:season-arr", IdempotencyKey: "dedupe:arr-season"}); err != nil {
+		t.Fatalf("execute season delete: %v", err)
+	}
+	if sonarrSpy.calls != 1 {
+		t.Fatalf("expected one sonarr season removal call for season projection, got %d", sonarrSpy.calls)
+	}
+	if sonarrSpy.season != 3 {
+		t.Fatalf("expected sonarr season operation to target season 3, got %d", sonarrSpy.season)
+	}
+}
+
+func TestExecuteDeleteHandlerRejectsSeriesProjectionDelete(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:series:series-arr",
+			ItemID:      "target:series:series-arr",
+			SubjectType: "series",
+			State:       domain.FlowStateDeleteQueued,
+			Version:     0,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed series flow: %v", err)
+	}
+
+	h := NewExecuteDeleteHandler(store, jellyfin.NewClient("http://example", "api-key", &http.Client{}))
+	err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-arr-series", ItemID: "target:series:series-arr", IdempotencyKey: "dedupe:arr-series"})
+	if err == nil || !strings.Contains(err.Error(), "unsupported delete subject type") {
+		t.Fatalf("expected unsupported subject type error, got %v", err)
 	}
 }
 
@@ -433,123 +593,6 @@ func TestHITLTimeoutHandlerFinalizesPromptMessage(t *testing.T) {
 	}
 }
 
-func TestExecuteDeleteHandlerDeletesChildrenForSeriesTarget(t *testing.T) {
-	store := testStore(t)
-	now := time.Now().UTC()
-
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
-		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
-			FlowID:      "flow:target:series:series-1",
-			ItemID:      "target:series:series-1",
-			SubjectType: "series",
-			State:       domain.FlowStateDeleteQueued,
-			Version:     0,
-			CreatedAt:   now,
-			UpdatedAt:   now,
-		}, 0); err != nil {
-			return err
-		}
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-1", SeriesID: "series-1", SeasonID: "season-1", UpdatedAt: now}); err != nil {
-			return err
-		}
-		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
-			FlowID:      "flow:target:season:season-1",
-			ItemID:      "target:season:season-1",
-			SubjectType: "season",
-			DisplayName: "Season 1",
-			State:       domain.FlowStateActive,
-			Version:     0,
-			CreatedAt:   now,
-			UpdatedAt:   now,
-		}, 0); err != nil {
-			return err
-		}
-		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
-			FlowID:      "flow:target:item:ep-1",
-			ItemID:      "target:item:ep-1",
-			SubjectType: "item",
-			DisplayName: "Episode 1",
-			State:       domain.FlowStateActive,
-			Version:     0,
-			CreatedAt:   now,
-			UpdatedAt:   now,
-		}, 0); err != nil {
-			return err
-		}
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-2", SeriesID: "series-1", SeasonID: "season-1", UpdatedAt: now}); err != nil {
-			return err
-		}
-		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
-			FlowID:      "flow:target:item:ep-2",
-			ItemID:      "target:item:ep-2",
-			SubjectType: "item",
-			DisplayName: "Episode 2",
-			State:       domain.FlowStateActive,
-			Version:     0,
-			CreatedAt:   now,
-			UpdatedAt:   now,
-		}, 0)
-	}); err != nil {
-		t.Fatalf("seed aggregate flow/media: %v", err)
-	}
-
-	deleteCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodDelete && (r.URL.Path == "/Items/ep-1" || r.URL.Path == "/Items/ep-2") {
-			deleteCount++
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-
-	h := NewExecuteDeleteHandler(store, jellyfin.NewClient(server.URL, "api-key", server.Client()))
-	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-agg", ItemID: "target:series:series-1", IdempotencyKey: "dedupe:agg"}); err != nil {
-		t.Fatalf("execute delete aggregate: %v", err)
-	}
-	if deleteCount != 2 {
-		t.Fatalf("expected 2 child deletes, got %d", deleteCount)
-	}
-
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
-		_, found, err := tx.GetMedia(context.Background(), "ep-1")
-		if err != nil {
-			return err
-		}
-		if found {
-			t.Fatal("expected ep-1 media deleted")
-		}
-
-		_, found, err = tx.GetFlow(context.Background(), "target:item:ep-1")
-		if err != nil {
-			return err
-		}
-		if found {
-			t.Fatal("expected child item flow deleted")
-		}
-
-		_, found, err = tx.GetFlow(context.Background(), "target:item:ep-2")
-		if err != nil {
-			return err
-		}
-		if found {
-			t.Fatal("expected second child item flow deleted")
-		}
-
-		_, found, err = tx.GetFlow(context.Background(), "target:season:season-1")
-		if err != nil {
-			return err
-		}
-		if found {
-			t.Fatal("expected season projection flow deleted for series delete")
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("verify post-delete state: %v", err)
-	}
-}
-
 func TestExecuteDeleteHandlerDeletesChildrenForSeasonTarget(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
@@ -874,6 +917,47 @@ func TestSendHITLPromptHandlerIncludesLastPlayedStatusLine(t *testing.T) {
 	}
 }
 
+func TestSendHITLPromptHandlerFallsBackToCreatedTimestampWhenNeverPlayed(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+	createdAt := now.Add(-48 * time.Hour)
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:    "flow:item-never-played",
+			ItemID:    "item-never-played",
+			State:     domain.FlowStatePendingReview,
+			Version:   0,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "item-never-played", CreatedAt: createdAt, UpdatedAt: now})
+	}); err != nil {
+		t.Fatalf("seed flow/media: %v", err)
+	}
+
+	pub, _, _ := ed25519.GenerateKey(nil)
+	discordSvc, err := discord.NewService("", pub)
+	if err != nil {
+		t.Fatalf("discord service: %v", err)
+	}
+	receivedStatus := ""
+	discordSvc.SetSendPromptHookForTest(func(_ context.Context, _ string, _ string, _ int64, _ string, _ string, status string) (string, error) {
+		receivedStatus = status
+		return "msg-status-created", nil
+	})
+
+	h := NewSendHITLPromptHandler(store, nil, discordSvc, "channel-1", 48*time.Hour)
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "prompt-never-played", ItemID: "item-never-played"}); err != nil {
+		t.Fatalf("handle prompt: %v", err)
+	}
+	if !strings.Contains(receivedStatus, "Last played at: never (added") {
+		t.Fatalf("expected created-time fallback status, got %q", receivedStatus)
+	}
+}
+
 func TestSendHITLPromptHandlerUsesCurrentFlowVersionInCustomID(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
@@ -977,5 +1061,13 @@ func TestSendHITLPromptHandlerSendsNewMessageWhenStoredMessageMissing(t *testing
 		return nil
 	}); err != nil {
 		t.Fatalf("verify flow: %v", err)
+	}
+}
+
+func TestHumanTimeLabelUsesDiscordRelativeTimestampFormat(t *testing.T) {
+	ts := time.Date(2026, 4, 9, 0, 0, 0, 0, time.UTC)
+	label := humanTimeLabel(ts)
+	if !strings.Contains(label, "<t:") || !strings.Contains(label, ":R>") || !strings.Contains(label, ":f>") {
+		t.Fatalf("expected discord timestamp format, got %q", label)
 	}
 }

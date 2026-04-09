@@ -52,6 +52,10 @@ type Config struct {
 	JellyfinPort         string
 	JellyfinAPIKey       string
 	JellyfinWebhookToken string
+	RadarrURL            string
+	RadarrAPIKey         string
+	SonarrURL            string
+	SonarrAPIKey         string
 
 	BackfillEnabled            bool
 	BackfillInterval           time.Duration
@@ -207,6 +211,10 @@ func LoadFromEnv() (Config, error) {
 		JellyfinPort:         jellyfinPort,
 		JellyfinAPIKey:       os.Getenv("JELLYFIN_API_KEY"),
 		JellyfinWebhookToken: strings.TrimSpace(os.Getenv("JELLYFIN_WEBHOOK_TOKEN")),
+		RadarrURL:            strings.TrimSpace(os.Getenv("RADARR_URL")),
+		RadarrAPIKey:         strings.TrimSpace(os.Getenv("RADARR_API_KEY")),
+		SonarrURL:            strings.TrimSpace(os.Getenv("SONARR_URL")),
+		SonarrAPIKey:         strings.TrimSpace(os.Getenv("SONARR_API_KEY")),
 
 		BackfillEnabled:            backfillEnabled,
 		BackfillInterval:           backfillInterval,

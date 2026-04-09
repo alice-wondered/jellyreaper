@@ -185,6 +185,15 @@ Behavior:
 | `JELLYFIN_API_KEY` | yes | - | Jellyfin API key |
 | `JELLYFIN_WEBHOOK_TOKEN` | no (strongly recommended) | - | required token for Jellyfin webhook auth |
 
+### Sonarr + Radarr (Optional Removal Sync)
+
+| Variable | Required | Default | Description |
+|---|---:|---|---|
+| `RADARR_URL` | no | - | Radarr base URL for movie removal sync |
+| `RADARR_API_KEY` | no | - | Radarr API key |
+| `SONARR_URL` | no | - | Sonarr base URL for series removal sync |
+| `SONARR_API_KEY` | no | - | Sonarr API key |
+
 ### Policy Defaults
 
 | Variable | Required | Default | Description |

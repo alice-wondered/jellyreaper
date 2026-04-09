@@ -57,6 +57,7 @@ type Service struct {
 	defaultDelayWindow    time.Duration
 	defaultExpireDays     int
 	defaultHITLTimeoutHrs int
+	jellyfinClient        *jellyfin.Client
 	backfillBatchSize     int
 	backfillBatchTimeout  time.Duration
 	backfillQueueCapacity int
@@ -173,7 +174,20 @@ func (s *Service) SetDiscordService(discordSvc *discord.Service) {
 	s.discord = discordSvc
 }
 
+func (s *Service) SetJellyfinClient(client *jellyfin.Client) {
+	s.jellyfinClient = client
+}
+
 func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.WebhookEvent) error {
+	if s.jellyfinClient != nil && isCatalogIndexEvent(event.EventType) && !isRemovalEvent(event.EventType) && event.ItemID != "" && len(event.Payload.ProviderIDs) == 0 {
+		providerIDs, err := s.jellyfinClient.FetchProviderIDs(ctx, event.ItemID)
+		if err != nil {
+			s.logger.Warn("failed to lazy-fetch jellyfin provider ids", "item_id", event.ItemID, "error", err)
+		} else if len(providerIDs) > 0 {
+			event.Payload.ProviderIDs = providerIDs
+		}
+	}
+
 	now := s.now().UTC()
 	if sourceNow, ok := sourceTimestampForJellyfinEvent(event); ok {
 		now = sourceNow
@@ -260,6 +274,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 	}
 
 	seasonChildIDs := make([]string, 0)
+	seasonChildren := make([]domain.MediaItem, 0)
 	seasonEpisodeDelta := map[string]int{}
 	if removalEvent && strings.EqualFold(strings.TrimSpace(event.Payload.ItemType), "season") {
 		seasonID := strings.TrimSpace(event.Payload.SeasonID)
@@ -271,6 +286,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 			if err != nil {
 				return err
 			}
+			seasonChildren = append(seasonChildren, children...)
 			for _, child := range children {
 				if child.ItemID != "" {
 					seasonChildIDs = append(seasonChildIDs, child.ItemID)
@@ -301,6 +317,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 			media.PlayCountTotal = existing.PlayCountTotal
 			media.LastCatalogEventAt = existing.LastCatalogEventAt
 			media.LastPlaybackEventAt = existing.LastPlaybackEventAt
+			media.ProviderIDs = existing.ProviderIDs
 			if catalogIndexEvent && !eventAt.IsZero() && eventAt.Before(existing.LastCatalogEventAt) {
 				catalogUpdateAllowed = false
 			}
@@ -311,12 +328,18 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 
 		itemTypeLower := strings.ToLower(strings.TrimSpace(event.Payload.ItemType))
 		if catalogIndexEvent && catalogUpdateAllowed {
-			created := event.Payload.DateCreated.UTC()
+			created := event.Payload.DateLastMediaAdded.UTC()
 			if created.IsZero() {
-				created = event.Payload.DateLastMediaAdded.UTC()
+				created = event.Payload.DateCreated.UTC()
+			}
+			if created.IsZero() {
+				created = eventAt.UTC()
+			}
+			if created.IsZero() {
+				created = now
 			}
 			if !created.IsZero() {
-				if media.CreatedAt.IsZero() || created.Before(media.CreatedAt) {
+				if media.CreatedAt.IsZero() || created.After(media.CreatedAt) {
 					media.CreatedAt = created
 				}
 			}
@@ -348,6 +371,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 			if event.Payload.PlayCountTotal > media.PlayCountTotal {
 				media.PlayCountTotal = event.Payload.PlayCountTotal
 			}
+			media.ProviderIDs = domain.MergeProviderIDs(media.ProviderIDs, event.Payload.ProviderIDs)
 			if eventAt.After(media.LastCatalogEventAt) {
 				media.LastCatalogEventAt = eventAt
 			}
@@ -381,13 +405,15 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 			if err := tx.UpsertMedia(ctx, media); err != nil {
 				return err
 			}
-		} else if itemTypeLower == "episode" && found {
-			seasonID := strings.TrimSpace(existing.SeasonID)
-			if seasonID == "" {
-				seasonID = strings.TrimSpace(event.Payload.SeasonID)
-			}
-			if seasonID != "" {
-				seasonEpisodeDelta[seasonID]--
+		} else if found {
+			if itemTypeLower == "episode" {
+				seasonID := strings.TrimSpace(existing.SeasonID)
+				if seasonID == "" {
+					seasonID = strings.TrimSpace(event.Payload.SeasonID)
+				}
+				if seasonID != "" {
+					seasonEpisodeDelta[seasonID]--
+				}
 			}
 		}
 	}
@@ -1011,6 +1037,7 @@ func (s *Service) ingestBackfillItemsWithCursor(ctx context.Context, items []jel
 		evt := jellyfin.WebhookEvent{
 			Payload: jellyfin.WebhookPayload{
 				ItemID:             it.ItemID,
+				ProviderIDs:        it.ProviderIDs,
 				ItemType:           it.ItemType,
 				Name:               it.Name,
 				SeasonID:           it.SeasonID,
@@ -1709,7 +1736,8 @@ func humanTimeLabel(t time.Time) string {
 	if t.IsZero() {
 		return "unknown"
 	}
-	return t.UTC().Format("2006-01-02 15:04 UTC")
+	unix := t.UTC().Unix()
+	return fmt.Sprintf("<t:%d:R> (<t:%d:f>)", unix, unix)
 }
 
 func shortHash(value string) string {

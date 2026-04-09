@@ -38,6 +38,21 @@ func (h evalCounterHandler) Handle(context.Context, domain.JobRecord) error {
 	return nil
 }
 
+type removalRecorder struct {
+	calls atomic.Int64
+	last  map[string]string
+}
+
+func (r *removalRecorder) RemoveByProviderIDs(_ context.Context, providerIDs map[string]string) error {
+	r.calls.Add(1)
+	cpy := make(map[string]string, len(providerIDs))
+	for k, v := range providerIDs {
+		cpy[k] = v
+	}
+	r.last = cpy
+	return nil
+}
+
 func openStore(t *testing.T) *bboltrepo.Store {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "integration.db")
@@ -584,6 +599,89 @@ func TestIntegrationCanonicalizesIDsAcrossBackfillAndWebhookSources(t *testing.T
 	})
 	if err != nil {
 		t.Fatalf("verify canonicalized persisted state: %v", err)
+	}
+}
+
+func TestIntegrationWebhookDeleteDoesNotTriggerARRRemovalPath(t *testing.T) {
+	store := openStore(t)
+	now := time.Now().UTC()
+	movieID := "1bb7dcaf-2c6e-04a7-5d91-c4f0ee6b3cfd"
+
+	backfillServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/Items":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"Items": []map[string]any{
+					{"Id": movieID, "Type": "Movie", "Name": "Sample Movie", "ProviderIds": map[string]any{"Tmdb": "603", "Imdb": "tt0133093"}, "DateCreated": now.Add(-300 * 24 * time.Hour).Format(time.RFC3339), "DateLastMediaAdded": now.Add(-300 * 24 * time.Hour).Format(time.RFC3339)},
+				},
+			})
+		case "/Users":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"Id": "u1"}})
+		case "/Users/u1/Items":
+			_ = json.NewEncoder(w).Encode(map[string]any{"Items": []map[string]any{}})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer backfillServer.Close()
+
+	b, err := jellyfin.NewBackfillService(backfillServer.URL, "api", backfillServer.Client())
+	if err != nil {
+		t.Fatalf("new backfill service: %v", err)
+	}
+	items, err := b.FetchChangedItemsSince(context.Background(), now.Add(-365*24*time.Hour), 100)
+	if err != nil {
+		t.Fatalf("fetch changed items: %v", err)
+	}
+
+	pub, _, _ := ed25519.GenerateKey(nil)
+	discordSvc, err := discord.NewService("", pub)
+	if err != nil {
+		t.Fatalf("discord service: %v", err)
+	}
+	appSvc := app.NewService(store, nil, nil)
+	appSvc.SetPolicyDefaults(60, 15*24*time.Hour)
+	if err := appSvc.IngestBackfillItems(context.Background(), items); err != nil {
+		t.Fatalf("ingest backfill items: %v", err)
+	}
+
+	mux, err := api.NewMux(api.Config{
+		Addr:                     ":0",
+		Jellyfin:                 appSvc.HandleJellyfinWebhook,
+		Discord:                  discordSvc,
+		HandleDiscordInteraction: appSvc.HandleDiscordComponentInteraction,
+	})
+	if err != nil {
+		t.Fatalf("new mux: %v", err)
+	}
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	payload := []byte(`{"ItemId":"` + movieID + `","ItemType":"Movie","Name":"Sample Movie","EventId":"evt-delete-arr","NotificationType":"ItemDeleted"}`)
+	resp, err := http.Post(server.URL+"/webhooks/jellyfin", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("post webhook: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("unexpected status: %d", resp.StatusCode)
+	}
+
+	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if _, found, err := tx.GetMedia(context.Background(), movieID); err != nil {
+			return err
+		} else if found {
+			t.Fatalf("expected deleted movie media to be removed from store")
+		}
+		if _, found, err := tx.GetFlow(context.Background(), "target:movie:"+movieID); err != nil {
+			return err
+		} else if found {
+			t.Fatalf("expected deleted movie flow to be removed")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("verify removed state: %v", err)
 	}
 }
 

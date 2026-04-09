@@ -12,26 +12,27 @@ import (
 )
 
 type WebhookPayload struct {
-	EventID            string    `json:"EventId,omitempty"`
-	NotificationID     string    `json:"NotificationId,omitempty"`
-	NotificationType   string    `json:"NotificationType,omitempty"`
-	Event              string    `json:"Event,omitempty"`
-	ItemID             string    `json:"ItemId,omitempty"`
-	ItemType           string    `json:"ItemType,omitempty"`
-	SeasonID           string    `json:"SeasonId,omitempty"`
-	SeasonName         string    `json:"SeasonName,omitempty"`
-	SeriesID           string    `json:"SeriesId,omitempty"`
-	SeriesName         string    `json:"SeriesName,omitempty"`
-	ServerURL          string    `json:"ServerUrl,omitempty"`
-	PrimaryImageTag    string    `json:"PrimaryImageTag,omitempty"`
-	PrimaryImageURL    string    `json:"PrimaryImageUrl,omitempty"`
-	UserID             string    `json:"UserId,omitempty"`
-	ServerID           string    `json:"ServerId,omitempty"`
-	Name               string    `json:"Name,omitempty"`
-	DateCreated        time.Time `json:"DateCreated,omitempty"`
-	DateLastMediaAdded time.Time `json:"DateLastMediaAdded,omitempty"`
-	LastPlayedAt       time.Time `json:"LastPlayedAt,omitempty"`
-	PlayCountTotal     int64     `json:"PlayCountTotal,omitempty"`
+	EventID            string            `json:"EventId,omitempty"`
+	NotificationID     string            `json:"NotificationId,omitempty"`
+	NotificationType   string            `json:"NotificationType,omitempty"`
+	Event              string            `json:"Event,omitempty"`
+	ItemID             string            `json:"ItemId,omitempty"`
+	ItemType           string            `json:"ItemType,omitempty"`
+	SeasonID           string            `json:"SeasonId,omitempty"`
+	SeasonName         string            `json:"SeasonName,omitempty"`
+	SeriesID           string            `json:"SeriesId,omitempty"`
+	SeriesName         string            `json:"SeriesName,omitempty"`
+	ServerURL          string            `json:"ServerUrl,omitempty"`
+	PrimaryImageTag    string            `json:"PrimaryImageTag,omitempty"`
+	PrimaryImageURL    string            `json:"PrimaryImageUrl,omitempty"`
+	UserID             string            `json:"UserId,omitempty"`
+	ServerID           string            `json:"ServerId,omitempty"`
+	Name               string            `json:"Name,omitempty"`
+	DateCreated        time.Time         `json:"DateCreated,omitempty"`
+	DateLastMediaAdded time.Time         `json:"DateLastMediaAdded,omitempty"`
+	LastPlayedAt       time.Time         `json:"LastPlayedAt,omitempty"`
+	PlayCountTotal     int64             `json:"PlayCountTotal,omitempty"`
+	ProviderIDs        map[string]string `json:"ProviderIds,omitempty"`
 }
 
 type WebhookEvent struct {
@@ -49,6 +50,7 @@ func BuildWebhookEvent(payload WebhookPayload, raw map[string]any) WebhookEvent 
 	payload.SeasonID = domain.NormalizeID(payload.SeasonID)
 	payload.SeriesID = domain.NormalizeID(payload.SeriesID)
 	payload.UserID = domain.NormalizeID(payload.UserID)
+	payload.ProviderIDs = domain.NormalizeProviderIDs(payload.ProviderIDs)
 	payload.PrimaryImageURL = derivePrimaryImageURL(payload)
 
 	eventID := payload.EventID

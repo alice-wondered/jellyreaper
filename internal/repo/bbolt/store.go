@@ -567,6 +567,7 @@ func (t *txRepo) UpsertMedia(ctx context.Context, media domain.MediaItem) error 
 	media.SeasonID = domain.NormalizeID(media.SeasonID)
 	media.SeriesID = domain.NormalizeID(media.SeriesID)
 	media.LastUserID = domain.NormalizeID(media.LastUserID)
+	media.ProviderIDs = domain.NormalizeProviderIDs(media.ProviderIDs)
 	b, err := requireBucket(t.tx, bucketMedia)
 	if err != nil {
 		return err
