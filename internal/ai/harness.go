@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,6 +31,7 @@ type Harness struct {
 	repository repo.Repository
 	client     openai.Client
 	model      string
+	logger     *slog.Logger
 	decision   DecisionService
 
 	mu              sync.Mutex
@@ -107,6 +109,7 @@ func NewHarness(repository repo.Repository, apiKey string, model string) *Harnes
 		repository:  repository,
 		client:      openai.NewClient(option.WithAPIKey(strings.TrimSpace(apiKey))),
 		model:       model,
+		logger:      slog.Default(),
 		history:     map[string]*ringBuffer{},
 		state:       map[string]threadState{},
 		maxThreads:  maxThreadContexts,
@@ -141,12 +144,25 @@ func (h *Harness) HandleMention(ctx context.Context, threadID string, userName s
 	h.touchThread(threadID)
 	out, err := h.respondBestEffort(ctx, threadID, userName, input)
 	if err != nil {
-		return "I hit an issue while processing that request. Please try again with a little more detail.", nil
+		h.logger.Error("ai mention processing failed", "thread_id", threadID, "user", userName, "error", err)
+		return fmt.Sprintf("I couldn't complete that because the AI backend returned an error: `%s`", summarizeAIError(err)), nil
 	}
 
 	h.appendHistory(threadID, userName+": "+input)
 	h.appendHistory(threadID, "assistant: "+out)
 	return out, nil
+}
+
+func summarizeAIError(err error) string {
+	msg := strings.TrimSpace(err.Error())
+	if msg == "" {
+		return "unknown error"
+	}
+	msg = strings.ReplaceAll(msg, "\n", " ")
+	if len(msg) > 220 {
+		msg = msg[:220] + "..."
+	}
+	return msg
 }
 
 func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userName string, input string) (string, error) {
