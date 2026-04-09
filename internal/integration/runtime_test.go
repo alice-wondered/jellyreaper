@@ -460,6 +460,133 @@ func TestIntegrationBackfillUsesUserPlaybackToDeferReviewScheduling(t *testing.T
 	}
 }
 
+func TestIntegrationCanonicalizesIDsAcrossBackfillAndWebhookSources(t *testing.T) {
+	store := openStore(t)
+	now := time.Now().UTC()
+	backfillPlay := now.Add(-4 * 24 * time.Hour)
+	webhookPlay := now.Add(-24 * time.Hour)
+
+	dashedID := "1bb7dcaf-2c6e-04a7-5d91-c4f0ee6b3cfd"
+	nonDashedID := "1bb7dcaf2c6e04a75d91c4f0ee6b3cfd"
+
+	backfillServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/Items":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"Items": []map[string]any{
+					{"Id": dashedID, "Type": "Movie", "Name": "Sample Movie", "DateCreated": now.Add(-300 * 24 * time.Hour).Format(time.RFC3339), "DateLastMediaAdded": now.Add(-300 * 24 * time.Hour).Format(time.RFC3339)},
+				},
+			})
+		case "/Users":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"Id": "u1"}})
+		case "/Users/u1/Items":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"Items": []map[string]any{
+					{"Id": dashedID, "Type": "Movie", "Name": "Sample Movie", "UserData": map[string]any{"LastPlayedDate": backfillPlay.Format(time.RFC3339Nano), "PlayCount": 2}},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer backfillServer.Close()
+
+	b, err := jellyfin.NewBackfillService(backfillServer.URL, "api", backfillServer.Client())
+	if err != nil {
+		t.Fatalf("new backfill service: %v", err)
+	}
+
+	items, err := b.FetchChangedItemsSince(context.Background(), now.Add(-365*24*time.Hour), 100)
+	if err != nil {
+		t.Fatalf("fetch changed items: %v", err)
+	}
+
+	pub, _, _ := ed25519.GenerateKey(nil)
+	discordSvc, err := discord.NewService("", pub)
+	if err != nil {
+		t.Fatalf("discord service: %v", err)
+	}
+	appSvc := app.NewService(store, nil, nil)
+	appSvc.SetPolicyDefaults(60, 15*24*time.Hour)
+	if err := appSvc.IngestBackfillItems(context.Background(), items); err != nil {
+		t.Fatalf("ingest backfill items: %v", err)
+	}
+
+	mux, err := api.NewMux(api.Config{
+		Addr:                     ":0",
+		Jellyfin:                 appSvc.HandleJellyfinWebhook,
+		Discord:                  discordSvc,
+		HandleDiscordInteraction: appSvc.HandleDiscordComponentInteraction,
+	})
+	if err != nil {
+		t.Fatalf("new mux: %v", err)
+	}
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	payload := []byte(`{"ItemId":"` + nonDashedID + `","ItemType":"Movie","Name":"Sample Movie","EventId":"evt-id-format","NotificationType":"PlaybackStart","LastPlayedAt":"` + webhookPlay.Format(time.RFC3339Nano) + `"}`)
+	resp, err := http.Post(server.URL+"/webhooks/jellyfin", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("post webhook: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("unexpected status: %d", resp.StatusCode)
+	}
+
+	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		media, found, err := tx.GetMedia(context.Background(), dashedID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatalf("expected canonical dashed media record")
+		}
+		if media.LastPlayedAt.Before(webhookPlay.Add(-time.Second)) || media.LastPlayedAt.After(webhookPlay.Add(time.Second)) {
+			t.Fatalf("expected webhook playback timestamp to win, got=%s want~=%s", media.LastPlayedAt, webhookPlay)
+		}
+
+		flowID := "target:movie:" + dashedID
+		flow, found, err := tx.GetFlow(context.Background(), flowID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatalf("expected canonical movie flow %s", flowID)
+		}
+		if flow.ItemID != flowID {
+			t.Fatalf("unexpected flow item id: %s", flow.ItemID)
+		}
+
+		if _, found, err := tx.GetFlow(context.Background(), "target:movie:"+nonDashedID); err != nil {
+			return err
+		} else if found {
+			t.Fatalf("did not expect non-canonical movie flow key")
+		}
+
+		canonicalJobID := "job:eval:scheduled:target:movie:" + dashedID
+		job, found, err := tx.GetJob(context.Background(), canonicalJobID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatalf("expected canonical scheduled evaluate job")
+		}
+		if job.ItemID != "target:movie:"+dashedID {
+			t.Fatalf("expected canonical job item id, got %s", job.ItemID)
+		}
+		if _, found, err := tx.GetJob(context.Background(), "job:eval:scheduled:target:movie:"+nonDashedID); err != nil {
+			return err
+		} else if found {
+			t.Fatalf("did not expect non-canonical scheduled evaluate job")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("verify canonicalized persisted state: %v", err)
+	}
+}
+
 func getFlow(store *bboltrepo.Store, itemID string) (domain.Flow, bool, error) {
 	var flow domain.Flow
 	var found bool
