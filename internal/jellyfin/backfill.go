@@ -34,6 +34,7 @@ type BackfillService struct {
 }
 
 const usersCacheTTL = 30 * time.Minute
+const userItemsIDsChunkSize = 80
 
 type FetchProgress struct {
 	Stream           string
@@ -397,23 +398,25 @@ func (s *BackfillService) enrichItemsWithAllUsersPlayback(ctx context.Context, i
 	lastPlayed := map[string]time.Time{}
 	playCount := map[string]int32{}
 	for _, user := range users {
-		userItems, err := s.fetchUserItemsPlayback(ctx, user.ID, ids)
-		if err != nil {
-			continue
-		}
-		for _, it := range userItems.Items {
-			id := strings.TrimSpace(it.ID)
-			if id == "" || it.UserData == nil {
+		for _, chunk := range chunkItemIDs(ids, userItemsIDsChunkSize) {
+			userItems, err := s.fetchUserItemsPlayback(ctx, user.ID, chunk)
+			if err != nil {
 				continue
 			}
-			if it.UserData.LastPlayedDate != nil {
-				ts := it.UserData.LastPlayedDate.UTC()
-				if ts.After(lastPlayed[id]) {
-					lastPlayed[id] = ts
+			for _, it := range userItems.Items {
+				id := strings.TrimSpace(it.ID)
+				if id == "" || it.UserData == nil {
+					continue
 				}
-			}
-			if it.UserData.PlayCount != nil && *it.UserData.PlayCount > playCount[id] {
-				playCount[id] = *it.UserData.PlayCount
+				if it.UserData.LastPlayedDate != nil {
+					ts := it.UserData.LastPlayedDate.UTC()
+					if ts.After(lastPlayed[id]) {
+						lastPlayed[id] = ts
+					}
+				}
+				if it.UserData.PlayCount != nil && *it.UserData.PlayCount > playCount[id] {
+					playCount[id] = *it.UserData.PlayCount
+				}
 			}
 		}
 	}
@@ -656,6 +659,22 @@ func mergeRecentSnapshots(base []ItemSnapshot, recent []ItemSnapshot) []ItemSnap
 		base = append(base, rec)
 	}
 	return base
+}
+
+func chunkItemIDs(ids []string, chunkSize int) [][]string {
+	if chunkSize <= 0 {
+		chunkSize = len(ids)
+	}
+	out := make([][]string, 0, (len(ids)+chunkSize-1)/chunkSize)
+	for start := 0; start < len(ids); start += chunkSize {
+		end := start + chunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		piece := append([]string(nil), ids[start:end]...)
+		out = append(out, piece)
+	}
+	return out
 }
 
 func (s *BackfillService) emitProgress(progress FetchProgress) {

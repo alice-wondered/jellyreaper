@@ -300,3 +300,46 @@ func TestBackfillFetchChangedItemsPageIncludesRecentUserPlaysWhenCatalogPageEmpt
 		t.Fatalf("expected merged last played %s, got %s", recentPlay, page.Items[0].LastPlayedAt)
 	}
 }
+
+func TestBackfillFetchChangedItemsSinceChunksUserItemsIdsToAvoidLongURLs(t *testing.T) {
+	ids := make([]uuid.UUID, 0, 140)
+	for i := 0; i < 140; i++ {
+		ids = append(ids, uuid.New())
+	}
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/Items":
+			out := make([]gen.BaseItemDto, 0, len(ids))
+			for _, id := range ids {
+				name := "Item"
+				out = append(out, gen.BaseItemDto{Id: &id, Name: &name})
+			}
+			_ = json.NewEncoder(w).Encode(gen.BaseItemDtoQueryResult{Items: &out})
+		case "/Users":
+			_, _ = w.Write([]byte(`[{"Id":"u1"}]`))
+		case "/Users/u1/Items":
+			requestCount++
+			if len(r.URL.Query().Get("Ids")) > 4000 {
+				w.WriteHeader(http.StatusRequestURITooLong)
+				return
+			}
+			_, _ = w.Write([]byte(`{"Items":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	b, err := NewBackfillService(server.URL, "token", server.Client())
+	if err != nil {
+		t.Fatalf("new backfill service: %v", err)
+	}
+
+	if _, err := b.FetchChangedItemsSince(context.Background(), time.Now().Add(-24*time.Hour), 500); err != nil {
+		t.Fatalf("fetch changed items: %v", err)
+	}
+	if requestCount < 2 {
+		t.Fatalf("expected chunked per-user item requests, got %d", requestCount)
+	}
+}
