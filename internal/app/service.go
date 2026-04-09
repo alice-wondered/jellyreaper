@@ -1509,7 +1509,7 @@ func upsertEvaluatePolicyJob(ctx context.Context, tx repo.TxRepository, flow dom
 }
 
 func targetKey(targetType, id string) string {
-	return "target:" + targetType + ":" + strings.TrimSpace(id)
+	return "target:" + targetType + ":" + domain.NormalizeID(id)
 }
 
 func inferSubjectType(canonical string) string {

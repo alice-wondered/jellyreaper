@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"jellyreaper/internal/domain"
 	gen "jellyreaper/internal/jellyfin/gen"
 )
 
@@ -325,15 +326,15 @@ func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.
 		hasMore = int32(len(*body.Items)) >= pageSize
 		out = make([]ItemSnapshot, 0, len(*body.Items))
 		for _, item := range *body.Items {
-			itemID := uuidString(item.Id)
+			itemID := domain.NormalizeID(uuidString(item.Id))
 			itemType := stringValueFromKind(item.Type)
 			imageURL := buildPrimaryImageURL(s.baseURL, itemID, item.ImageTags)
 			out = append(out, ItemSnapshot{
 				ItemID:             itemID,
 				ItemType:           itemType,
-				SeasonID:           uuidString(item.SeasonId),
+				SeasonID:           domain.NormalizeID(uuidString(item.SeasonId)),
 				SeasonName:         safeString(item.SeasonName),
-				SeriesID:           uuidString(item.SeriesId),
+				SeriesID:           domain.NormalizeID(uuidString(item.SeriesId)),
 				SeriesName:         safeString(item.SeriesName),
 				Name:               safeString(item.Name),
 				ImageURL:           imageURL,
@@ -408,7 +409,7 @@ func (s *BackfillService) enrichItemsWithAllUsersPlayback(ctx context.Context, i
 	ids := make([]string, 0, len(items))
 	indexByID := make(map[string]int, len(items))
 	for i := range items {
-		id := strings.TrimSpace(items[i].ItemID)
+		id := domain.NormalizeID(items[i].ItemID)
 		if id == "" {
 			continue
 		}
@@ -434,7 +435,7 @@ func (s *BackfillService) enrichItemsWithAllUsersPlayback(ctx context.Context, i
 				continue
 			}
 			for _, it := range userItems.Items {
-				id := strings.TrimSpace(it.ID)
+				id := domain.NormalizeID(it.ID)
 				if id == "" || it.UserData == nil {
 					continue
 				}
@@ -547,7 +548,7 @@ func (s *BackfillService) fetchRecentlyPlayedAcrossUsersSince(ctx context.Contex
 				if played.Before(since) {
 					continue
 				}
-				id := strings.TrimSpace(raw.ID)
+				id := domain.NormalizeID(raw.ID)
 				if id == "" {
 					continue
 				}
@@ -560,13 +561,13 @@ func (s *BackfillService) fetchRecentlyPlayedAcrossUsersSince(ctx context.Contex
 					item.Name = strings.TrimSpace(raw.Name)
 				}
 				if strings.TrimSpace(item.SeasonID) == "" {
-					item.SeasonID = strings.TrimSpace(raw.SeasonID)
+					item.SeasonID = domain.NormalizeID(raw.SeasonID)
 				}
 				if strings.TrimSpace(item.SeasonName) == "" {
 					item.SeasonName = strings.TrimSpace(raw.SeasonName)
 				}
 				if strings.TrimSpace(item.SeriesID) == "" {
-					item.SeriesID = strings.TrimSpace(raw.SeriesID)
+					item.SeriesID = domain.NormalizeID(raw.SeriesID)
 				}
 				if strings.TrimSpace(item.SeriesName) == "" {
 					item.SeriesName = strings.TrimSpace(raw.SeriesName)
@@ -695,13 +696,13 @@ func retryBackoffDelayForEnrichment(attempt int, base time.Duration, max time.Du
 func mergeRecentSnapshots(base []ItemSnapshot, recent []ItemSnapshot) []ItemSnapshot {
 	index := make(map[string]int, len(base))
 	for i := range base {
-		id := strings.TrimSpace(base[i].ItemID)
+		id := domain.NormalizeID(base[i].ItemID)
 		if id != "" {
 			index[id] = i
 		}
 	}
 	for _, rec := range recent {
-		id := strings.TrimSpace(rec.ItemID)
+		id := domain.NormalizeID(rec.ItemID)
 		if id == "" {
 			continue
 		}
