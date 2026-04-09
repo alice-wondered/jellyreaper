@@ -269,6 +269,7 @@ func (s *BackfillService) FetchChangedItemsSince(ctx context.Context, since time
 func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.Time, startIndex int32, limit int32) (ItemPage, error) {
 	recursive := true
 	enableUserData := true
+	includeItemTypes := []gen.BaseItemKind{gen.BaseItemKindMovie, gen.BaseItemKindEpisode}
 	sortBy := []gen.ItemSortBy{gen.ItemSortByDateCreated}
 	sortOrder := []gen.SortOrder{gen.SortOrder("Ascending")}
 	fields := []gen.ItemFields{gen.ItemFieldsProviderIds}
@@ -278,13 +279,14 @@ func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.
 	}
 
 	params := &gen.GetItemsParams{
-		Recursive:      &recursive,
-		EnableUserData: &enableUserData,
-		SortBy:         &sortBy,
-		SortOrder:      &sortOrder,
-		Fields:         &fields,
-		Limit:          &pageSize,
-		StartIndex:     &startIndex,
+		Recursive:        &recursive,
+		EnableUserData:   &enableUserData,
+		IncludeItemTypes: &includeItemTypes,
+		SortBy:           &sortBy,
+		SortOrder:        &sortOrder,
+		Fields:           &fields,
+		Limit:            &pageSize,
+		StartIndex:       &startIndex,
 	}
 	if !since.IsZero() {
 		params.MinDateLastSaved = &since
