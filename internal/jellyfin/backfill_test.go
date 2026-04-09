@@ -68,6 +68,13 @@ func TestBackfillFetchChangedItemsSince(t *testing.T) {
 			if enableUserData != "true" {
 				t.Fatalf("expected EnableUserData=true query parameter")
 			}
+			sortOrder := r.URL.Query().Get("sortOrder")
+			if sortOrder == "" {
+				sortOrder = r.URL.Query().Get("SortOrder")
+			}
+			if !strings.Contains(strings.ToLower(sortOrder), "descending") {
+				t.Fatalf("expected descending DateCreated scan, got sortOrder=%q", sortOrder)
+			}
 			playCount := int32(7)
 			userData := gen.UserItemDataDto{LastPlayedDate: &now, PlayCount: &playCount}
 			res := gen.BaseItemDtoQueryResult{Items: &[]gen.BaseItemDto{{Id: &id, Name: strPtr("Movie C"), DateCreated: &now, DateLastMediaAdded: &now, UserData: &userData}}}
@@ -132,7 +139,8 @@ func TestBackfillFetchChangedItemsSincePaginatesAllResults(t *testing.T) {
 			out := make([]gen.BaseItemDto, 0, end-start)
 			for i := start; i < end; i++ {
 				name := fmt.Sprintf("Item %d", i+1)
-				out = append(out, gen.BaseItemDto{Id: &ids[i], Name: &name, DateCreated: &now, DateLastMediaAdded: &now})
+				created := now.Add(-time.Duration(i) * time.Minute)
+				out = append(out, gen.BaseItemDto{Id: &ids[i], Name: &name, DateCreated: &created, DateLastMediaAdded: &created})
 			}
 			_ = json.NewEncoder(w).Encode(gen.BaseItemDtoQueryResult{Items: &out})
 		case "/Users":
@@ -156,6 +164,64 @@ func TestBackfillFetchChangedItemsSincePaginatesAllResults(t *testing.T) {
 	}
 	if len(items) != len(ids) {
 		t.Fatalf("expected %d items, got %d", len(ids), len(items))
+	}
+}
+
+func TestBackfillFetchChangedItemsSinceStopsWhenOlderThanSince(t *testing.T) {
+	now := time.Now().UTC()
+	ids := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
+	since := now.Add(-90 * time.Minute)
+	itemsCalls := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/Items":
+			itemsCalls++
+			start, _ := strconv.Atoi(r.URL.Query().Get("startIndex"))
+			limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+			if limit <= 0 {
+				limit = 500
+			}
+			if start >= len(ids) {
+				_ = json.NewEncoder(w).Encode(gen.BaseItemDtoQueryResult{Items: &[]gen.BaseItemDto{}})
+				return
+			}
+			end := start + limit
+			if end > len(ids) {
+				end = len(ids)
+			}
+			out := make([]gen.BaseItemDto, 0, end-start)
+			createdTimes := []time.Time{now, now.Add(-time.Hour), now.Add(-4 * time.Hour)}
+			for i := start; i < end; i++ {
+				name := fmt.Sprintf("Item %d", i+1)
+				created := createdTimes[i]
+				out = append(out, gen.BaseItemDto{Id: &ids[i], Name: &name, DateCreated: &created, DateLastMediaAdded: &created})
+			}
+			_ = json.NewEncoder(w).Encode(gen.BaseItemDtoQueryResult{Items: &out})
+		case "/Users":
+			_, _ = w.Write([]byte(`[{"Id":"u1"}]`))
+		case "/Users/u1/Items":
+			_, _ = w.Write([]byte(`{"Items":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	b, err := NewBackfillService(server.URL, "token", server.Client())
+	if err != nil {
+		t.Fatalf("new backfill service: %v", err)
+	}
+
+	items, err := b.FetchChangedItemsSince(context.Background(), since, 2)
+	if err != nil {
+		t.Fatalf("fetch changed items: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected only items newer than since, got %d", len(items))
+	}
+	if itemsCalls != 2 {
+		t.Fatalf("expected two item page requests before stop, got %d", itemsCalls)
 	}
 }
 

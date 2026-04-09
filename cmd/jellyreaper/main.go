@@ -170,6 +170,19 @@ func main() {
 	}
 	appService.SetBackfillWriteBatching(cfg.BackfillWriteBatchSize, cfg.BackfillWriteBatchTimeout, cfg.BackfillWriteQueueCapacity)
 	dispatcher := worker.NewDispatcher(store, registry, logger)
+	if cfg.DiscordChannelID != "" {
+		dispatcher.SetDeleteFailedNotifier(func(ctx context.Context, flow domain.Flow, deleteErr error) {
+			name := strings.TrimSpace(flow.DisplayName)
+			if name == "" {
+				name = flow.ItemID
+			}
+			msg := fmt.Sprintf("Delete FAILED for %s (item_id=%s): %v", name, flow.ItemID, deleteErr)
+			logger.Error("delete terminal failure", "lex", "DELETION", "item_id", flow.ItemID, "error", deleteErr)
+			if err := discordService.SendSystemMessage(cfg.DiscordChannelID, msg); err != nil {
+				logger.Warn("failed to send delete failure notification", "lex", "DELETION", "item_id", flow.ItemID, "error", err)
+			}
+		})
+	}
 	schedulerLoop := scheduler.NewLoop(store, dispatcher.Dispatch, logger, scheduler.Config{
 		LeaseOwner: cfg.WorkerID,
 		LeaseLimit: 32,
@@ -177,6 +190,9 @@ func main() {
 		IdlePoll:   10 * time.Second,
 		Signal:     wakeCh,
 	})
+	schedulerObj := scheduler.NewScheduler(schedulerLoop, wake)
+	evaluatePolicyHandler.SetEvalScheduler(schedulerObj)
+	appService.SetEvalScheduler(schedulerObj)
 
 	if len(cfg.DiscordPublicKey) == 0 {
 		logger.Warn("DISCORD_PUBLIC_KEY_HEX is empty; /discord/interactions will reject requests")
@@ -243,6 +259,8 @@ func main() {
 		}
 	}()
 
+	// right now we send this in a bit of a race condition with the backfill messages that get sent, causing some weird status updates
+	// I don't know that we really need this when we can just set the bot's status to online
 	if cfg.DiscordChannelID != "" {
 		if err := discordService.SendSystemMessage(cfg.DiscordChannelID, "JellyReaper is online and ready."); err != nil {
 			logger.Warn("failed to send online announcement", "error", err)
@@ -267,6 +285,7 @@ func main() {
 	logger.Info("shutdown complete")
 }
 
+// can we somehow combine this with the "run backfill once" logic? This feels like a weird split in our code
 func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.Repository, appService *app.Service, discordService *discord.Service, cfg config.Config, backfillSvc *jellyfin.BackfillService, runStartup bool) {
 	if cfg.DiscordChannelID != "" {
 		if err := discordService.SendSystemMessage(cfg.DiscordChannelID, "Starting Jellyfin backfill and reconciliation run."); err != nil {
@@ -365,14 +384,14 @@ func runBackfillOnce(ctx context.Context, logger *slog.Logger, repository repo.R
 		cursor = nextCursor
 	}
 
-	if err := saveBackfillCheckpoint(ctx, repository, cursor.MaxSeen); err != nil {
+	completedAt := time.Now().UTC()
+	if err := saveBackfillCheckpoint(ctx, repository, completedAt); err != nil {
 		logger.Error("save backfill checkpoint failed", "error", err)
 	}
 	if err := clearBackfillCursor(ctx, repository); err != nil {
 		logger.Warn("clear backfill cursor failed", "error", err)
 	}
 
-	completedAt := time.Now().UTC()
 	logger.Info("backfill completed", "since", cursor.Since, "plays_fetched", cursor.PlaysProcessed, "items_fetched", cursor.ItemsProcessed, "duration", completedAt.Sub(startedAt).String())
 	if isStartup && cfg.DiscordChannelID != "" {
 		msg := "Backfill complete: plays=" + strconv.Itoa(cursor.PlaysProcessed) + ", items=" + strconv.Itoa(cursor.ItemsProcessed)

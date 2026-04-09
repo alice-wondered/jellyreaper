@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -19,11 +20,19 @@ const (
 	defaultBackoffJitterPct = 0.20
 )
 
+// DeleteFailedNotifier is invoked when an ExecuteDelete job exhausts its
+// retries and the dispatcher transitions the flow to DeleteFailed. The hook
+// is the seam for surfacing the failure to humans (Discord notification,
+// pager, etc.). It runs on a best-effort basis; errors inside the notifier
+// must not be returned to the dispatcher.
+type DeleteFailedNotifier func(ctx context.Context, flow domain.Flow, err error)
+
 type Dispatcher struct {
-	repository repo.Repository
-	registry   *jobs.Registry
-	logger     *slog.Logger
-	now        func() time.Time
+	repository         repo.Repository
+	registry           *jobs.Registry
+	logger             *slog.Logger
+	now                func() time.Time
+	notifyDeleteFailed DeleteFailedNotifier
 }
 
 func NewDispatcher(repository repo.Repository, registry *jobs.Registry, logger *slog.Logger) *Dispatcher {
@@ -36,6 +45,12 @@ func NewDispatcher(repository repo.Repository, registry *jobs.Registry, logger *
 		logger:     logger,
 		now:        time.Now,
 	}
+}
+
+// SetDeleteFailedNotifier installs a hook that fires after a terminal
+// ExecuteDelete failure has been recorded as DeleteFailed on the flow.
+func (d *Dispatcher) SetDeleteFailedNotifier(notifier DeleteFailedNotifier) {
+	d.notifyDeleteFailed = notifier
 }
 
 func (d *Dispatcher) Dispatch(ctx context.Context, job domain.JobRecord) error {
@@ -69,6 +84,11 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job domain.JobRecord) error {
 		if failErr := d.repository.FailJob(ctx, job.JobID, err.Error(), retryAt, terminal); failErr != nil {
 			return fmt.Errorf("mark job failed %s: %w", job.JobID, failErr)
 		}
+		if terminal && job.Kind == domain.JobKindExecuteDelete {
+			if markErr := d.markDeleteFlowFailed(ctx, job, err); markErr != nil {
+				d.logger.Warn("failed to mark delete flow failed", "lex", "DELETION", "job_id", job.JobID, "item_id", job.ItemID, "error", markErr)
+			}
+		}
 		return nil
 	}
 
@@ -79,6 +99,46 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job domain.JobRecord) error {
 	fields := []any{"lex", jobLogLexicon(job.Kind), "kind", job.Kind, "job_id", job.JobID, "flow_id", job.FlowID, "item_id", job.ItemID}
 	fields = append(fields, d.jobOutcomeFields(ctx, job)...)
 	d.logger.Info("job completed", fields...)
+	return nil
+}
+
+func (d *Dispatcher) markDeleteFlowFailed(ctx context.Context, job domain.JobRecord, deleteErr error) error {
+	now := d.now().UTC()
+	notifyFlow := domain.Flow{}
+	notify := false
+	if err := d.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(ctx, job.ItemID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return nil
+		}
+		if flow.State != domain.FlowStateDeleteQueued {
+			return nil
+		}
+		expected := flow.Version
+		flow.State = domain.FlowStateDeleteFailed
+		flow.UpdatedAt = now
+		flow.Version = expected + 1
+		if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+			return err
+		}
+		notifyFlow = flow
+		notify = true
+		return nil
+	}); err != nil {
+		return err
+	}
+	// Best-effort: notify whoever's listening (e.g. Discord) so the failure
+	// is visible. Hook fires outside the tx so its (potentially slow) I/O
+	// doesn't hold the bbolt write lock.
+	if notify && d.notifyDeleteFailed != nil {
+		if deleteErr == nil {
+			deleteErr = errors.New("execute delete failed")
+		}
+		d.notifyDeleteFailed(ctx, notifyFlow, deleteErr)
+	}
 	return nil
 }
 

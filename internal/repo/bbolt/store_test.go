@@ -70,6 +70,21 @@ func TestFailJobRequeuesPending(t *testing.T) {
 	if err := store.FailJob(context.Background(), "job1", "boom", retryAt, false); err != nil {
 		t.Fatalf("fail job: %v", err)
 	}
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		job, found, err := tx.GetJob(context.Background(), "job1")
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatal("expected failed job to exist")
+		}
+		if job.Attempts != 1 {
+			t.Fatalf("expected attempts incremented to 1, got %d", job.Attempts)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify failed job attempts: %v", err)
+	}
 
 	next, ok, err := store.GetNextDueAt(context.Background())
 	if err != nil {

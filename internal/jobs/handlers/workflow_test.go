@@ -3,6 +3,8 @@ package handlers
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -926,6 +928,58 @@ func TestExecuteDeleteHandlerDeletesMovieProjectionAndSiblingFlows(t *testing.T)
 	}
 }
 
+func TestExecuteDeleteHandlerRetriesDeleteInProgressFlow(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:movie:mv-retry",
+			ItemID:      "target:movie:mv-retry",
+			SubjectType: "movie",
+			DisplayName: "Retry Movie",
+			State:       domain.FlowStateDeleteQueued,
+			Version:     2,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "mv-retry", ItemType: "Movie", UpdatedAt: now})
+	}); err != nil {
+		t.Fatalf("seed retrying delete flow: %v", err)
+	}
+
+	deleteCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && r.URL.Path == "/Items/mv-retry" {
+			deleteCalls++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	h := NewExecuteDeleteHandler(store, jellyfin.NewClient(server.URL, "api-key", server.Client()))
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-delete-retry", ItemID: "target:movie:mv-retry", IdempotencyKey: "dedupe:delete-retry"}); err != nil {
+		t.Fatalf("retry delete in progress flow: %v", err)
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("expected one jellyfin delete call on retry, got %d", deleteCalls)
+	}
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if _, found, err := tx.GetFlow(context.Background(), "target:movie:mv-retry"); err != nil {
+			return err
+		} else if found {
+			return fmt.Errorf("expected retry delete to remove flow")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify retry delete cleanup: %v", err)
+	}
+}
+
 func TestSendHITLPromptHandlerAppliesMinimumResponseWindow(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
@@ -1230,4 +1284,328 @@ func TestHumanTimeLabelUsesDiscordRelativeTimestampFormat(t *testing.T) {
 	if !strings.Contains(label, "<t:") || !strings.Contains(label, ":R>") || !strings.Contains(label, ":f>") {
 		t.Fatalf("expected discord timestamp format, got %q", label)
 	}
+}
+
+// --- Stale-job bail tests (version checkpoint model) -----------------------
+
+func TestEvaluatePolicyHandlerBailsOnStaleVersion(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+	itemID := "target:movie:eval-stale"
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:" + itemID,
+			ItemID:      itemID,
+			SubjectType: "movie",
+			State:       domain.FlowStateActive,
+			Version:     5,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	h := NewEvaluatePolicyHandler(store, nil)
+	// Job stamped at version 3; flow is at 5 — handler must bail.
+	payload := mustMarshalJSON(t, map[string]any{"reason": "test", "flow_version": 3})
+	job := domain.JobRecord{JobID: "job:eval:stale", ItemID: itemID, Kind: domain.JobKindEvaluatePolicy, PayloadJSON: payload}
+	if err := h.Handle(context.Background(), job); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+
+	flow := mustGetFlowFromHandlerStore(t, store, itemID)
+	if flow.Version != 5 {
+		t.Fatalf("expected flow version unchanged at 5, got %d", flow.Version)
+	}
+	if flow.State != domain.FlowStateActive {
+		t.Fatalf("expected state unchanged Active, got %s", flow.State)
+	}
+}
+
+func TestEvaluatePolicyHandlerBailsOnFlowMissing(t *testing.T) {
+	store := testStore(t)
+	h := NewEvaluatePolicyHandler(store, nil)
+	job := domain.JobRecord{JobID: "job:eval:gone", ItemID: "target:movie:gone", Kind: domain.JobKindEvaluatePolicy}
+	if err := h.Handle(context.Background(), job); err != nil {
+		t.Fatalf("expected nil on missing flow, got %v", err)
+	}
+}
+
+func TestSendHITLPromptHandlerBailsOnStaleVersion(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+	itemID := "target:movie:prompt-stale"
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:" + itemID,
+			ItemID:      itemID,
+			SubjectType: "movie",
+			State:       domain.FlowStatePendingReview,
+			Version:     7,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	pub, _, _ := ed25519.GenerateKey(nil)
+	discordSvc, err := discord.NewService("", pub)
+	if err != nil {
+		t.Fatalf("discord service: %v", err)
+	}
+	h := NewSendHITLPromptHandler(store, nil, discordSvc, "channel-x", time.Hour)
+
+	payload := mustMarshalJSON(t, map[string]any{"channel_id": "channel-x", "flow_version": 4})
+	job := domain.JobRecord{JobID: "job:prompt:stale", ItemID: itemID, Kind: domain.JobKindSendHITLPrompt, PayloadJSON: payload}
+	if err := h.Handle(context.Background(), job); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+
+	flow := mustGetFlowFromHandlerStore(t, store, itemID)
+	if flow.Version != 7 {
+		t.Fatalf("expected flow version unchanged at 7, got %d", flow.Version)
+	}
+	if strings.TrimSpace(flow.Discord.MessageID) != "" {
+		t.Fatalf("expected no message id written on stale bail, got %q", flow.Discord.MessageID)
+	}
+}
+
+func TestHITLTimeoutHandlerBailsOnStaleVersion(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+	itemID := "target:movie:timeout-stale"
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:             "flow:" + itemID,
+			ItemID:             itemID,
+			SubjectType:        "movie",
+			State:              domain.FlowStatePendingReview,
+			Version:            9,
+			DecisionDeadlineAt: now.Add(-time.Hour),
+			CreatedAt:          now,
+			UpdatedAt:          now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	pub, _, _ := ed25519.GenerateKey(nil)
+	discordSvc, err := discord.NewService("", pub)
+	if err != nil {
+		t.Fatalf("discord service: %v", err)
+	}
+	h := NewHITLTimeoutHandler(store, discordSvc, nil)
+
+	payload := mustMarshalJSON(t, map[string]any{"default_action": "delete", "flow_version": 2})
+	job := domain.JobRecord{JobID: "job:timeout:stale", ItemID: itemID, Kind: domain.JobKindHITLTimeout, PayloadJSON: payload}
+	if err := h.Handle(context.Background(), job); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+
+	flow := mustGetFlowFromHandlerStore(t, store, itemID)
+	if flow.State != domain.FlowStatePendingReview {
+		t.Fatalf("expected state unchanged PendingReview, got %s", flow.State)
+	}
+	if flow.Version != 9 {
+		t.Fatalf("expected version unchanged at 9, got %d", flow.Version)
+	}
+}
+
+func TestHITLTimeoutHandlerBailsOnOutcomeResolved(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+	itemID := "target:movie:timeout-outcome"
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:             "flow:" + itemID,
+			ItemID:             itemID,
+			SubjectType:        "movie",
+			State:              domain.FlowStatePendingReview,
+			HITLOutcome:        "delay",
+			Version:            3,
+			DecisionDeadlineAt: now.Add(-time.Hour),
+			CreatedAt:          now,
+			UpdatedAt:          now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	pub, _, _ := ed25519.GenerateKey(nil)
+	discordSvc, err := discord.NewService("", pub)
+	if err != nil {
+		t.Fatalf("discord service: %v", err)
+	}
+	h := NewHITLTimeoutHandler(store, discordSvc, nil)
+
+	payload := mustMarshalJSON(t, map[string]any{"default_action": "delete", "flow_version": 3})
+	job := domain.JobRecord{JobID: "job:timeout:outcome", ItemID: itemID, Kind: domain.JobKindHITLTimeout, PayloadJSON: payload}
+	if err := h.Handle(context.Background(), job); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+
+	flow := mustGetFlowFromHandlerStore(t, store, itemID)
+	if flow.State != domain.FlowStatePendingReview {
+		t.Fatalf("expected state unchanged, got %s", flow.State)
+	}
+}
+
+// --- Destructive delete tests ----------------------------------------------
+
+func TestExecuteDeleteHandlerForceDeletesDespiteVersionDrift(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+	itemID := "target:movie:force-delete"
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:" + itemID,
+			ItemID:      itemID,
+			SubjectType: "movie",
+			State:       domain.FlowStateDeleteQueued,
+			Version:     12,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "force-delete", ItemType: "Movie", UpdatedAt: now})
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && r.URL.Path == "/Items/force-delete" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	h := NewExecuteDeleteHandler(store, jellyfin.NewClient(server.URL, "k", server.Client()))
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job:delete:force", ItemID: itemID, IdempotencyKey: "ded:force"}); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		_, found, err := tx.GetFlow(context.Background(), itemID)
+		if err != nil {
+			return err
+		}
+		if found {
+			t.Fatal("expected flow record to be force-deleted")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+}
+
+func TestExecuteDeleteHandlerPurgesSiblingJobs(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+	itemID := "target:movie:purge-jobs"
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:" + itemID,
+			ItemID:      itemID,
+			SubjectType: "movie",
+			State:       domain.FlowStateDeleteQueued,
+			Version:     1,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0); err != nil {
+			return err
+		}
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "purge-jobs", ItemType: "Movie", UpdatedAt: now}); err != nil {
+			return err
+		}
+		// Stale eval, prompt, and timeout records — all should be purged.
+		for _, j := range []domain.JobRecord{
+			{JobID: "job:eval:scheduled:" + itemID, ItemID: itemID, Kind: domain.JobKindEvaluatePolicy, Status: domain.JobStatusPending, RunAt: now.Add(time.Hour), CreatedAt: now, UpdatedAt: now},
+			{JobID: "job:prompt:" + itemID + ":1", ItemID: itemID, Kind: domain.JobKindSendHITLPrompt, Status: domain.JobStatusPending, RunAt: now.Add(time.Minute), CreatedAt: now, UpdatedAt: now},
+			{JobID: "job:timeout:" + itemID + ":1", ItemID: itemID, Kind: domain.JobKindHITLTimeout, Status: domain.JobStatusPending, RunAt: now.Add(2 * time.Hour), CreatedAt: now, UpdatedAt: now},
+		} {
+			if err := tx.EnqueueJob(context.Background(), j); err != nil {
+				return err
+			}
+		}
+		// And the executing delete job itself.
+		return tx.EnqueueJob(context.Background(), domain.JobRecord{JobID: "job:delete:purge", ItemID: itemID, Kind: domain.JobKindExecuteDelete, Status: domain.JobStatusPending, RunAt: now, CreatedAt: now, UpdatedAt: now})
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	h := NewExecuteDeleteHandler(store, jellyfin.NewClient(server.URL, "k", server.Client()))
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job:delete:purge", ItemID: itemID, IdempotencyKey: "ded:purge"}); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+
+	// All jobs (including the executing delete) should be gone.
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		for _, jid := range []string{
+			"job:eval:scheduled:" + itemID,
+			"job:prompt:" + itemID + ":1",
+			"job:timeout:" + itemID + ":1",
+			"job:delete:purge",
+		} {
+			_, found, err := tx.GetJob(context.Background(), jid)
+			if err != nil {
+				return err
+			}
+			if found {
+				t.Errorf("expected job %s to be purged after delete", jid)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify jobs: %v", err)
+	}
+}
+
+// --- helpers ----------------------------------------------------------------
+
+func mustMarshalJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return b
+}
+
+func mustGetFlowFromHandlerStore(t *testing.T, store *bboltrepo.Store, itemID string) domain.Flow {
+	t.Helper()
+	var out domain.Flow
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(context.Background(), itemID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatalf("flow %s not found", itemID)
+		}
+		out = flow
+		return nil
+	}); err != nil {
+		t.Fatalf("get flow: %v", err)
+	}
+	return out
 }

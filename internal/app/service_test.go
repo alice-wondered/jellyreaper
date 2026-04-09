@@ -1141,6 +1141,239 @@ func TestFullBackfillOverLiveIndexCanAdvancePlaybackWithoutRegression(t *testing
 	}
 }
 
+func TestBackfillReplayPreservesArchivedFlowState(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 9, 19, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:movie:movie-archived-1",
+			ItemID:      "target:movie:movie-archived-1",
+			SubjectType: "movie",
+			DisplayName: "The Magicians",
+			State:       domain.FlowStateArchived,
+			Version:     0,
+			CreatedAt:   now.Add(-24 * time.Hour),
+			UpdatedAt:   now.Add(-24 * time.Hour),
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed archived flow: %v", err)
+	}
+
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+		ItemID:             "movie-archived-1",
+		ItemType:           "Movie",
+		Name:               "The Magicians",
+		DateLastMediaAdded: now.Add(-48 * time.Hour),
+	}}); err != nil {
+		t.Fatalf("backfill replay: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, "target:movie:movie-archived-1")
+	if flow.State != domain.FlowStateArchived {
+		t.Fatalf("expected archived flow to remain archived, got %s", flow.State)
+	}
+}
+
+func TestPlaybackDuringDelayResolvesDelayAndReschedulesEval(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 9, 22, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	// Delay is 90 days out — longer than the 60-day configured review window.
+	// A play event must win over the delay and reset the clock to lastPlay+60d.
+	delayedUntil := now.Add(90 * 24 * time.Hour)
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.SetMeta(context.Background(), metaReviewDays, "60"); err != nil {
+			return err
+		}
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:movie:movie-play-win-1",
+			ItemID:      "target:movie:movie-play-win-1",
+			SubjectType: "movie",
+			DisplayName: "Play Wins Movie",
+			State:       domain.FlowStateActive,
+			HITLOutcome: "delay",
+			Version:     0,
+			PolicySnapshot: domain.PolicySnapshot{
+				ExpireAfterDays: 0, // falls back to meta (60)
+				HITLTimeoutHrs:  24,
+				TimeoutAction:   "delete",
+			},
+			NextActionAt: delayedUntil,
+			CreatedAt:    now.Add(-48 * time.Hour),
+			UpdatedAt:    now.Add(-48 * time.Hour),
+		}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID:    "movie-play-win-1",
+			ItemType:  "Movie",
+			Name:      "Play Wins Movie",
+			UpdatedAt: now.Add(-48 * time.Hour),
+		})
+	}); err != nil {
+		t.Fatalf("seed delayed flow: %v", err)
+	}
+
+	if err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload:    jellyfin.WebhookPayload{ItemID: "movie-play-win-1", ItemType: "Movie", NotificationType: "PlaybackStart", EventID: "evt-play-win-1"},
+		Raw:        map[string]any{"EventId": "evt-play-win-1"},
+		ItemID:     "movie-play-win-1",
+		EventID:    "evt-play-win-1",
+		EventType:  "PlaybackStart",
+		DedupeKey:  "jellyfin:evt-play-win-1",
+		OccurredAt: now,
+	}); err != nil {
+		t.Fatalf("playback webhook: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, "target:movie:movie-play-win-1")
+	if flow.State != domain.FlowStateActive {
+		t.Fatalf("expected flow to remain active, got %s", flow.State)
+	}
+	if flow.HITLOutcome != "played" {
+		t.Fatalf("play must resolve delay: expected HITLOutcome=played, got %q", flow.HITLOutcome)
+	}
+	wantNextAction := now.Add(60 * 24 * time.Hour)
+	if !flow.NextActionAt.Equal(wantNextAction) {
+		t.Fatalf("play must win over delay: got NextActionAt=%s want=%s", flow.NextActionAt, wantNextAction)
+	}
+
+	jobs, err := store.LeaseDueJobs(context.Background(), wantNextAction, 10, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease jobs: %v", err)
+	}
+	var evalJob *domain.JobRecord
+	for i := range jobs {
+		if jobs[i].ItemID == "target:movie:movie-play-win-1" && jobs[i].Kind == domain.JobKindEvaluatePolicy {
+			evalJob = &jobs[i]
+			break
+		}
+	}
+	if evalJob == nil {
+		t.Fatal("expected evaluate_policy job rescheduled at lastPlay+reviewDays after play")
+	}
+	if !evalJob.RunAt.Equal(wantNextAction) {
+		t.Fatalf("eval job must be at lastPlay+60d: got=%s want=%s", evalJob.RunAt, wantNextAction)
+	}
+}
+
+func TestBackfillReplayPreservesDelayedActiveFlowSchedule(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 9, 20, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+	delayedUntil := now.Add(10 * 24 * time.Hour)
+	lastPlayed := now.Add(-24 * time.Hour)
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:movie:movie-delayed-1",
+			ItemID:      "target:movie:movie-delayed-1",
+			SubjectType: "movie",
+			DisplayName: "RWBY",
+			State:       domain.FlowStateActive,
+			Version:     0,
+			PolicySnapshot: domain.PolicySnapshot{
+				ExpireAfterDays: 30,
+				HITLTimeoutHrs:  24,
+				TimeoutAction:   "delete",
+			},
+			NextActionAt: delayedUntil,
+			CreatedAt:    now.Add(-48 * time.Hour),
+			UpdatedAt:    now.Add(-48 * time.Hour),
+		}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID:             "movie-delayed-1",
+			ItemType:           "Movie",
+			Name:               "RWBY",
+			CreatedAt:          now.Add(-72 * time.Hour),
+			LastPlayedAt:       lastPlayed,
+			LastCatalogEventAt: now.Add(-48 * time.Hour),
+			UpdatedAt:          now.Add(-48 * time.Hour),
+		})
+	}); err != nil {
+		t.Fatalf("seed delayed flow/media: %v", err)
+	}
+
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+		ItemID:             "movie-delayed-1",
+		ItemType:           "Movie",
+		Name:               "RWBY",
+		DateLastMediaAdded: now.Add(-72 * time.Hour),
+		LastPlayedAt:       lastPlayed,
+		PlayCount:          1,
+	}}); err != nil {
+		t.Fatalf("backfill replay: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, "target:movie:movie-delayed-1")
+	if !flow.NextActionAt.Equal(delayedUntil) {
+		t.Fatalf("expected delayed next action to be preserved, got=%s want=%s", flow.NextActionAt, delayedUntil)
+	}
+}
+
+func TestBackfillReplayRecoversPendingReviewFlowWhenPlaybackAdvanced(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 9, 21, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:         "flow:target:movie:movie-pending-backfill-1",
+			ItemID:         "target:movie:movie-pending-backfill-1",
+			SubjectType:    "movie",
+			DisplayName:    "The Magicians",
+			State:          domain.FlowStatePendingReview,
+			Version:        0,
+			PolicySnapshot: domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 24, TimeoutAction: "delete"},
+			Discord:        domain.DiscordContext{ChannelID: "c1", MessageID: "m1"},
+			CreatedAt:      now.Add(-48 * time.Hour),
+			UpdatedAt:      now.Add(-48 * time.Hour),
+		}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID:       "movie-pending-backfill-1",
+			ItemType:     "Movie",
+			Name:         "The Magicians",
+			LastPlayedAt: now.Add(-40 * 24 * time.Hour),
+			UpdatedAt:    now.Add(-48 * time.Hour),
+		})
+	}); err != nil {
+		t.Fatalf("seed pending flow: %v", err)
+	}
+
+	newPlay := now.Add(-time.Hour)
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+		ItemID:       "movie-pending-backfill-1",
+		ItemType:     "Movie",
+		Name:         "The Magicians",
+		LastPlayedAt: newPlay,
+		PlayCount:    2,
+	}}); err != nil {
+		t.Fatalf("backfill replay with advanced playback: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, "target:movie:movie-pending-backfill-1")
+	if flow.State != domain.FlowStateActive {
+		t.Fatalf("expected pending review flow to recover to active, got %s", flow.State)
+	}
+	if flow.HITLOutcome != "played" {
+		t.Fatalf("expected recovered flow HITL outcome played, got %q", flow.HITLOutcome)
+	}
+	if flow.NextActionAt.Before(newPlay.Add(29 * 24 * time.Hour)) {
+		t.Fatalf("expected recovered flow next action to move beyond new play, got %s", flow.NextActionAt)
+	}
+}
+
 func TestIngestBackfillItemsEpisodeUsesSeriesProviderIDsAndCache(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)
@@ -2199,6 +2432,7 @@ func TestSourceTimestampForPlaybackPrefersLastPlayedAtOverCatalogDate(t *testing
 			DateLastMediaAdded: oldCatalog,
 			LastPlayedAt:       recentPlay,
 		},
+		EventType: "PlaybackStart",
 	}
 
 	ts, ok := sourceTimestampForJellyfinEvent(event)
@@ -2207,5 +2441,308 @@ func TestSourceTimestampForPlaybackPrefersLastPlayedAtOverCatalogDate(t *testing
 	}
 	if !ts.Equal(recentPlay) {
 		t.Fatalf("expected playback timestamp to prefer LastPlayedAt, got=%s want=%s", ts, recentPlay)
+	}
+}
+
+func TestSourceTimestampForCatalogEventPrefersCatalogDateOverLastPlayedAt(t *testing.T) {
+	catalog := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	recentPlay := time.Date(2026, 4, 5, 0, 29, 37, 0, time.UTC)
+
+	event := jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			NotificationType:   "ItemUpdated",
+			ItemType:           "Movie",
+			DateLastMediaAdded: catalog,
+			LastPlayedAt:       recentPlay,
+		},
+		EventType: "ItemUpdated",
+	}
+
+	ts, ok := sourceTimestampForJellyfinEvent(event)
+	if !ok {
+		t.Fatal("expected source timestamp")
+	}
+	if !ts.Equal(catalog) {
+		t.Fatalf("expected catalog event timestamp to prefer DateLastMediaAdded, got=%s want=%s", ts, catalog)
+	}
+}
+
+func TestFetchProviderIDsCachedRetriesAfterPreviousFailure(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"Items":[{"ProviderIds":{"Tvdb":"73244"}}]}`))
+	}))
+	defer server.Close()
+
+	svc.SetJellyfinClient(jellyfin.NewClient(server.URL, "api-key", server.Client()))
+	if _, err := svc.fetchProviderIDsCached(context.Background(), "series-retry-1"); err == nil {
+		t.Fatal("expected first provider id fetch to fail")
+	}
+	ids, err := svc.fetchProviderIDsCached(context.Background(), "series-retry-1")
+	if err != nil {
+		t.Fatalf("expected second provider id fetch to retry and succeed: %v", err)
+	}
+	if ids["tvdb"] != "73244" {
+		t.Fatalf("expected retried provider ids to include tvdb, got %#v", ids)
+	}
+}
+
+// --- DeleteFailed / resurrection / playback recovery cleanup ---------------
+
+func TestWebhookSkipsFlowMutationsForDeleteQueued(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	itemID := "target:movie:dq-skip"
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:" + itemID,
+			ItemID:      itemID,
+			SubjectType: "movie",
+			DisplayName: "Original Name",
+			State:       domain.FlowStateDeleteQueued,
+			Version:     5,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload:   jellyfin.WebhookPayload{ItemID: "dq-skip", ItemType: "Movie", Name: "Renamed", NotificationType: "ItemUpdated", EventID: "evt-dq-1"},
+		Raw:       map[string]any{"ItemId": "dq-skip", "EventId": "evt-dq-1"},
+		ItemID:    "dq-skip",
+		EventID:   "evt-dq-1",
+		EventType: "ItemUpdated",
+		DedupeKey: "jellyfin:evt-dq-1",
+	}); err != nil {
+		t.Fatalf("handle webhook: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, itemID)
+	if flow.Version != 5 {
+		t.Fatalf("expected version untouched at 5, got %d", flow.Version)
+	}
+	if flow.DisplayName != "Original Name" {
+		t.Fatalf("expected display name untouched, got %q", flow.DisplayName)
+	}
+	if flow.State != domain.FlowStateDeleteQueued {
+		t.Fatalf("expected state untouched DeleteQueued, got %s", flow.State)
+	}
+}
+
+func TestWebhookSkipsFlowMutationsForDeleteFailedNonItemAdded(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 9, 12, 5, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	itemID := "target:movie:df-skip"
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:" + itemID,
+			ItemID:      itemID,
+			SubjectType: "movie",
+			DisplayName: "Failed Movie",
+			State:       domain.FlowStateDeleteFailed,
+			Version:     8,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0)
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// ItemUpdated (not ItemAdded) on DeleteFailed → skip.
+	if err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload:   jellyfin.WebhookPayload{ItemID: "df-skip", ItemType: "Movie", Name: "Updated Title", NotificationType: "ItemUpdated", EventID: "evt-df-1"},
+		Raw:       map[string]any{"ItemId": "df-skip", "EventId": "evt-df-1"},
+		ItemID:    "df-skip",
+		EventID:   "evt-df-1",
+		EventType: "ItemUpdated",
+		DedupeKey: "jellyfin:evt-df-1",
+	}); err != nil {
+		t.Fatalf("handle webhook: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, itemID)
+	if flow.Version != 8 || flow.State != domain.FlowStateDeleteFailed {
+		t.Fatalf("expected DeleteFailed unchanged, got version=%d state=%s", flow.Version, flow.State)
+	}
+	if flow.DisplayName != "Failed Movie" {
+		t.Fatalf("expected display name untouched, got %q", flow.DisplayName)
+	}
+}
+
+func TestWebhookItemAddedResurrectsDeleteFailedFlow(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 9, 12, 10, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	itemID := "target:movie:df-resurrect"
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:" + itemID,
+			ItemID:      itemID,
+			SubjectType: "movie",
+			DisplayName: "Old Failed Movie",
+			State:       domain.FlowStateDeleteFailed,
+			Version:     11,
+			CreatedAt:   now.Add(-7 * 24 * time.Hour),
+			UpdatedAt:   now.Add(-7 * 24 * time.Hour),
+		}, 0); err != nil {
+			return err
+		}
+		// Stale jobs left over from the failed delete cycle.
+		return tx.EnqueueJob(context.Background(), domain.JobRecord{
+			JobID:     "job:eval:scheduled:" + itemID,
+			ItemID:    itemID,
+			Kind:      domain.JobKindEvaluatePolicy,
+			Status:    domain.JobStatusPending,
+			RunAt:     now.Add(time.Hour),
+			CreatedAt: now,
+			UpdatedAt: now,
+		})
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload:   jellyfin.WebhookPayload{ItemID: "df-resurrect", ItemType: "Movie", Name: "Resurrected Movie", NotificationType: "ItemAdded", EventID: "evt-resurrect"},
+		Raw:       map[string]any{"ItemId": "df-resurrect", "EventId": "evt-resurrect"},
+		ItemID:    "df-resurrect",
+		EventID:   "evt-resurrect",
+		EventType: "ItemAdded",
+		DedupeKey: "jellyfin:evt-resurrect",
+	}); err != nil {
+		t.Fatalf("handle webhook: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, itemID)
+	if flow.State != domain.FlowStateActive {
+		t.Fatalf("expected resurrected flow to be Active, got %s", flow.State)
+	}
+	if flow.Version <= 11 {
+		t.Fatalf("expected version to advance past 11, got %d", flow.Version)
+	}
+	if flow.DisplayName != "Resurrected Movie" {
+		t.Fatalf("expected display name from new event, got %q", flow.DisplayName)
+	}
+
+	// Stale eval should have been purged then a fresh eval re-created by RequestEval.
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		freshJob, found, err := tx.GetJob(context.Background(), "job:eval:scheduled:"+itemID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatal("expected fresh eval job to be re-scheduled after resurrection")
+		}
+		if freshJob.Status != domain.JobStatusPending {
+			t.Fatalf("expected fresh eval to be pending, got %s", freshJob.Status)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify eval: %v", err)
+	}
+}
+
+func TestWebhookPlaybackRecoveryPurgesStaleHITLJobs(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 9, 12, 15, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	itemID := "target:movie:recovery"
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:             "flow:" + itemID,
+			ItemID:             itemID,
+			SubjectType:        "movie",
+			DisplayName:        "Recovery Movie",
+			State:              domain.FlowStatePendingReview,
+			DecisionDeadlineAt: now.Add(24 * time.Hour),
+			Version:            3,
+			CreatedAt:          now,
+			UpdatedAt:          now,
+		}, 0); err != nil {
+			return err
+		}
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "recovery", ItemType: "Movie", LastPlayedAt: now, UpdatedAt: now}); err != nil {
+			return err
+		}
+		// Seed a stale prompt and stale timeout — both should be purged.
+		for _, j := range []domain.JobRecord{
+			{JobID: "job:prompt:" + itemID + ":1", ItemID: itemID, Kind: domain.JobKindSendHITLPrompt, Status: domain.JobStatusPending, RunAt: now.Add(time.Minute), CreatedAt: now, UpdatedAt: now},
+			{JobID: "job:timeout:" + itemID + ":1", ItemID: itemID, Kind: domain.JobKindHITLTimeout, Status: domain.JobStatusPending, RunAt: now.Add(2 * time.Hour), CreatedAt: now, UpdatedAt: now},
+		} {
+			if err := tx.EnqueueJob(context.Background(), j); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload:    jellyfin.WebhookPayload{ItemID: "recovery", ItemType: "Movie", LastPlayedAt: now, NotificationType: "PlaybackStart", EventID: "evt-recovery"},
+		Raw:        map[string]any{"ItemId": "recovery", "EventId": "evt-recovery"},
+		ItemID:     "recovery",
+		EventID:    "evt-recovery",
+		EventType:  "PlaybackStart",
+		DedupeKey:  "jellyfin:evt-recovery",
+		OccurredAt: now,
+	}); err != nil {
+		t.Fatalf("handle webhook: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, itemID)
+	if flow.State != domain.FlowStateActive {
+		t.Fatalf("expected playback to recover flow to Active, got %s", flow.State)
+	}
+	if flow.HITLOutcome != "played" {
+		t.Fatalf("expected HITLOutcome=played after recovery, got %q", flow.HITLOutcome)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		for _, jid := range []string{
+			"job:prompt:" + itemID + ":1",
+			"job:timeout:" + itemID + ":1",
+		} {
+			_, found, err := tx.GetJob(context.Background(), jid)
+			if err != nil {
+				return err
+			}
+			if found {
+				t.Errorf("expected stale job %s to be purged after playback recovery", jid)
+			}
+		}
+		// Eval should have been re-created by RequestEval.
+		evalJob, found, err := tx.GetJob(context.Background(), "job:eval:scheduled:"+itemID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatal("expected fresh eval job after recovery")
+		}
+		if evalJob.Status != domain.JobStatusPending {
+			t.Fatalf("expected fresh eval pending, got %s", evalJob.Status)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify jobs: %v", err)
 	}
 }

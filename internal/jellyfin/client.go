@@ -60,7 +60,11 @@ func (c *Client) DeleteItem(ctx context.Context, itemID string) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+	// 204/200 — successfully deleted.
+	// 404 — already gone. Treat as success so the destructive delete handler
+	// is idempotent across retries and across "Jellyfin removed it out from
+	// under us" scenarios.
+	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
 		return nil
 	}
 

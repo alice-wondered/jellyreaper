@@ -271,7 +271,7 @@ func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.
 	enableUserData := true
 	includeItemTypes := []gen.BaseItemKind{gen.BaseItemKindMovie, gen.BaseItemKindEpisode}
 	sortBy := []gen.ItemSortBy{gen.ItemSortByDateCreated}
-	sortOrder := []gen.SortOrder{gen.SortOrder("Ascending")}
+	sortOrder := []gen.SortOrder{gen.SortOrder("Descending")}
 	fields := []gen.ItemFields{gen.ItemFieldsProviderIds}
 	pageSize := limit
 	if pageSize <= 0 {
@@ -288,10 +288,6 @@ func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.
 		Limit:            &pageSize,
 		StartIndex:       &startIndex,
 	}
-	if !since.IsZero() {
-		params.MinDateLastSaved = &since
-	}
-
 	resp, err := s.client.GetItemsWithResponse(ctx, params)
 	if err != nil {
 		return ItemPage{}, fmt.Errorf("fetch jellyfin changed items: %w", err)
@@ -330,7 +326,13 @@ func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.
 		nextStart = startIndex + int32(len(*body.Items))
 		hasMore = int32(len(*body.Items)) >= pageSize
 		out = make([]ItemSnapshot, 0, len(*body.Items))
+		stopAtSince := false
 		for _, item := range *body.Items {
+			createdAt := safeTime(item.DateCreated)
+			if !since.IsZero() && !createdAt.IsZero() && createdAt.Before(since) {
+				stopAtSince = true
+				break
+			}
 			itemID := domain.NormalizeID(uuidString(item.Id))
 			itemType := stringValueFromKind(item.Type)
 			imageURL := buildPrimaryImageURL(s.baseURL, itemID, item.ImageTags)
@@ -346,9 +348,12 @@ func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.
 				ImageURL:           imageURL,
 				LastPlayedAt:       safeNestedLastPlayed(item.UserData),
 				PlayCount:          safeNestedPlayCount(item.UserData),
-				DateCreated:        safeTime(item.DateCreated),
+				DateCreated:        createdAt,
 				DateLastMediaAdded: safeTime(item.DateLastMediaAdded),
 			})
+		}
+		if stopAtSince {
+			hasMore = false
 		}
 	}
 

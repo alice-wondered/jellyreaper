@@ -271,7 +271,28 @@ func (s *Store) CompleteJob(ctx context.Context, jobID string, completedAt time.
 			return err
 		}
 		if !found {
-			return fmt.Errorf("complete job %s: %w", jobID, ErrNotFound)
+			// The job record was purged during the handler's run (e.g. the
+			// delete handler called DeleteJobsForItem on its own item).
+			// Treat as a no-op completion — the work is done, the record is
+			// gone, nothing to mark.
+			return nil
+		}
+
+		// The handler rescheduled this job during execution (set it to Pending).
+		// Leave it — the loop will pick it up at the new RunAt.
+		if job.Status == domain.JobStatusPending {
+			return nil
+		}
+
+		// An external system updated RunAt to a future time while the job was
+		// leased (e.g. a play event rescheduled a delayed item). Now that
+		// execution is complete, reschedule rather than marking done.
+		if job.Status == domain.JobStatusLeased && job.RunAt.After(completedAt) {
+			job.Status = domain.JobStatusPending
+			job.LeaseOwner = ""
+			job.LeaseUntil = time.Time{}
+			job.UpdatedAt = completedAt
+			return repoTx.UpdateJob(ctx, job)
 		}
 
 		job.Status = domain.JobStatusCompleted
@@ -306,6 +327,7 @@ func (s *Store) FailJob(ctx context.Context, jobID string, errMsg string, retryA
 		job.LeaseOwner = ""
 		job.LeaseUntil = time.Time{}
 		job.UpdatedAt = time.Now().UTC()
+		job.Attempts++
 
 		if markTerminal {
 			job.Status = domain.JobStatusFailed
@@ -762,6 +784,58 @@ func (t *txRepo) UpdateJob(ctx context.Context, job domain.JobRecord) error {
 	}
 
 	return nil
+}
+
+// DeleteJobsForItem removes every job whose ItemID matches itemID. Each
+// removed record is also dropped from the due index. Returns the number of
+// records deleted. This is a single-pass scan over bucketJobs; it is intended
+// for use during destructive flows (delete handler completion, webhook
+// playback recovery) where stale jobs should be purged in bulk.
+func (t *txRepo) DeleteJobsForItem(ctx context.Context, itemID string) (int, error) {
+	if err := checkContext(ctx); err != nil {
+		return 0, err
+	}
+	if itemID == "" {
+		return 0, fmt.Errorf("delete jobs for item: item id required: %w", ErrInvalidInput)
+	}
+
+	jobsBucket, err := requireBucket(t.tx, bucketJobs)
+	if err != nil {
+		return 0, err
+	}
+	dueIndex, err := requireBucket(t.tx, bucketDueIndex)
+	if err != nil {
+		return 0, err
+	}
+
+	// Collect matching keys first; bbolt cursors don't like deletion during
+	// iteration.
+	var toDelete []domain.JobRecord
+	if err := jobsBucket.ForEach(func(_, value []byte) error {
+		var job domain.JobRecord
+		if err := json.Unmarshal(value, &job); err != nil {
+			return fmt.Errorf("decode job during purge: %w", err)
+		}
+		if job.ItemID == itemID {
+			toDelete = append(toDelete, job)
+		}
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+
+	for _, job := range toDelete {
+		if job.Status == domain.JobStatusPending {
+			if err := dueIndex.Delete(dueIndexKeyBytes(job.RunAt, job.JobID)); err != nil {
+				return 0, fmt.Errorf("remove due index for %s: %w", job.JobID, err)
+			}
+		}
+		if err := jobsBucket.Delete(keyBytes(job.JobID)); err != nil {
+			return 0, fmt.Errorf("delete job %s: %w", job.JobID, err)
+		}
+	}
+
+	return len(toDelete), nil
 }
 
 func (t *txRepo) IsProcessed(ctx context.Context, key string) (bool, error) {

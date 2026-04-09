@@ -107,6 +107,12 @@ func (s *Service) RemoveSeasonByProviderIDs(ctx context.Context, providerIDs map
 		s.logger.Info("sonarr season delete complete", "lex", "SONARR-DELETE", "series_id", series.ID, "season_number", seasonNumber, "episode_count", len(episodeIDs), "episode_file_count", len(episodeFileIDs))
 		return nil
 	}
+	// 404 — series/season/episodes already gone in Sonarr between our list
+	// and our monitor PUT. Idempotent success.
+	if resp.StatusCode == http.StatusNotFound {
+		s.logger.Info("sonarr season delete already gone", "lex", "SONARR-DELETE", "series_id", series.ID, "season_number", seasonNumber)
+		return nil
+	}
 	return fmt.Errorf("sonarr season monitor returned status %d", resp.StatusCode)
 }
 
@@ -253,6 +259,10 @@ func (s *Service) deleteEpisodeFiles(ctx context.Context, fileIDs []int) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	// 404 — files already gone. Idempotent success.
+	if resp.StatusCode == http.StatusNotFound {
 		return nil
 	}
 	return fmt.Errorf("sonarr episodefile bulk delete returned status %d", resp.StatusCode)

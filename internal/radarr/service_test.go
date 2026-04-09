@@ -42,6 +42,25 @@ func TestRemoveByProviderIDsDeletesMatchedMovie(t *testing.T) {
 	}
 }
 
+func TestRemoveByProviderIDs404IsIdempotent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/movie":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 7, "tmdbId": 603, "imdbId": "tt0133093"}})
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v3/movie/7":
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	svc := NewService(server.URL, "k")
+	if err := svc.RemoveByProviderIDs(context.Background(), map[string]string{"tmdb": "603"}); err != nil {
+		t.Fatalf("expected 404 to be treated as success, got %v", err)
+	}
+}
+
 func TestRemoveByProviderIDsNoMatchSkipsDelete(t *testing.T) {
 	deleteCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

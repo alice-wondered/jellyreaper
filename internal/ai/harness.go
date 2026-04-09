@@ -257,15 +257,20 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 		}
 
 		toolOutputs := make([]responses.ResponseInputItemUnionParam, 0, len(toolCalls))
+		finalResponse := ""
 		for _, tc := range toolCalls {
 			result, out, err := h.executeToolCall(ctx, threadID, tc.Name, tc.Arguments)
 			if err != nil {
+				h.logger.Warn("ai tool call failed", "thread_id", threadID, "tool", tc.Name, "error", err)
 				result = "tool error: " + err.Error()
 			}
 			toolOutputs = append(toolOutputs, responses.ResponseInputItemParamOfFunctionCallOutput(tc.CallID, result))
-			if strings.TrimSpace(out) != "" {
-				return out, nil
+			if strings.TrimSpace(out) != "" && finalResponse == "" {
+				finalResponse = out
 			}
+		}
+		if strings.TrimSpace(finalResponse) != "" {
+			return finalResponse, nil
 		}
 		pendingInput = toolOutputs
 	}
@@ -1120,11 +1125,11 @@ func (h *Harness) handleFollowUp(ctx context.Context, threadID string, input str
 		default:
 			err = fmt.Errorf("unsupported pending action %q", state.PendingAction)
 		}
-		state.PendingAction = ""
-		h.setThreadState(threadID, state)
 		if err != nil {
 			return "", "", err
 		}
+		state.PendingAction = ""
+		h.setThreadState(threadID, state)
 		return out, "", nil
 	}
 	if trimmed == "no" && state.PendingAction != "" {
