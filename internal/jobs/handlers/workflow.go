@@ -770,7 +770,7 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 					return fmt.Errorf("radarr projection removal for %s: %w", flow.ItemID, err)
 				}
 			}
-		case "season", "series":
+		case "series":
 			if h.sonarr != nil {
 				if len(providerIDs) == 0 {
 					return fmt.Errorf("sonarr removal skipped for %s: missing provider ids", flow.ItemID)

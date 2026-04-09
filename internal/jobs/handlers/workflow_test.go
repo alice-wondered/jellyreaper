@@ -156,7 +156,7 @@ func TestExecuteDeleteHandlerMovieProjectionTriggersRadarrRemoval(t *testing.T) 
 	}
 }
 
-func TestExecuteDeleteHandlerSeasonProjectionTriggersSonarrRemoval(t *testing.T) {
+func TestExecuteDeleteHandlerSeasonProjectionDoesNotTriggerSonarrSeriesRemoval(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
 
@@ -197,8 +197,54 @@ func TestExecuteDeleteHandlerSeasonProjectionTriggersSonarrRemoval(t *testing.T)
 	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-arr-season", ItemID: "target:season:season-arr", IdempotencyKey: "dedupe:arr-season"}); err != nil {
 		t.Fatalf("execute season delete: %v", err)
 	}
+	if sonarrSpy.calls != 0 {
+		t.Fatalf("expected no sonarr series removal call for season projection, got %d", sonarrSpy.calls)
+	}
+}
+
+func TestExecuteDeleteHandlerSeriesProjectionTriggersSonarrRemoval(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:series:series-arr",
+			ItemID:      "target:series:series-arr",
+			SubjectType: "series",
+			DisplayName: "Series ARR",
+			State:       domain.FlowStateDeleteQueued,
+			Version:     0,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0); err != nil {
+			return err
+		}
+		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-arr-s1", ItemType: "Episode", SeasonID: "season-arr-s1", SeriesID: "series-arr", ProviderIDs: map[string]string{"tvdb": "73244"}, UpdatedAt: now}); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-arr-s2", ItemType: "Episode", SeasonID: "season-arr-s2", SeriesID: "series-arr", ProviderIDs: map[string]string{"tvdb": "73244"}, UpdatedAt: now})
+	}); err != nil {
+		t.Fatalf("seed series state: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && (r.URL.Path == "/Items/ep-arr-s1" || r.URL.Path == "/Items/ep-arr-s2") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	sonarrSpy := &arrRemovalSpy{}
+	h := NewExecuteDeleteHandler(store, jellyfin.NewClient(server.URL, "api-key", server.Client()))
+	h.SetSonarrService(sonarrSpy)
+
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-arr-series", ItemID: "target:series:series-arr", IdempotencyKey: "dedupe:arr-series"}); err != nil {
+		t.Fatalf("execute series delete: %v", err)
+	}
 	if sonarrSpy.calls != 1 {
-		t.Fatalf("expected one sonarr removal call, got %d", sonarrSpy.calls)
+		t.Fatalf("expected one sonarr removal call for series projection, got %d", sonarrSpy.calls)
 	}
 	if sonarrSpy.last["tvdb"] != "73244" {
 		t.Fatalf("expected tvdb id forwarded to sonarr, got %q", sonarrSpy.last["tvdb"])
