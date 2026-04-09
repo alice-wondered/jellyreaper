@@ -110,10 +110,14 @@ func main() {
 		})
 		logger.Info("ai mention assistant enabled", "model", cfg.OpenAIModel)
 	}
-	if err := discordService.OpenGateway(); err != nil {
-		logger.Warn("failed to open discord gateway", "error", err)
+	if assistant != nil {
+		if err := discordService.OpenGateway(); err != nil {
+			logger.Warn("failed to open discord gateway for mention assistant", "error", err)
+		} else {
+			defer func() { _ = discordService.CloseGateway() }()
+		}
 	} else {
-		defer func() { _ = discordService.CloseGateway() }()
+		logger.Info("discord gateway disabled (mention assistant not configured)")
 	}
 
 	evaluatePolicyHandler := handlers.NewEvaluatePolicyHandler(store, logger)
