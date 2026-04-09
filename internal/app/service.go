@@ -385,12 +385,18 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 
 		itemTypeLower := strings.ToLower(strings.TrimSpace(event.Payload.ItemType))
 		if catalogIndexEvent && catalogUpdateAllowed {
-			created := event.Payload.DateCreated.UTC()
+			created := event.Payload.DateLastMediaAdded.UTC()
 			if created.IsZero() {
-				created = event.Payload.DateLastMediaAdded.UTC()
+				created = event.Payload.DateCreated.UTC()
+			}
+			if created.IsZero() {
+				created = eventAt.UTC()
+			}
+			if created.IsZero() {
+				created = now
 			}
 			if !created.IsZero() {
-				if media.CreatedAt.IsZero() || created.Before(media.CreatedAt) {
+				if media.CreatedAt.IsZero() || created.After(media.CreatedAt) {
 					media.CreatedAt = created
 				}
 			}

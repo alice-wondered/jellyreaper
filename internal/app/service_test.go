@@ -1571,6 +1571,70 @@ func TestCatalogEventUsesPayloadTimestampNotServiceClock(t *testing.T) {
 	}
 }
 
+func TestCatalogEventPrefersDateLastMediaAddedOverDateCreated(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 12, 10, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	oldCreated := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	recentAdded := time.Date(2026, 4, 10, 8, 30, 0, 0, time.UTC)
+	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:             "movie-ts-2",
+			ItemType:           "Movie",
+			Name:               "Timestamped 2",
+			NotificationType:   "ItemUpdated",
+			DateCreated:        oldCreated,
+			DateLastMediaAdded: recentAdded,
+			EventID:            "evt-ts-2",
+		},
+		Raw:       map[string]any{"EventId": "evt-ts-2"},
+		ItemID:    "movie-ts-2",
+		EventID:   "evt-ts-2",
+		EventType: "ItemUpdated",
+		DedupeKey: "jellyfin:evt-ts-2",
+	})
+	if err != nil {
+		t.Fatalf("handle webhook: %v", err)
+	}
+
+	media := mustGetMedia(t, store, "movie-ts-2")
+	if !media.CreatedAt.Equal(recentAdded) {
+		t.Fatalf("expected media created timestamp from DateLastMediaAdded, got=%s want=%s", media.CreatedAt, recentAdded)
+	}
+}
+
+func TestCatalogEventFallsBackToServiceClockWhenPayloadDatesMissing(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 12, 10, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:           "movie-ts-3",
+			ItemType:         "Movie",
+			Name:             "Timestamped 3",
+			NotificationType: "ItemUpdated",
+			EventID:          "evt-ts-3",
+		},
+		Raw:       map[string]any{"EventId": "evt-ts-3"},
+		ItemID:    "movie-ts-3",
+		EventID:   "evt-ts-3",
+		EventType: "ItemUpdated",
+		DedupeKey: "jellyfin:evt-ts-3",
+	})
+	if err != nil {
+		t.Fatalf("handle webhook: %v", err)
+	}
+
+	media := mustGetMedia(t, store, "movie-ts-3")
+	if !media.CreatedAt.Equal(now) {
+		t.Fatalf("expected media created timestamp to fallback to service clock, got=%s want=%s", media.CreatedAt, now)
+	}
+}
+
 func TestCollectionWebhookDoesNotCreateOperationalFlow(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)
