@@ -16,8 +16,8 @@ func TestRemoveByProviderIDsDeletesMatchedMovie(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/movie":
 			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 42, "tmdbId": 603, "imdbId": "tt0133093", "title": "Sample Movie"}})
 		case r.Method == http.MethodDelete && r.URL.Path == "/api/v3/movie/42":
-			if got := r.URL.Query().Get("deleteFiles"); got != "false" {
-				t.Fatalf("expected deleteFiles=false, got %q", got)
+			if got := r.URL.Query().Get("deleteFiles"); got != "true" {
+				t.Fatalf("expected deleteFiles=true, got %q", got)
 			}
 			if got := r.URL.Query().Get("addImportExclusion"); got != "true" {
 				t.Fatalf("expected addImportExclusion=true, got %q", got)

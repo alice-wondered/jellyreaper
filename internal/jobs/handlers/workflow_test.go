@@ -127,8 +127,10 @@ func TestExecuteDeleteHandlerMovieProjectionTriggersRadarrRemoval(t *testing.T) 
 		t.Fatalf("seed flow/media: %v", err)
 	}
 
+	jellyfinDeleteCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete && r.URL.Path == "/Items/mv-arr" {
+			jellyfinDeleteCalls++
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -148,6 +150,9 @@ func TestExecuteDeleteHandlerMovieProjectionTriggersRadarrRemoval(t *testing.T) 
 	}
 	if radarrSpy.last["tmdb"] != "603" {
 		t.Fatalf("expected tmdb id forwarded to radarr, got %q", radarrSpy.last["tmdb"])
+	}
+	if jellyfinDeleteCalls != 0 {
+		t.Fatalf("expected movie deletion to use radarr primary path when configured, jellyfin delete calls=%d", jellyfinDeleteCalls)
 	}
 }
 

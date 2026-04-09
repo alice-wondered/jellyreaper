@@ -641,6 +641,7 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 	}
 
 	deletedChildren := []domain.MediaItem{}
+	radarrPrimaryDelete := false
 	if flow.SubjectType == "season" || flow.SubjectType == "series" {
 		children, err := h.deleteAggregateChildren(ctx, flow)
 		if err != nil {
@@ -652,11 +653,29 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 		if strings.HasPrefix(deleteID, "target:item:") || strings.HasPrefix(deleteID, "target:movie:") {
 			deleteID = deleteID[strings.LastIndex(deleteID, ":")+1:]
 		}
-		if media, found, err := h.getMedia(ctx, deleteID); err == nil && found {
+		media, found, err := h.getMedia(ctx, deleteID)
+		if err != nil {
+			return err
+		}
+		if found {
 			deletedChildren = append(deletedChildren, media)
 		}
-		if err := h.client.DeleteItem(ctx, deleteID); err != nil {
-			return err
+
+		if h.radarr != nil && (flow.SubjectType == "movie" || flow.SubjectType == "item") {
+			providerIDs := projectionProviderIDs(flow.SubjectType, deletedChildren)
+			if len(providerIDs) == 0 {
+				return fmt.Errorf("radarr primary delete missing provider ids for %s", flow.ItemID)
+			}
+			if err := h.radarr.RemoveByProviderIDs(ctx, providerIDs); err != nil {
+				return fmt.Errorf("radarr primary delete for %s: %w", flow.ItemID, err)
+			}
+			radarrPrimaryDelete = true
+		}
+
+		if !radarrPrimaryDelete {
+			if err := h.client.DeleteItem(ctx, deleteID); err != nil {
+				return err
+			}
 		}
 		if len(deletedChildren) == 0 {
 			deletedChildren = append(deletedChildren, domain.MediaItem{ItemID: deleteID})
@@ -740,6 +759,9 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 		providerIDs := projectionProviderIDs(flow.SubjectType, deletedChildren)
 		switch flow.SubjectType {
 		case "movie", "item":
+			if radarrPrimaryDelete {
+				break
+			}
 			if h.radarr != nil {
 				if len(providerIDs) == 0 {
 					return fmt.Errorf("radarr removal skipped for %s: missing provider ids", flow.ItemID)
