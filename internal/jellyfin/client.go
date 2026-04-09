@@ -75,30 +75,42 @@ func (c *Client) FetchProviderIDs(ctx context.Context, itemID string) (map[strin
 		return nil, fmt.Errorf("item id is required")
 	}
 
-	endpoint := c.baseURL + "/Items/" + url.PathEscape(itemID) + "?Fields=ProviderIds"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build jellyfin provider ids request: %w", err)
-	}
-	req.Header.Set("X-Emby-Token", c.apiKey)
+	var lastErr error
+	for _, candidate := range domain.AlternateIDForms(itemID) {
+		endpoint := c.baseURL + "/Items/" + url.PathEscape(candidate) + "?Fields=ProviderIds"
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build jellyfin provider ids request: %w", err)
+		}
+		req.Header.Set("X-Emby-Token", c.apiKey)
 
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("perform jellyfin provider ids request: %w", err)
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("perform jellyfin provider ids request: %w", err)
+			continue
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			lastErr = fmt.Errorf("read jellyfin provider ids response: %w", readErr)
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			lastErr = fmt.Errorf("jellyfin provider ids request failed with status %d", resp.StatusCode)
+			continue
+		}
+
+		var payload struct {
+			ProviderIds map[string]string `json:"ProviderIds"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			lastErr = fmt.Errorf("decode jellyfin provider ids response: %w", err)
+			continue
+		}
+		return domain.NormalizeProviderIDs(payload.ProviderIds), nil
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("jellyfin provider ids request failed with status %d", resp.StatusCode)
+	if lastErr != nil {
+		return nil, lastErr
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, fmt.Errorf("read jellyfin provider ids response: %w", err)
-	}
-	var payload struct {
-		ProviderIds map[string]string `json:"ProviderIds"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, fmt.Errorf("decode jellyfin provider ids response: %w", err)
-	}
-	return domain.NormalizeProviderIDs(payload.ProviderIds), nil
+	return nil, fmt.Errorf("jellyfin provider ids request failed")
 }
