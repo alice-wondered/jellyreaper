@@ -76,7 +76,7 @@ func (c *Client) FetchProviderIDs(ctx context.Context, itemID string) (map[strin
 	}
 
 	var lastErr error
-	for _, candidate := range domain.AlternateIDForms(itemID) {
+	for _, candidate := range providerIDCandidates(itemID) {
 		endpoint := c.baseURL + "/Items/" + url.PathEscape(candidate) + "?Fields=ProviderIds"
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
@@ -113,4 +113,16 @@ func (c *Client) FetchProviderIDs(ctx context.Context, itemID string) (map[strin
 		return nil, lastErr
 	}
 	return nil, fmt.Errorf("jellyfin provider ids request failed")
+}
+
+func providerIDCandidates(itemID string) []string {
+	normalized := domain.NormalizeID(itemID)
+	if normalized == "" {
+		return nil
+	}
+	nodash := strings.ReplaceAll(normalized, "-", "")
+	if nodash == normalized {
+		return []string{normalized}
+	}
+	return []string{nodash, normalized}
 }
