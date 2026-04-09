@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -13,7 +14,9 @@ import (
 	"jellyreaper/internal/domain"
 	"jellyreaper/internal/jellyfin"
 	"jellyreaper/internal/jobs"
+	"jellyreaper/internal/radarr"
 	"jellyreaper/internal/repo"
+	"jellyreaper/internal/sonarr"
 )
 
 const minHITLResponseWindow = 24 * time.Hour
@@ -661,18 +664,24 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 		deletedChildren = children
 		if h.sonarr != nil {
 			providerIDs := domain.NormalizeProviderIDs(flow.ProviderIDs)
-			if len(providerIDs) == 0 {
-				return fmt.Errorf("sonarr primary season delete missing projection provider ids for %s", flow.ItemID)
-			}
 			seasonNumber := seasonNumberFromDeletedMedia(deletedChildren)
-			if seasonNumber <= 0 {
-				return fmt.Errorf("sonarr primary season delete missing season number for %s", flow.ItemID)
+			switch {
+			case len(providerIDs) == 0:
+				h.logger.Info("sonarr season delete falling back to jellyfin due to missing projection provider ids", "lex", "DELETE-SONARR", "item_id", flow.ItemID)
+			case seasonNumber <= 0:
+				h.logger.Info("sonarr season delete falling back to jellyfin due to missing season number", "lex", "DELETE-SONARR", "item_id", flow.ItemID)
+			default:
+				h.logger.Info("execute delete sonarr primary season action", "lex", "DELETE-SONARR", "item_id", flow.ItemID, "season_number", seasonNumber, "child_count", len(deletedChildren))
+				if err := h.sonarr.RemoveSeasonByProviderIDs(ctx, providerIDs, seasonNumber); err != nil {
+					if errors.Is(err, sonarr.ErrNotManaged) {
+						h.logger.Info("sonarr season delete falling back to jellyfin because media is unmanaged", "lex", "DELETE-SONARR", "item_id", flow.ItemID, "error", err)
+					} else {
+						return fmt.Errorf("sonarr primary season delete for %s: %w", flow.ItemID, err)
+					}
+				} else {
+					sonarrPrimarySeasonDelete = true
+				}
 			}
-			h.logger.Info("execute delete sonarr primary season action", "lex", "DELETE-SONARR", "item_id", flow.ItemID, "season_number", seasonNumber, "child_count", len(deletedChildren))
-			if err := h.sonarr.RemoveSeasonByProviderIDs(ctx, providerIDs, seasonNumber); err != nil {
-				return fmt.Errorf("sonarr primary season delete for %s: %w", flow.ItemID, err)
-			}
-			sonarrPrimarySeasonDelete = true
 		}
 		if !sonarrPrimarySeasonDelete {
 			children, err := h.deleteAggregateChildren(ctx, flow)
@@ -697,12 +706,16 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 		if h.radarr != nil && (flow.SubjectType == "movie" || flow.SubjectType == "item") {
 			providerIDs := domain.NormalizeProviderIDs(flow.ProviderIDs)
 			if len(providerIDs) == 0 {
-				return fmt.Errorf("radarr primary delete missing projection provider ids for %s", flow.ItemID)
+				h.logger.Info("radarr movie delete falling back to jellyfin due to missing projection provider ids", "lex", "DELETE-RADARR", "item_id", flow.ItemID)
+			} else if err := h.radarr.RemoveByProviderIDs(ctx, providerIDs); err != nil {
+				if errors.Is(err, radarr.ErrNotManaged) {
+					h.logger.Info("radarr movie delete falling back to jellyfin because media is unmanaged", "lex", "DELETE-RADARR", "item_id", flow.ItemID, "error", err)
+				} else {
+					return fmt.Errorf("radarr primary delete for %s: %w", flow.ItemID, err)
+				}
+			} else {
+				radarrPrimaryDelete = true
 			}
-			if err := h.radarr.RemoveByProviderIDs(ctx, providerIDs); err != nil {
-				return fmt.Errorf("radarr primary delete for %s: %w", flow.ItemID, err)
-			}
-			radarrPrimaryDelete = true
 		}
 
 		if !radarrPrimaryDelete {
@@ -776,42 +789,6 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 			// best effort
 		}
 	}
-	if committed {
-		providerIDs := projectionProviderIDs(flow.SubjectType, deletedChildren)
-		switch flow.SubjectType {
-		case "movie", "item":
-			if radarrPrimaryDelete {
-				break
-			}
-			if h.radarr != nil {
-				providerIDs = domain.NormalizeProviderIDs(flow.ProviderIDs)
-				if len(providerIDs) == 0 {
-					return fmt.Errorf("radarr removal skipped for %s: missing projection provider ids", flow.ItemID)
-				}
-				if err := h.radarr.RemoveByProviderIDs(ctx, providerIDs); err != nil {
-					return fmt.Errorf("radarr projection removal for %s: %w", flow.ItemID, err)
-				}
-			}
-		case "season":
-			if sonarrPrimarySeasonDelete {
-				break
-			}
-			if h.sonarr != nil {
-				providerIDs = domain.NormalizeProviderIDs(flow.ProviderIDs)
-				if len(providerIDs) == 0 {
-					return fmt.Errorf("sonarr removal skipped for %s: missing projection provider ids", flow.ItemID)
-				}
-				seasonNumber := seasonNumberFromDeletedMedia(deletedChildren)
-				if seasonNumber <= 0 {
-					return fmt.Errorf("sonarr removal skipped for %s: missing season number", flow.ItemID)
-				}
-				h.logger.Info("execute delete sonarr projection season action", "lex", "DELETE-SONARR", "item_id", flow.ItemID, "season_number", seasonNumber, "child_count", len(deletedChildren))
-				if err := h.sonarr.RemoveSeasonByProviderIDs(ctx, providerIDs, seasonNumber); err != nil {
-					return fmt.Errorf("sonarr projection removal for %s: %w", flow.ItemID, err)
-				}
-			}
-		}
-	}
 	return nil
 }
 
@@ -827,52 +804,6 @@ func (h *ExecuteDeleteHandler) getMedia(ctx context.Context, itemID string) (dom
 		return domain.MediaItem{}, false, err
 	}
 	return media, found, nil
-}
-
-func projectionProviderIDs(subjectType string, deleted []domain.MediaItem) map[string]string {
-	merge := func(dst map[string]string, src map[string]string) map[string]string {
-		for k, v := range src {
-			if strings.TrimSpace(k) == "" || strings.TrimSpace(v) == "" {
-				continue
-			}
-			dst[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
-		}
-		return dst
-	}
-	out := map[string]string{}
-	for _, media := range deleted {
-		out = merge(out, media.ProviderIDs)
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	if subjectType == "movie" || subjectType == "item" {
-		movie := map[string]string{}
-		if v := out["tmdb"]; v != "" {
-			movie["tmdb"] = v
-		}
-		if v := out["imdb"]; v != "" {
-			movie["imdb"] = v
-		}
-		if len(movie) == 0 {
-			return nil
-		}
-		return movie
-	}
-	series := map[string]string{}
-	if v := out["tvdb"]; v != "" {
-		series["tvdb"] = v
-	}
-	if v := out["tmdb"]; v != "" {
-		series["tmdb"] = v
-	}
-	if v := out["imdb"]; v != "" {
-		series["imdb"] = v
-	}
-	if len(series) == 0 {
-		return nil
-	}
-	return series
 }
 
 func seasonNumberFromDeletedMedia(deleted []domain.MediaItem) int {
