@@ -9,8 +9,10 @@ func TestNormalizeID(t *testing.T) {
 		want string
 	}{
 		{name: "empty", in: "", want: ""},
-		{name: "trimmed uuid", in: "  BDA444ED-C4E7-4BBB-6677-3CBE94938D10  ", want: "bda444ed-c4e7-4bbb-6677-3cbe94938d10"},
-		{name: "nodash uuid to dashed", in: "BDA444EDC4E74BBB66773CBE94938D10", want: "bda444ed-c4e7-4bbb-6677-3cbe94938d10"},
+		{name: "trimmed uuid", in: "  BDA444ED-C4E7-4BBB-6677-3CBE94938D10  ", want: "bda444edc4e74bbb66773cbe94938d10"},
+		{name: "nodash uuid stays nodash", in: "BDA444EDC4E74BBB66773CBE94938D10", want: "bda444edc4e74bbb66773cbe94938d10"},
+		{name: "dashed hex guid", in: "F8F13C13-EAE5-0047-57EB-3308105503B9", want: "f8f13c13eae5004757eb3308105503b9"},
+		{name: "nodash hex guid", in: "F8F13C13EAE5004757EB3308105503B9", want: "f8f13c13eae5004757eb3308105503b9"},
 		{name: "non uuid preserved", in: "series-provider-1", want: "series-provider-1"},
 	}
 
@@ -29,11 +31,11 @@ func TestAlternateIDForms(t *testing.T) {
 	if len(forms) != 2 {
 		t.Fatalf("expected two alternate forms, got %d (%v)", len(forms), forms)
 	}
-	if forms[0] != "bda444ed-c4e7-4bbb-6677-3cbe94938d10" {
+	if forms[0] != "bda444edc4e74bbb66773cbe94938d10" {
 		t.Fatalf("unexpected normalized form: %q", forms[0])
 	}
-	if forms[1] != "bda444edc4e74bbb66773cbe94938d10" {
-		t.Fatalf("unexpected nodash form: %q", forms[1])
+	if forms[1] != "bda444ed-c4e7-4bbb-6677-3cbe94938d10" {
+		t.Fatalf("unexpected dashed form: %q", forms[1])
 	}
 
 	plain := AlternateIDForms("series-provider-1")
