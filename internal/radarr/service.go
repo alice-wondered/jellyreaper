@@ -47,7 +47,7 @@ func (s *Service) RemoveByProviderIDs(ctx context.Context, providerIDs map[strin
 		return err
 	}
 	if !found {
-		return nil
+		return fmt.Errorf("radarr movie not found for provider ids: %v", BuildProviderIDs(providerIDs))
 	}
 	endpoint := fmt.Sprintf("%s/api/v3/movie/%d?deleteFiles=false&addImportExclusion=true", s.baseURL, movie.ID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)

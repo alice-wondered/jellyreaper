@@ -229,6 +229,16 @@ func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.Webh
 		}
 	}
 
+	if isRemovalEvent(event.EventType) && len(arrRemovals) == 0 {
+		itemType := strings.ToLower(strings.TrimSpace(event.Payload.ItemType))
+		if itemType == "movie" && s.radarr != nil {
+			s.logger.Warn("arr removal skipped: missing provider ids for radarr", "item_id", itemID, "item_type", itemType)
+		}
+		if (itemType == "series" || itemType == "season" || itemType == "episode") && s.sonarr != nil {
+			s.logger.Warn("arr removal skipped: missing provider ids for sonarr", "item_id", itemID, "item_type", itemType)
+		}
+	}
+
 	for _, req := range arrRemovals {
 		switch req.service {
 		case "radarr":

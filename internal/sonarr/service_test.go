@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -57,8 +58,12 @@ func TestRemoveByProviderIDsNoMatchSkipsDelete(t *testing.T) {
 	defer server.Close()
 
 	svc := NewService(server.URL, "k")
-	if err := svc.RemoveByProviderIDs(context.Background(), map[string]string{"tvdb": "999999"}); err != nil {
-		t.Fatalf("remove by provider ids: %v", err)
+	err := svc.RemoveByProviderIDs(context.Background(), map[string]string{"tvdb": "999999"})
+	if err == nil {
+		t.Fatal("expected not-found error for unmatched provider ids")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected not-found error, got %v", err)
 	}
 	if deleteCalls != 0 {
 		t.Fatalf("expected no delete call for unmatched provider ids, got %d", deleteCalls)
