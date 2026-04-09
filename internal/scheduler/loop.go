@@ -69,6 +69,8 @@ func NewLoop(repository repo.Repository, dispatch DispatchFunc, logger *slog.Log
 	}
 }
 
+// I would have expected to see a select block here to determine our wakeups, especially because that allows us to
+// open a channel and wake early if we get a signal
 func (l *Loop) Run(ctx context.Context) error {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -88,6 +90,21 @@ func (l *Loop) Run(ctx context.Context) error {
 }
 
 func (l *Loop) leaseAndDispatch(ctx context.Context, now time.Time) error {
+	// let's verify the leasing system behavior is working the way that we intend for it to
+	// essentially no writes can happen to a job that's leased
+	// which prevents a write to a pending deletion, evaluation, or pending_review
+	// but when not leased (because not due) we CAN write to those jobs, allowing for
+	// a playback event, for instance, to be processed and update any scheduled job that isn't due yet
+	// this means that every job handler should have a "verification" stage where it checks to see if the job
+	// that's scheduled should still be valid or if we should state change based on new information
+	// for instance, HITL review should not schedule a deletion if a play came in
+	// but frankly, I find this to be a little clunky, because I would really expect for something affecting the current job to
+	// immediately update the job state
+	// however I want job state to be owned by the scheduler/job handler not webhooks or external systems or backfill or whatever else
+	// in which case, I think our scheduler should probably expose some sort of API that allows us to encapsulate job update and schedule update
+	// semantics for those external systems rather than doing it directly via the repository
+	// then if we need to deal with leasing or whatever else at least it's all in one place
+	// and we can handle complexity like "waiting for the lease to expire and resolve next action"
 	jobs, err := l.repository.LeaseDueJobs(ctx, now, l.leaseLimit, l.leaseOwner, l.leaseTTL)
 	if err != nil {
 		return fmt.Errorf("lease due jobs: %w", err)
@@ -122,6 +139,7 @@ func (l *Loop) computeNextWake(ctx context.Context, now time.Time) time.Time {
 	return nextWake
 }
 
+// Oh ok we have our select thing here, it's just a bit buried in indirection
 func (l *Loop) sleepUntil(ctx context.Context, wakeAt time.Time) error {
 	wait := wakeAt.Sub(l.now())
 	if wait < 0 {

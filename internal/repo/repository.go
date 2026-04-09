@@ -7,6 +7,12 @@ import (
 	"jellyreaper/internal/domain"
 )
 
+// This is a really interesting pattern but I feel like we might be misusing it a bit causing our domain model to leak
+// and become rather hard to understand
+// now, instead of having a repository interface and building first class "functions as features" into the service implementation
+// we instead have arbitrary tx repository calls all over our code to compose behaviors.
+// could we not instead expose the transactional behaviors directly on the repository and not have a bunch of freeform
+// functions that show up in random places like our scheduler?
 type TxRepository interface {
 	GetFlow(ctx context.Context, itemID string) (domain.Flow, bool, error)
 	ListFlows(ctx context.Context) ([]domain.Flow, error)
@@ -24,6 +30,12 @@ type TxRepository interface {
 	EnqueueJob(ctx context.Context, job domain.JobRecord) error
 	GetJob(ctx context.Context, jobID string) (domain.JobRecord, bool, error)
 	UpdateJob(ctx context.Context, job domain.JobRecord) error
+	// DeleteJobsForItem removes every job record (any status, any kind) whose
+	// ItemID matches itemID. Used by ExecuteDelete to purge stale eval/prompt/
+	// timeout jobs after a successful destruction, and by webhook playback
+	// recovery to wipe stale HITL chain jobs when a play resurrects an item.
+	// Returns the number of records deleted.
+	DeleteJobsForItem(ctx context.Context, itemID string) (int, error)
 
 	IsProcessed(ctx context.Context, key string) (bool, error)
 	MarkProcessed(ctx context.Context, key string, at time.Time) error

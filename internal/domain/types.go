@@ -5,13 +5,17 @@ import "time"
 type FlowState string
 
 const (
-	FlowStateActive           FlowState = "active"
-	FlowStatePendingReview    FlowState = "pending_review"
-	FlowStateDeleteQueued     FlowState = "delete_queued"
-	FlowStateDeleteInProgress FlowState = "delete_in_progress"
-	FlowStateDeleted          FlowState = "deleted"
-	FlowStateArchived         FlowState = "archived"
-	FlowStateDeleteFailed     FlowState = "delete_failed"
+	FlowStateActive        FlowState = "active"
+	FlowStatePendingReview FlowState = "pending_review"
+	// FlowStateDeleteQueued is the only "delete in flight" signal. The
+	// ExecuteDeleteHandler holds no intermediate transitional state — once
+	// it picks up a DeleteQueued flow it runs through to either Deleted
+	// (flow record removed) or DeleteFailed (terminal failure). Other
+	// handlers see DeleteQueued and bail.
+	FlowStateDeleteQueued FlowState = "delete_queued"
+	FlowStateDeleted      FlowState = "deleted"
+	FlowStateArchived     FlowState = "archived"
+	FlowStateDeleteFailed FlowState = "delete_failed"
 )
 
 type JobStatus string

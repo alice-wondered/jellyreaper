@@ -67,6 +67,28 @@ func TestRemoveSeasonByProviderIDsUpdatesEpisodeMonitorState(t *testing.T) {
 	}
 }
 
+func TestRemoveSeasonByProviderIDsMonitor404IsIdempotent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/series":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 77, "tvdbId": 73244, "imdbId": "tt0386676"}})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/episode":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1001, "episodeFileId": 0}})
+		case r.Method == http.MethodPut && r.URL.Path == "/api/v3/episode/monitor":
+			// Series/season disappeared between our list and our PUT.
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	svc := NewService(server.URL, "k")
+	if err := svc.RemoveSeasonByProviderIDs(context.Background(), map[string]string{"tvdb": "73244"}, 3); err != nil {
+		t.Fatalf("expected 404 to be treated as success, got %v", err)
+	}
+}
+
 func TestRemoveSeasonByProviderIDsNoMatchReturnsError(t *testing.T) {
 	monitorCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

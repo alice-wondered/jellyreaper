@@ -66,6 +66,10 @@ func (s *Service) RemoveByProviderIDs(ctx context.Context, providerIDs map[strin
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
 	}
+	// 404 — already gone in Radarr. Idempotent success.
+	if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
 	return fmt.Errorf("radarr delete returned status %d", resp.StatusCode)
 }
 

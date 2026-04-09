@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -110,7 +111,7 @@ func TestDispatcher_MarksDeleteFlowFailedOnTerminalDeleteError(t *testing.T) {
 			ItemID:      "target:movie:delete-fail",
 			SubjectType: "movie",
 			DisplayName: "Delete Fail",
-			State:       domain.FlowStateDeleteInProgress,
+			State:       domain.FlowStateDeleteQueued,
 			Version:     1,
 			CreatedAt:   now,
 			UpdatedAt:   now,
@@ -154,5 +155,62 @@ func TestDispatcher_MarksDeleteFlowFailedOnTerminalDeleteError(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("verify delete failure state: %v", err)
+	}
+}
+
+func TestDispatcher_NotifierFiresOnTerminalDeleteFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dispatcher-notifier.db")
+	store, err := bboltrepo.Open(path, 0o600, &bbolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close(); _ = os.Remove(path) })
+
+	now := time.Now().UTC()
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:movie:notify-fail",
+			ItemID:      "target:movie:notify-fail",
+			SubjectType: "movie",
+			DisplayName: "Notify Fail",
+			State:       domain.FlowStateDeleteQueued,
+			Version:     1,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}, 0); err != nil {
+			return err
+		}
+		return tx.EnqueueJob(context.Background(), domain.JobRecord{JobID: "job-notify-fail", ItemID: "target:movie:notify-fail", Kind: domain.JobKindExecuteDelete, Status: domain.JobStatusPending, RunAt: now, MaxAttempts: 1})
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	notifyCalls := 0
+	var lastFlow domain.Flow
+	var lastErr error
+	reg, _ := jobs.NewRegistry(testHandler{kind: domain.JobKindExecuteDelete, err: errors.New("upstream gone")})
+	d := NewDispatcher(store, reg, nil)
+	d.now = func() time.Time { return now }
+	d.SetDeleteFailedNotifier(func(_ context.Context, flow domain.Flow, err error) {
+		notifyCalls++
+		lastFlow = flow
+		lastErr = err
+	})
+
+	if err := d.Dispatch(context.Background(), domain.JobRecord{JobID: "job-notify-fail", ItemID: "target:movie:notify-fail", Kind: domain.JobKindExecuteDelete, Attempts: 0, MaxAttempts: 1}); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+
+	if notifyCalls != 1 {
+		t.Fatalf("expected notifier to fire exactly once, got %d", notifyCalls)
+	}
+	if lastFlow.ItemID != "target:movie:notify-fail" {
+		t.Fatalf("expected notifier to receive failed flow, got %#v", lastFlow)
+	}
+	if lastFlow.State != domain.FlowStateDeleteFailed {
+		t.Fatalf("expected notifier to see DeleteFailed state, got %s", lastFlow.State)
+	}
+	if lastErr == nil || !strings.Contains(lastErr.Error(), "upstream gone") {
+		t.Fatalf("expected notifier error to carry handler error, got %v", lastErr)
 	}
 }

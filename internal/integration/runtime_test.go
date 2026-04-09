@@ -300,7 +300,7 @@ func TestIntegrationWebhookDoesNotDeleteImmediatelyWithShortTimeoutConfig(t *tes
 	if err != nil || !found {
 		t.Fatalf("expected timeout flow: found=%v err=%v", found, err)
 	}
-	if flow.State == domain.FlowStateDeleted || flow.State == domain.FlowStateDeleteQueued || flow.State == domain.FlowStateDeleteInProgress {
+	if flow.State == domain.FlowStateDeleted || flow.State == domain.FlowStateDeleteQueued {
 		t.Fatalf("unexpected immediate deletion state: %s", flow.State)
 	}
 }

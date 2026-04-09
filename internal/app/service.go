@@ -19,6 +19,7 @@ import (
 	"jellyreaper/internal/jellyfin"
 	"jellyreaper/internal/jobs"
 	"jellyreaper/internal/repo"
+	"jellyreaper/internal/scheduler"
 )
 
 const (
@@ -54,6 +55,7 @@ type Service struct {
 	logger                *slog.Logger
 	discord               *discord.Service
 	wake                  func(time.Time)
+	evalScheduler         scheduler.EvalRequester
 	now                   func() time.Time
 	defaultDelayWindow    time.Duration
 	defaultExpireDays     int
@@ -77,6 +79,7 @@ func NewService(repository repo.Repository, logger *slog.Logger, wake func(time.
 		repository:            repository,
 		logger:                logger,
 		wake:                  wake,
+		evalScheduler:         scheduler.NewScheduler(nil, nil),
 		now:                   time.Now,
 		defaultDelayWindow:    defaultDelayDuration,
 		defaultExpireDays:     defaultExpireDays,
@@ -94,6 +97,12 @@ func (s *Service) SetPolicyDefaults(defaultExpireDays int, defaultDelayWindow ti
 	}
 	if defaultDelayWindow > 0 {
 		s.defaultDelayWindow = defaultDelayWindow
+	}
+}
+
+func (s *Service) SetEvalScheduler(es scheduler.EvalRequester) {
+	if es != nil {
+		s.evalScheduler = es
 	}
 }
 
@@ -488,38 +497,104 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 			}
 			newFlowCreated = true
 		} else {
-			if catalogIndexEvent && !eventAt.IsZero() && eventAt.Before(flow.LastCatalogEventAt) {
-				catalogFlowUpdateAllowed = false
+			// Delete-in-flight or terminal-failed flows are not touched by
+			// webhooks at all, with one exception: an ItemAdded catalog event
+			// resurrects a DeleteFailed flow back to fresh Active state
+			// (Jellyfin must have re-added the underlying file).
+			if flow.State == domain.FlowStateDeleteQueued {
+				s.logger.InfoContext(ctx, "webhook skipped: flow is delete-queued",
+					"lex", "FLOW-LIFECYCLE",
+					"item_id", target.Canonical,
+					"event_type", event.EventType,
+					"flow_state", flow.State,
+				)
+				continue
 			}
-			if catalogIndexEvent {
-				mergedProviderIDs := domain.MergeProviderIDs(flow.ProviderIDs, targetProviderIDs)
-				if !providerIDMapsEqual(flow.ProviderIDs, mergedProviderIDs) {
-					flow.ProviderIDs = mergedProviderIDs
-					flowNeedsWrite = true
+			if flow.State == domain.FlowStateDeleteFailed {
+				if !(catalogIndexEvent && isItemAddedEvent(event.EventType)) {
+					s.logger.InfoContext(ctx, "webhook skipped: flow is delete-failed",
+						"lex", "FLOW-LIFECYCLE",
+						"item_id", target.Canonical,
+						"event_type", event.EventType,
+						"flow_state", flow.State,
+					)
+					continue
 				}
-				if catalogFlowUpdateAllowed && target.Name != "" && flow.DisplayName != target.Name {
-					flow.DisplayName = target.Name
-					flowNeedsWrite = true
-				}
-				if catalogFlowUpdateAllowed && target.ImageURL != "" && flow.ImageURL != target.ImageURL {
-					flow.ImageURL = target.ImageURL
-					flowNeedsWrite = true
-				}
-				if catalogFlowUpdateAllowed && target.Type != "" && flow.SubjectType != target.Type {
-					flow.SubjectType = target.Type
-					flowNeedsWrite = true
-				}
-				if catalogFlowUpdateAllowed && eventAt.After(flow.LastCatalogEventAt) {
-					flow.LastCatalogEventAt = eventAt
-					flowNeedsWrite = true
-				}
-			}
-			if flowNeedsWrite {
+				// Resurrect: rebuild the flow as fresh Active. We keep the
+				// FlowID and ItemID but reset everything else. The version
+				// advances by one so any in-flight stale jobs version-mismatch
+				// and bail.
 				expected := flow.Version
-				flow.Version = expected + 1
-				flow.UpdatedAt = now
+				flow = domain.Flow{
+					FlowID:      flow.FlowID,
+					ItemID:      flow.ItemID,
+					SubjectType: target.Type,
+					ProviderIDs: targetProviderIDs,
+					DisplayName: target.Name,
+					ImageURL:    target.ImageURL,
+					State:       domain.FlowStateActive,
+					Version:     expected + 1,
+					PolicySnapshot: domain.PolicySnapshot{
+						ExpireAfterDays: defaultReviewDays,
+						HITLTimeoutHrs:  defaultHITLTimeoutHours,
+						TimeoutAction:   "delete",
+					},
+					LastCatalogEventAt: eventAt,
+					CreatedAt:          now,
+					UpdatedAt:          now,
+				}
+				if target.Type == "season" {
+					flow.EpisodeCount = 0
+				}
 				if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
 					return err
+				}
+				// Wipe any stale jobs left over from the failed delete cycle.
+				purged, err := tx.DeleteJobsForItem(ctx, target.Canonical)
+				if err != nil {
+					return err
+				}
+				newFlowCreated = true
+				s.logger.InfoContext(ctx, "webhook resurrected delete-failed flow",
+					"lex", "FLOW-LIFECYCLE",
+					"item_id", target.Canonical,
+					"event_type", event.EventType,
+					"jobs_purged", purged,
+				)
+			} else {
+				if catalogIndexEvent && !eventAt.IsZero() && eventAt.Before(flow.LastCatalogEventAt) {
+					catalogFlowUpdateAllowed = false
+				}
+				if catalogIndexEvent {
+					mergedProviderIDs := domain.MergeProviderIDs(flow.ProviderIDs, targetProviderIDs)
+					if !providerIDMapsEqual(flow.ProviderIDs, mergedProviderIDs) {
+						flow.ProviderIDs = mergedProviderIDs
+						flowNeedsWrite = true
+					}
+					if catalogFlowUpdateAllowed && target.Name != "" && flow.DisplayName != target.Name {
+						flow.DisplayName = target.Name
+						flowNeedsWrite = true
+					}
+					if catalogFlowUpdateAllowed && target.ImageURL != "" && flow.ImageURL != target.ImageURL {
+						flow.ImageURL = target.ImageURL
+						flowNeedsWrite = true
+					}
+					if catalogFlowUpdateAllowed && target.Type != "" && flow.SubjectType != target.Type {
+						flow.SubjectType = target.Type
+						flowNeedsWrite = true
+					}
+					if catalogFlowUpdateAllowed && eventAt.After(flow.LastCatalogEventAt) {
+						flow.LastCatalogEventAt = eventAt
+						flowNeedsWrite = true
+					}
+				}
+				if flowNeedsWrite {
+					expected := flow.Version
+					flow.Version = expected + 1
+					flow.UpdatedAt = now
+					if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -569,7 +644,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 				resolvedPlayedAt = playAt
 				expireDays := flow.PolicySnapshot.ExpireAfterDays
 				if expireDays <= 0 {
-					expireDays = defaultExpireDays
+					expireDays = defaultReviewDays
 				}
 				dueAt := playAt.Add(time.Duration(expireDays) * 24 * time.Hour)
 				if dueAt.After(runAt) {
@@ -587,7 +662,20 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 			if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
 				return err
 			}
-			if err := upsertEvaluatePolicyJob(ctx, tx, flow, now, runAt, "jellyfin_playback_recovered", dedupeKey+":eval"); err != nil {
+			// Opportunistic cleanup: a play during PendingReview makes the
+			// prompt/timeout chain stale. Wipe them so they don't fire and
+			// log+bail. This also wipes the eval singleton, which RequestEval
+			// recreates immediately below.
+			purged, err := tx.DeleteJobsForItem(ctx, target.Canonical)
+			if err != nil {
+				return err
+			}
+			s.logger.InfoContext(ctx, "webhook playback recovery purged stale jobs",
+				"lex", "FLOW-LIFECYCLE",
+				"item_id", target.Canonical,
+				"jobs_purged", purged,
+			)
+			if err := s.evalScheduler.RequestEval(ctx, tx, flow, now, runAt, "jellyfin_playback_recovered", dedupeKey+":eval", flow.Version); err != nil {
 				return err
 			}
 			if finalizations != nil && strings.TrimSpace(flow.Discord.ChannelID) != "" && strings.TrimSpace(flow.Discord.MessageID) != "" {
@@ -605,6 +693,18 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		}
 
 		if flow.State == domain.FlowStatePendingReview || flow.State == domain.FlowStateArchived || flow.State == domain.FlowStateDeleted {
+			// A playback event for a non-Active flow is the "user clicked
+			// archive (or similar) and then played the file" scenario the
+			// playback-recovery branch above does NOT cover. Surface it
+			// explicitly so the divergence is observable; we still skip
+			// because the user's prior decision wins.
+			if playbackEvent {
+				s.logger.InfoContext(ctx, "webhook playback ignored: flow is not active",
+					"lex", "FLOW-LIFECYCLE",
+					"item_id", target.Canonical,
+					"flow_state", flow.State,
+				)
+			}
 			continue
 		}
 
@@ -614,7 +714,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		} else if known {
 			expireDays := flow.PolicySnapshot.ExpireAfterDays
 			if expireDays <= 0 {
-				expireDays = defaultExpireDays
+				expireDays = defaultReviewDays
 			}
 			dueAt := playAt.Add(time.Duration(expireDays) * 24 * time.Hour)
 			if dueAt.After(runAt) {
@@ -622,17 +722,24 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 			}
 		}
 
-		if flow.NextActionAt.Before(runAt) {
+		// Plays always win: reschedule unconditionally on a playback event so that a
+		// play during a longer delay window still resets the review clock to
+		// lastPlay+reviewDays. For non-playback catalog events only advance if later.
+		if playbackEvent || flow.NextActionAt.Before(runAt) {
 			expected := flow.Version
 			flow.NextActionAt = runAt
 			flow.UpdatedAt = now
+			if playbackEvent && flow.HITLOutcome == "delay" {
+				flow.HITLOutcome = "played"
+				flow.DecisionDeadlineAt = time.Time{}
+			}
 			flow.Version = expected + 1
 			if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
 				return err
 			}
 		}
 
-		if err := upsertEvaluatePolicyJob(ctx, tx, flow, now, runAt, "jellyfin_webhook", dedupeKey+":eval"); err != nil {
+		if err := s.evalScheduler.RequestEval(ctx, tx, flow, now, runAt, "jellyfin_webhook", dedupeKey+":eval", flow.Version); err != nil {
 			return err
 		}
 	}
@@ -725,7 +832,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 			flow.NextActionAt = now.Add(defaultDeferWindow)
 			flow.DecisionDeadlineAt = time.Time{}
 			clearDiscordPromptLink(&flow.Discord)
-			if err := enqueueEvaluatePolicy(ctx, tx, flow, now, "discord_delay", flow.NextActionAt); err != nil {
+			if err := s.evalScheduler.RequestEval(ctx, tx, flow, now, flow.NextActionAt, "discord_delay", "discord:eval:"+flow.ItemID, flow.Version); err != nil {
 				return err
 			}
 		case "delete":
@@ -837,7 +944,7 @@ func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action str
 			flow.State = domain.FlowStateActive
 			flow.DecisionDeadlineAt = time.Time{}
 			clearDiscordPromptLink(&flow.Discord)
-			if err := enqueueEvaluatePolicy(ctx, tx, flow, now, "ai_unarchive", now); err != nil {
+			if err := s.evalScheduler.RequestEval(ctx, tx, flow, now, now, "ai_unarchive", "ai:eval:"+flow.ItemID, flow.Version); err != nil {
 				return err
 			}
 		case "delete":
@@ -950,7 +1057,7 @@ func (s *Service) ApplyAIDelayDays(ctx context.Context, itemID string, days int)
 		if err := tx.UpsertFlowCAS(ctx, flow, expectedVersion); err != nil {
 			return err
 		}
-		if err := enqueueEvaluatePolicy(ctx, tx, flow, now, "ai_delay", delayUntil); err != nil {
+		if err := s.evalScheduler.RequestEval(ctx, tx, flow, now, delayUntil, "ai_delay", "ai:eval:"+flow.ItemID, flow.Version); err != nil {
 			return err
 		}
 		return tx.AppendEvent(ctx, domain.Event{
@@ -1298,27 +1405,6 @@ func parseCustomID(value string) (customID, error) {
 	return customID{Action: action, ItemID: itemID, Version: version}, nil
 }
 
-func enqueueEvaluatePolicy(ctx context.Context, tx repo.TxRepository, flow domain.Flow, now time.Time, reason string, runAt time.Time) error {
-	payload, err := json.Marshal(jobs.EvaluatePolicyPayload{Reason: reason})
-	if err != nil {
-		return err
-	}
-
-	return tx.EnqueueJob(ctx, domain.JobRecord{
-		JobID:          "job:eval:" + flow.ItemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
-		FlowID:         flow.FlowID,
-		ItemID:         flow.ItemID,
-		Kind:           domain.JobKindEvaluatePolicy,
-		Status:         domain.JobStatusPending,
-		RunAt:          runAt,
-		MaxAttempts:    5,
-		IdempotencyKey: "discord:eval:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version+1, 10),
-		PayloadJSON:    payload,
-		CreatedAt:      now,
-		UpdatedAt:      now,
-	})
-}
-
 func enqueueExecuteDelete(ctx context.Context, tx repo.TxRepository, flow domain.Flow, now time.Time) error {
 	payload, err := json.Marshal(jobs.ExecuteDeletePayload{RequestedBy: "discord"})
 	if err != nil {
@@ -1377,9 +1463,6 @@ func staleDecisionMessage(flow domain.Flow, itemDisplay string, interaction disc
 		switch flow.State {
 		case domain.FlowStateArchived:
 			decision = "archive"
-			hasDecision = true
-		case domain.FlowStateDeleteInProgress:
-			decision = "delete_requested"
 			hasDecision = true
 		case domain.FlowStateDeleteQueued:
 			decision = "delete_requested"
@@ -1576,51 +1659,6 @@ func mostRecentPlayForTarget(ctx context.Context, tx repo.TxRepository, flow dom
 		return time.Time{}, false, nil
 	}
 	return item.LastPlayedAt, true, nil
-}
-
-func upsertEvaluatePolicyJob(ctx context.Context, tx repo.TxRepository, flow domain.Flow, now time.Time, runAt time.Time, reason string, idempotencyPrefix string) error {
-	payload, err := json.Marshal(jobs.EvaluatePolicyPayload{Reason: reason})
-	if err != nil {
-		return err
-	}
-
-	jobID := "job:eval:scheduled:" + flow.ItemID
-	job, found, err := tx.GetJob(ctx, jobID)
-	if err != nil {
-		return err
-	}
-	if found {
-		job.FlowID = flow.FlowID
-		job.ItemID = flow.ItemID
-		job.Kind = domain.JobKindEvaluatePolicy
-		job.Status = domain.JobStatusPending
-		job.RunAt = runAt
-		job.LeaseOwner = ""
-		job.LeaseUntil = time.Time{}
-		job.MaxAttempts = 5
-		job.IdempotencyKey = idempotencyPrefix + ":" + flow.ItemID
-		job.PayloadJSON = payload
-		job.LastError = ""
-		job.UpdatedAt = now
-		if job.CreatedAt.IsZero() {
-			job.CreatedAt = now
-		}
-		return tx.UpdateJob(ctx, job)
-	}
-
-	return tx.EnqueueJob(ctx, domain.JobRecord{
-		JobID:          jobID,
-		FlowID:         flow.FlowID,
-		ItemID:         flow.ItemID,
-		Kind:           domain.JobKindEvaluatePolicy,
-		Status:         domain.JobStatusPending,
-		RunAt:          runAt,
-		MaxAttempts:    5,
-		IdempotencyKey: idempotencyPrefix + ":" + flow.ItemID,
-		PayloadJSON:    payload,
-		CreatedAt:      now,
-		UpdatedAt:      now,
-	})
 }
 
 func targetKey(targetType, id string) string {

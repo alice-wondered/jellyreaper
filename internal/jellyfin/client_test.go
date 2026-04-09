@@ -56,3 +56,30 @@ func TestProviderIDCandidatePreservesNonHexIDs(t *testing.T) {
 		t.Fatalf("providerIDCandidate(%q)=%q want=%q", in, got, in)
 	}
 }
+
+func TestDeleteItem404IsIdempotent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Fatalf("expected DELETE, got %s", r.Method)
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "api-key", server.Client())
+	if err := client.DeleteItem(context.Background(), "missing-item"); err != nil {
+		t.Fatalf("expected 404 to be treated as success, got %v", err)
+	}
+}
+
+func TestDeleteItemReturnsErrorOnServerError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "api-key", server.Client())
+	if err := client.DeleteItem(context.Background(), "boom"); err == nil {
+		t.Fatal("expected error on 500, got nil")
+	}
+}
