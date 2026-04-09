@@ -86,7 +86,7 @@ services:
       JELLYFIN_URL: http://jellyfin:8096
       JELLYFIN_WEBHOOK_TOKEN: ${JELLYFIN_WEBHOOK_TOKEN:-}
       # Optional: enable Discord @mention AI assistant
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5-mini}
     volumes:
       - ./data:/data
       - ./logs:/logs
@@ -144,7 +144,7 @@ go run ./cmd/jellyreaper
 
 Set:
 - `OPENAI_API_KEY`
-- optional `OPENAI_MODEL` (default `gpt-4o-mini`)
+- optional `OPENAI_MODEL` (default `gpt-5-mini`)
 
 Behavior:
 - Responds to @mentions in Discord threads.
@@ -173,7 +173,7 @@ Behavior:
 | `DISCORD_BOT_TOKEN` | yes (for sending messages) | - | bot token for prompt sends; gateway used only for AI mentions |
 | `DISCORD_CHANNEL_ID` | yes (recommended) | - | fallback channel for HITL prompt delivery |
 | `OPENAI_API_KEY` | no | - | enables Discord @mention AI assistant |
-| `OPENAI_MODEL` | no | `gpt-4o-mini` | OpenAI model for assistant |
+| `OPENAI_MODEL` | no | `gpt-5-mini` | OpenAI model for assistant |
 
 ### Jellyfin
 
