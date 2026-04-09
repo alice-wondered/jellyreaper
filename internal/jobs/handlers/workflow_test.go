@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -977,5 +978,13 @@ func TestSendHITLPromptHandlerSendsNewMessageWhenStoredMessageMissing(t *testing
 		return nil
 	}); err != nil {
 		t.Fatalf("verify flow: %v", err)
+	}
+}
+
+func TestHumanTimeLabelUsesDiscordRelativeTimestampFormat(t *testing.T) {
+	ts := time.Date(2026, 4, 9, 0, 0, 0, 0, time.UTC)
+	label := humanTimeLabel(ts)
+	if !strings.Contains(label, "<t:") || !strings.Contains(label, ":R>") || !strings.Contains(label, ":f>") {
+		t.Fatalf("expected discord timestamp format, got %q", label)
 	}
 }
