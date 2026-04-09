@@ -1949,6 +1949,45 @@ func TestSeriesWebhookDoesNotCreateOperationalFlow(t *testing.T) {
 	}
 }
 
+func TestSeasonCatalogWebhookDoesNotCreateOperationalFlow(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 12, 10, 50, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:           "season-magicians-1",
+			ItemType:         "Season",
+			Name:             "Season 1",
+			SeriesName:       "The Magicians",
+			NotificationType: "ItemUpdated",
+			EventID:          "evt-season-magicians-1",
+		},
+		Raw:       map[string]any{"EventId": "evt-season-magicians-1"},
+		ItemID:    "season-magicians-1",
+		EventID:   "evt-season-magicians-1",
+		EventType: "ItemUpdated",
+		DedupeKey: "jellyfin:evt-season-magicians-1",
+	})
+	if err != nil {
+		t.Fatalf("handle season webhook: %v", err)
+	}
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		flows, err := tx.ListFlows(context.Background())
+		if err != nil {
+			return err
+		}
+		if len(flows) != 0 {
+			return fmt.Errorf("expected no operational flows from season-only catalog webhook, got %d", len(flows))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify no season flow created: %v", err)
+	}
+}
+
 func TestDiscordInteractionUsesSnowflakeTimestamp(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)
