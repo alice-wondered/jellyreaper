@@ -343,3 +343,40 @@ func TestBackfillFetchChangedItemsSinceChunksUserItemsIdsToAvoidLongURLs(t *test
 		t.Fatalf("expected chunked per-user item requests, got %d", requestCount)
 	}
 }
+
+func TestBackfillFetchChangedItemsSinceSurfacesEnrichmentWarnings(t *testing.T) {
+	id := uuid.New()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/Items":
+			name := "Sample Movie"
+			out := []gen.BaseItemDto{{Id: &id, Name: &name}}
+			_ = json.NewEncoder(w).Encode(gen.BaseItemDtoQueryResult{Items: &out})
+		case "/Users":
+			_, _ = w.Write([]byte(`[{"Id":"u1"}]`))
+		case "/Users/u1/Items":
+			w.WriteHeader(http.StatusRequestURITooLong)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	b, err := NewBackfillService(server.URL, "token", server.Client())
+	if err != nil {
+		t.Fatalf("new backfill service: %v", err)
+	}
+	warnings := 0
+	b.SetWarningHook(func(stage string, err error) {
+		if stage == "user-playback-enrichment" && err != nil {
+			warnings++
+		}
+	})
+
+	if _, err := b.FetchChangedItemsSince(context.Background(), time.Now().Add(-24*time.Hour), 100); err != nil {
+		t.Fatalf("fetch changed items: %v", err)
+	}
+	if warnings == 0 {
+		t.Fatal("expected enrichment warning hook to fire")
+	}
+}

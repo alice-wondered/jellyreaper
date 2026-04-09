@@ -28,6 +28,7 @@ type BackfillService struct {
 	apiKey        string
 	httpClient    *http.Client
 	progressHook  func(FetchProgress)
+	warningHook   func(string, error)
 	usersMu       sync.Mutex
 	cachedUsers   []userSummary
 	usersCachedAt time.Time
@@ -115,6 +116,10 @@ func NewBackfillServiceWithClient(client BackfillClient) *BackfillService {
 
 func (s *BackfillService) SetProgressHook(hook func(FetchProgress)) {
 	s.progressHook = hook
+}
+
+func (s *BackfillService) SetWarningHook(hook func(string, error)) {
+	s.warningHook = hook
 }
 
 func (s *BackfillService) FetchPlaybackEventsSince(ctx context.Context, since time.Time, limit int32) ([]PlaybackEvent, error) {
@@ -337,7 +342,10 @@ func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.
 		}
 	}
 
-	if enriched, err := s.enrichItemsWithAllUsersPlayback(ctx, out); err == nil {
+	if enriched, err := s.enrichItemsWithAllUsersPlayback(ctx, out); err != nil {
+		out = enriched
+		s.emitWarning("user-playback-enrichment", err)
+	} else {
 		out = enriched
 	}
 
@@ -397,10 +405,16 @@ func (s *BackfillService) enrichItemsWithAllUsersPlayback(ctx context.Context, i
 
 	lastPlayed := map[string]time.Time{}
 	playCount := map[string]int32{}
+	chunkFailures := 0
+	var firstErr error
 	for _, user := range users {
 		for _, chunk := range chunkItemIDs(ids, userItemsIDsChunkSize) {
 			userItems, err := s.fetchUserItemsPlayback(ctx, user.ID, chunk)
 			if err != nil {
+				chunkFailures++
+				if firstErr == nil {
+					firstErr = err
+				}
 				continue
 			}
 			for _, it := range userItems.Items {
@@ -428,6 +442,9 @@ func (s *BackfillService) enrichItemsWithAllUsersPlayback(ctx context.Context, i
 		if pc, ok := playCount[id]; ok && pc > items[idx].PlayCount {
 			items[idx].PlayCount = pc
 		}
+	}
+	if chunkFailures > 0 {
+		return items, fmt.Errorf("user playback enrichment had %d failed user-item chunks: %w", chunkFailures, firstErr)
 	}
 	return items, nil
 }
@@ -681,6 +698,13 @@ func (s *BackfillService) emitProgress(progress FetchProgress) {
 	if s.progressHook != nil {
 		s.progressHook(progress)
 	}
+}
+
+func (s *BackfillService) emitWarning(stage string, err error) {
+	if err == nil || s.warningHook == nil {
+		return
+	}
+	s.warningHook(stage, err)
 }
 
 func safeTotalCount(value *int32) int {

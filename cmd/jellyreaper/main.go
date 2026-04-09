@@ -185,6 +185,9 @@ func main() {
 			if err != nil {
 				logger.Error("create backfill service", "error", err)
 			} else {
+				backfillSvc.SetWarningHook(func(stage string, warnErr error) {
+					logger.Warn("backfill warning", "stage", stage, "error", warnErr)
+				})
 				backfillSvc.SetProgressHook(func(progress jellyfin.FetchProgress) {
 					remaining := 0
 					if progress.TotalRecordCount > 0 && progress.TotalRecordCount > progress.Fetched {
