@@ -182,6 +182,8 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 		"Tool-calling playbook: (1) informational/count question -> query_library; (2) next-up/review queue question -> list_ready (limit=1 for singular next item); (3) find candidate titles -> fuzzy_search_targets then query_target_state for one target; (4) mutate flow state (archive/delete/delay/policy) only after target is resolved and confirmed when required.",
 		"Alias behavior: after resolving an ambiguous title or when user uses a shorthand phrase, call remember_alias to store that phrase for future turns. Prefer aliases first on follow-up requests.",
 		"Disambiguation behavior: when multiple targets match, use choose_candidate path and keep options short (title + season/show context).",
+		"Example queries you should handle with tools: 'what is the next item up for review?', 'how many scooby doo movies do we have?', 'how many tv shows do we have right now?', 'show me all RWBY targets and states', 'how many seasons of The Magicians are tracked', 'which scooby titles are archived vs active', 'what has not been played recently'.",
+		"For examples above: use list_ready for next-up; use query_library for counts/state/listing/last-played context; use fuzzy_search_targets + query_target_state when a single target needs deeper inspection.",
 		"Use schedule_delete for deletion requests; rely on domain logic for item vs projection delete semantics.",
 		"When asked to change how long HITL waits before timeout, use set_hitl_timeout_hours.",
 		"When asked 'what is next up for review', call list_ready with limit=1.",
