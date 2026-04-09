@@ -291,16 +291,13 @@ func (h *Harness) ensureHistoryLoaded(ctx context.Context, threadID string) {
 }
 
 func (h *Harness) executeToolCall(ctx context.Context, threadID string, tc openai.ChatCompletionMessageToolCall) (string, string, error) {
-	args := map[string]any{}
-	if strings.TrimSpace(tc.Function.Arguments) != "" {
-		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-			return "", "", err
-		}
-	}
-
 	switch tc.Function.Name {
 	case "response":
-		msg := strings.TrimSpace(asString(args["message"]))
+		args, err := decodeToolArgs[toolResponseArgs](tc.Function.Arguments)
+		if err != nil {
+			return "", "", err
+		}
+		msg := strings.TrimSpace(args.Message)
 		if msg == "" {
 			msg = "Could you share a little more detail so I can help?"
 		}
@@ -308,84 +305,163 @@ func (h *Harness) executeToolCall(ctx context.Context, threadID string, tc opena
 	case "list_ready":
 		return h.listReady(ctx)
 	case "fuzzy_search_targets":
-		return h.fuzzySearchTargets(ctx, asString(args["query"]), asString(args["subject_type"]), asInt(args["limit"], 12))
+		args, err := decodeToolArgs[toolFuzzySearchArgs](tc.Function.Arguments)
+		if err != nil {
+			return "", "", err
+		}
+		limit := args.Limit
+		if limit <= 0 {
+			limit = 12
+		}
+		return h.fuzzySearchTargets(ctx, args.Query, args.SubjectType, limit)
 	case "query_target_state":
-		return h.queryTargetState(ctx, threadID, asString(args["query"]))
+		args, err := decodeToolArgs[toolQueryTargetStateArgs](tc.Function.Arguments)
+		if err != nil {
+			return "", "", err
+		}
+		return h.queryTargetState(ctx, threadID, args.Query)
 	case "remember_alias":
-		return h.rememberAlias(ctx, threadID, asString(args["alias"]), asString(args["target_ref"]))
+		args, err := decodeToolArgs[toolRememberAliasArgs](tc.Function.Arguments)
+		if err != nil {
+			return "", "", err
+		}
+		return h.rememberAlias(ctx, threadID, args.Alias, args.TargetRef)
 	case "schedule_delete":
-		return h.setDeleteState(ctx, threadID, asString(args["target_ref"]))
+		args, err := decodeToolArgs[toolScheduleDeleteArgs](tc.Function.Arguments)
+		if err != nil {
+			return "", "", err
+		}
+		return h.setDeleteState(ctx, threadID, args.TargetRef)
 	case "schedule_delete_many":
-		return h.scheduleDeleteMany(ctx, asStringSlice(args["target_ids"]))
+		args, err := decodeToolArgs[toolScheduleDeleteManyArgs](tc.Function.Arguments)
+		if err != nil {
+			return "", "", err
+		}
+		return h.scheduleDeleteMany(ctx, args.TargetIDs)
 	case "delay_target_days":
-		return h.delayTargetDays(ctx, threadID, asString(args["target_ref"]), asInt(args["days"], 0))
+		args, err := decodeToolArgs[toolDelayTargetDaysArgs](tc.Function.Arguments)
+		if err != nil {
+			return "", "", err
+		}
+		return h.delayTargetDays(ctx, threadID, args.TargetRef, args.Days)
 	case "archive_target":
-		archived := asBool(args["archived"], true)
-		return h.setArchiveState(ctx, threadID, asString(args["query"]), archived)
+		args, err := decodeToolArgs[toolArchiveTargetArgs](tc.Function.Arguments)
+		if err != nil {
+			return "", "", err
+		}
+		archived := true
+		if args.Archived != nil {
+			archived = *args.Archived
+		}
+		return h.setArchiveState(ctx, threadID, args.Query, archived)
 	case "choose_candidate":
-		n := asInt(args["number"], 0)
+		args, err := decodeToolArgs[toolChooseCandidateArgs](tc.Function.Arguments)
+		if err != nil {
+			return "", "", err
+		}
+		n := args.Number
 		if n <= 0 {
 			return "", "", fmt.Errorf("number must be >= 1")
 		}
 		return h.handleFollowUp(ctx, threadID, strconv.Itoa(n))
 	case "confirm_pending":
-		confirmed := asBool(args["confirmed"], false)
-		if confirmed {
+		args, err := decodeToolArgs[toolConfirmPendingArgs](tc.Function.Arguments)
+		if err != nil {
+			return "", "", err
+		}
+		if args.Confirmed {
 			return h.handleFollowUp(ctx, threadID, "yes")
 		}
 		return h.handleFollowUp(ctx, threadID, "no")
 	case "set_review_days":
-		return h.setReviewDays(ctx, asInt(args["days"], 0))
+		args, err := decodeToolArgs[toolSetReviewDaysArgs](tc.Function.Arguments)
+		if err != nil {
+			return "", "", err
+		}
+		return h.setReviewDays(ctx, args.Days)
 	case "set_defer_days":
-		return h.setDeferDays(ctx, asInt(args["days"], 0))
+		args, err := decodeToolArgs[toolSetDeferDaysArgs](tc.Function.Arguments)
+		if err != nil {
+			return "", "", err
+		}
+		return h.setDeferDays(ctx, args.Days)
 	case "set_hitl_timeout_hours":
-		return h.setHITLTimeoutHours(ctx, asInt(args["hours"], 0))
+		args, err := decodeToolArgs[toolSetHITLTimeoutHoursArgs](tc.Function.Arguments)
+		if err != nil {
+			return "", "", err
+		}
+		return h.setHITLTimeoutHours(ctx, args.Hours)
 	default:
 		return "", "", fmt.Errorf("unknown tool: %s", tc.Function.Name)
 	}
 }
 
-func asString(v any) string {
-	s, _ := v.(string)
-	return s
+type toolResponseArgs struct {
+	Message string `json:"message"`
 }
 
-func asInt(v any, fallback int) int {
-	switch n := v.(type) {
-	case float64:
-		return int(n)
-	case int:
-		return n
-	default:
-		return fallback
-	}
+type toolFuzzySearchArgs struct {
+	Query       string `json:"query"`
+	SubjectType string `json:"subject_type"`
+	Limit       int    `json:"limit"`
 }
 
-func asBool(v any, fallback bool) bool {
-	b, ok := v.(bool)
-	if !ok {
-		return fallback
-	}
-	return b
+type toolQueryTargetStateArgs struct {
+	Query string `json:"query"`
 }
 
-func asStringSlice(v any) []string {
-	arr, ok := v.([]any)
-	if !ok {
-		return nil
+type toolRememberAliasArgs struct {
+	Alias     string `json:"alias"`
+	TargetRef string `json:"target_ref"`
+}
+
+type toolScheduleDeleteArgs struct {
+	TargetRef string `json:"target_ref"`
+}
+
+type toolScheduleDeleteManyArgs struct {
+	TargetIDs []string `json:"target_ids"`
+}
+
+type toolDelayTargetDaysArgs struct {
+	TargetRef string `json:"target_ref"`
+	Days      int    `json:"days"`
+}
+
+type toolArchiveTargetArgs struct {
+	Query    string `json:"query"`
+	Archived *bool  `json:"archived"`
+}
+
+type toolChooseCandidateArgs struct {
+	Number int `json:"number"`
+}
+
+type toolConfirmPendingArgs struct {
+	Confirmed bool `json:"confirmed"`
+}
+
+type toolSetReviewDaysArgs struct {
+	Days int `json:"days"`
+}
+
+type toolSetDeferDaysArgs struct {
+	Days int `json:"days"`
+}
+
+type toolSetHITLTimeoutHoursArgs struct {
+	Hours int `json:"hours"`
+}
+
+func decodeToolArgs[T any](raw string) (T, error) {
+	var out T
+	if strings.TrimSpace(raw) == "" {
+		return out, nil
 	}
-	out := make([]string, 0, len(arr))
-	for _, raw := range arr {
-		s, ok := raw.(string)
-		if !ok {
-			continue
-		}
-		if strings.TrimSpace(s) == "" {
-			continue
-		}
-		out = append(out, s)
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return out, fmt.Errorf("decode tool args: %w", err)
 	}
-	return out
+	return out, nil
 }
 
 func (h *Harness) listReady(ctx context.Context) (string, string, error) {
