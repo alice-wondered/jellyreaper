@@ -24,6 +24,9 @@ func AlternateIDForms(raw string) []string {
 		return nil
 	}
 	forms := []string{normalized}
+	if _, err := uuid.Parse(normalized); err != nil {
+		return forms
+	}
 	nodash := strings.ReplaceAll(normalized, "-", "")
 	if nodash != normalized {
 		forms = append(forms, nodash)
