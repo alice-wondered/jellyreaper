@@ -130,7 +130,15 @@ go run ./cmd/jellyreaper
 3. Copy application public key (hex) to `DISCORD_PUBLIC_KEY_HEX`.
 4. Set `DISCORD_BOT_TOKEN`.
 5. Set `DISCORD_CHANNEL_ID` as fallback channel for HITL prompts.
-6. Enable message content intent if using the AI mention assistant.
+6. Invite bot with minimum channel permissions:
+   - `View Channel`
+   - `Send Messages`
+   - `Embed Links`
+   - `Add Reactions`
+   - `Read Message History`
+7. If using AI @mentions, enable **Message Content Intent** in Discord Developer Portal.
+   - If disabled, Discord gateway may close with `4014 Disallowed intent(s)`.
+   - JellyReaper only opens the gateway when AI mentions are enabled (`OPENAI_API_KEY` set).
 
 ### Enabling AI Assistant
 
@@ -162,7 +170,7 @@ Behavior:
 | Variable | Required | Default | Description |
 |---|---:|---|---|
 | `DISCORD_PUBLIC_KEY_HEX` | yes | - | verifies Discord interaction signatures |
-| `DISCORD_BOT_TOKEN` | yes (for sending messages) | - | bot token for gateway/message APIs |
+| `DISCORD_BOT_TOKEN` | yes (for sending messages) | - | bot token for prompt sends; gateway used only for AI mentions |
 | `DISCORD_CHANNEL_ID` | yes (recommended) | - | fallback channel for HITL prompt delivery |
 | `OPENAI_API_KEY` | no | - | enables Discord @mention AI assistant |
 | `OPENAI_MODEL` | no | `gpt-4o-mini` | OpenAI model for assistant |
