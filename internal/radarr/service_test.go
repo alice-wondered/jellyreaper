@@ -19,8 +19,8 @@ func TestRemoveByProviderIDsDeletesMatchedMovie(t *testing.T) {
 			if got := r.URL.Query().Get("deleteFiles"); got != "true" {
 				t.Fatalf("expected deleteFiles=true, got %q", got)
 			}
-			if got := r.URL.Query().Get("addImportExclusion"); got != "true" {
-				t.Fatalf("expected addImportExclusion=true, got %q", got)
+			if got := r.URL.Query().Get("addImportExclusion"); got != "false" {
+				t.Fatalf("expected addImportExclusion=false, got %q", got)
 			}
 			if got := r.Header.Get("X-Api-Key"); got != "k" {
 				t.Fatalf("expected api key header, got %q", got)

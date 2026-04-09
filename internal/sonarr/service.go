@@ -49,7 +49,7 @@ func (s *Service) RemoveByProviderIDs(ctx context.Context, providerIDs map[strin
 	if !found {
 		return fmt.Errorf("sonarr series not found for provider ids: %v", providerIDs)
 	}
-	endpoint := fmt.Sprintf("%s/api/v3/series/%d?deleteFiles=false&addImportListExclusion=true", s.baseURL, series.ID)
+	endpoint := fmt.Sprintf("%s/api/v3/series/%d?deleteFiles=false&addImportListExclusion=false", s.baseURL, series.ID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
 	if err != nil {
 		return fmt.Errorf("build sonarr delete request: %w", err)

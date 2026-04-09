@@ -19,8 +19,8 @@ func TestRemoveByProviderIDsDeletesMatchedSeries(t *testing.T) {
 			if got := r.URL.Query().Get("deleteFiles"); got != "false" {
 				t.Fatalf("expected deleteFiles=false, got %q", got)
 			}
-			if got := r.URL.Query().Get("addImportListExclusion"); got != "true" {
-				t.Fatalf("expected addImportListExclusion=true, got %q", got)
+			if got := r.URL.Query().Get("addImportListExclusion"); got != "false" {
+				t.Fatalf("expected addImportListExclusion=false, got %q", got)
 			}
 			if got := r.Header.Get("X-Api-Key"); got != "k" {
 				t.Fatalf("expected api key header, got %q", got)
