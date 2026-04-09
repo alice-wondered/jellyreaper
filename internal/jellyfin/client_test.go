@@ -10,23 +10,19 @@ import (
 func TestFetchProviderIDsPrefersNoDashUUIDForm(t *testing.T) {
 	const dashed = "bda444ed-c4e7-4bbb-6677-3cbe94938d10"
 	const nodash = "bda444edc4e74bbb66773cbe94938d10"
-	dashedCalls := 0
-	nodashCalls := 0
+	itemsCalls := 0
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/Items/" + dashed:
-			dashedCalls++
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		case "/Items/" + nodash:
-			nodashCalls++
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"ProviderIds":{"Tvdb":"73244","Imdb":"tt0386676"}}`))
-			return
-		default:
+		if r.URL.Path != "/Items" {
 			w.WriteHeader(http.StatusNotFound)
+			return
 		}
+		itemsCalls++
+		if got := r.URL.Query().Get("Ids"); got != nodash {
+			t.Fatalf("expected Ids=%s, got %s", nodash, got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"Items":[{"ProviderIds":{"Tvdb":"73244","Imdb":"tt0386676"}}]}`))
 	}))
 	defer server.Close()
 
@@ -41,11 +37,8 @@ func TestFetchProviderIDsPrefersNoDashUUIDForm(t *testing.T) {
 	if ids["imdb"] != "tt0386676" {
 		t.Fatalf("expected imdb provider id from alternate id form, got %q", ids["imdb"])
 	}
-	if nodashCalls != 1 {
-		t.Fatalf("expected nodash form to be queried once, got %d", nodashCalls)
-	}
-	if dashedCalls != 0 {
-		t.Fatalf("did not expect dashed fallback when nodash succeeds, got %d dashed calls", dashedCalls)
+	if itemsCalls != 1 {
+		t.Fatalf("expected one /Items query call, got %d", itemsCalls)
 	}
 }
 

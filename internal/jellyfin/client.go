@@ -79,7 +79,7 @@ func (c *Client) FetchProviderIDs(ctx context.Context, itemID string) (map[strin
 	}
 
 	candidate := providerIDCandidate(itemID)
-	endpoint := c.baseURL + "/Items/" + url.PathEscape(candidate) + "?Fields=ProviderIds"
+	endpoint := c.baseURL + "/Items?Ids=" + url.QueryEscape(candidate) + "&Fields=ProviderIds&Limit=1"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build jellyfin provider ids request: %w", err)
@@ -100,12 +100,17 @@ func (c *Client) FetchProviderIDs(ctx context.Context, itemID string) (map[strin
 	}
 
 	var payload struct {
-		ProviderIds map[string]string `json:"ProviderIds"`
+		Items []struct {
+			ProviderIds map[string]string `json:"ProviderIds"`
+		} `json:"Items"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("decode jellyfin provider ids response: %w", err)
 	}
-	return domain.NormalizeProviderIDs(payload.ProviderIds), nil
+	if len(payload.Items) == 0 {
+		return nil, nil
+	}
+	return domain.NormalizeProviderIDs(payload.Items[0].ProviderIds), nil
 }
 
 func providerIDCandidate(itemID string) string {
