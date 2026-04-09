@@ -7,13 +7,14 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
 	"jellyreaper/internal/domain"
 )
+
+var dashedHexIDPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 type Client struct {
 	baseURL string
@@ -112,7 +113,7 @@ func providerIDCandidate(itemID string) string {
 	if normalized == "" {
 		return ""
 	}
-	if _, err := uuid.Parse(normalized); err != nil {
+	if !dashedHexIDPattern.MatchString(normalized) {
 		return normalized
 	}
 	return strings.ReplaceAll(normalized, "-", "")

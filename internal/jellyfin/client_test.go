@@ -48,3 +48,18 @@ func TestFetchProviderIDsPrefersNoDashUUIDForm(t *testing.T) {
 		t.Fatalf("did not expect dashed fallback when nodash succeeds, got %d dashed calls", dashedCalls)
 	}
 }
+
+func TestProviderIDCandidateStripsDashedHexIDsEvenIfNonRFCUUID(t *testing.T) {
+	in := "f8f13c13-eae5-0047-57eb-3308105503b9"
+	want := "f8f13c13eae5004757eb3308105503b9"
+	if got := providerIDCandidate(in); got != want {
+		t.Fatalf("providerIDCandidate(%q)=%q want=%q", in, got, want)
+	}
+}
+
+func TestProviderIDCandidatePreservesNonHexIDs(t *testing.T) {
+	in := "series-provider-1"
+	if got := providerIDCandidate(in); got != in {
+		t.Fatalf("providerIDCandidate(%q)=%q want=%q", in, got, in)
+	}
+}
