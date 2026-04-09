@@ -54,10 +54,6 @@ type arrRemovalRequest struct {
 	itemID      string
 }
 
-type providerIDFetcher interface {
-	FetchProviderIDs(context.Context, string) (map[string]string, error)
-}
-
 type radarrRemover interface {
 	RemoveByProviderIDs(context.Context, map[string]string) error
 }
@@ -75,7 +71,7 @@ type Service struct {
 	defaultDelayWindow    time.Duration
 	defaultExpireDays     int
 	defaultHITLTimeoutHrs int
-	providerFetcher       providerIDFetcher
+	jellyfinClient        *jellyfin.Client
 	radarr                radarrRemover
 	sonarr                sonarrRemover
 	backfillBatchSize     int
@@ -194,8 +190,8 @@ func (s *Service) SetDiscordService(discordSvc *discord.Service) {
 	s.discord = discordSvc
 }
 
-func (s *Service) SetProviderIDFetcher(fetcher providerIDFetcher) {
-	s.providerFetcher = fetcher
+func (s *Service) SetJellyfinClient(client *jellyfin.Client) {
+	s.jellyfinClient = client
 }
 
 func (s *Service) SetRadarrService(remover radarrRemover) {
@@ -207,8 +203,8 @@ func (s *Service) SetSonarrService(remover sonarrRemover) {
 }
 
 func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.WebhookEvent) error {
-	if s.providerFetcher != nil && isCatalogIndexEvent(event.EventType) && !isRemovalEvent(event.EventType) && event.ItemID != "" && len(event.Payload.ProviderIDs) == 0 {
-		providerIDs, err := s.providerFetcher.FetchProviderIDs(ctx, event.ItemID)
+	if s.jellyfinClient != nil && isCatalogIndexEvent(event.EventType) && !isRemovalEvent(event.EventType) && event.ItemID != "" && len(event.Payload.ProviderIDs) == 0 {
+		providerIDs, err := s.jellyfinClient.FetchProviderIDs(ctx, event.ItemID)
 		if err != nil {
 			s.logger.Warn("failed to lazy-fetch jellyfin provider ids", "item_id", event.ItemID, "error", err)
 		} else if len(providerIDs) > 0 {

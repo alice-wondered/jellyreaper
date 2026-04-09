@@ -2,7 +2,6 @@ package radarr
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,11 +25,8 @@ type movieResource struct {
 	Title  string `json:"title"`
 }
 
-func NewService(baseURL, apiKey string, insecureTLS bool) *Service {
+func NewService(baseURL, apiKey string) *Service {
 	transport := &http.Transport{Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: false}
-	if insecureTLS {
-		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	}
 	return &Service{
 		baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
 		apiKey:  strings.TrimSpace(apiKey),

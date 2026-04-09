@@ -56,7 +56,6 @@ type Config struct {
 	RadarrAPIKey         string
 	SonarrURL            string
 	SonarrAPIKey         string
-	ARRInsecureTLS       bool
 
 	BackfillEnabled            bool
 	BackfillInterval           time.Duration
@@ -195,15 +194,6 @@ func LoadFromEnv() (Config, error) {
 		defaultHITLTimeoutHours = parsed
 	}
 
-	arrInsecureTLS := false
-	if raw := strings.TrimSpace(os.Getenv("ARR_INSECURE_TLS")); raw != "" {
-		parsed, err := strconv.ParseBool(raw)
-		if err != nil {
-			return Config{}, fmt.Errorf("parse ARR_INSECURE_TLS: %w", err)
-		}
-		arrInsecureTLS = parsed
-	}
-
 	cfg := Config{
 		HTTPAddr: httpAddr,
 		HTTPPort: httpPort,
@@ -225,7 +215,6 @@ func LoadFromEnv() (Config, error) {
 		RadarrAPIKey:         strings.TrimSpace(os.Getenv("RADARR_API_KEY")),
 		SonarrURL:            strings.TrimSpace(os.Getenv("SONARR_URL")),
 		SonarrAPIKey:         strings.TrimSpace(os.Getenv("SONARR_API_KEY")),
-		ARRInsecureTLS:       arrInsecureTLS,
 
 		BackfillEnabled:            backfillEnabled,
 		BackfillInterval:           backfillInterval,

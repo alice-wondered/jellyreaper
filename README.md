@@ -193,7 +193,6 @@ Behavior:
 | `RADARR_API_KEY` | no | - | Radarr API key |
 | `SONARR_URL` | no | - | Sonarr base URL for series removal sync |
 | `SONARR_API_KEY` | no | - | Sonarr API key |
-| `ARR_INSECURE_TLS` | no | `false` | set `true` to allow self-signed TLS for Sonarr/Radarr |
 
 ### Policy Defaults
 

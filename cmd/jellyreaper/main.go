@@ -155,14 +155,14 @@ func main() {
 	appService.SetPolicyDefaults(cfg.DefaultLastPlayedThresholdDays, cfg.DefaultDelayWindow)
 	appService.SetDefaultHITLTimeoutHours(cfg.DefaultHITLTimeoutHours)
 	if cfg.JellyfinURL != "" && cfg.JellyfinAPIKey != "" {
-		appService.SetProviderIDFetcher(jellyfin.NewClient(cfg.JellyfinURL, cfg.JellyfinAPIKey, nil))
+		appService.SetJellyfinClient(jellyfin.NewClient(cfg.JellyfinURL, cfg.JellyfinAPIKey, nil))
 	}
 	if cfg.RadarrURL != "" && cfg.RadarrAPIKey != "" {
-		appService.SetRadarrService(radarr.NewService(cfg.RadarrURL, cfg.RadarrAPIKey, cfg.ARRInsecureTLS))
+		appService.SetRadarrService(radarr.NewService(cfg.RadarrURL, cfg.RadarrAPIKey))
 		logger.Info("radarr service enabled")
 	}
 	if cfg.SonarrURL != "" && cfg.SonarrAPIKey != "" {
-		appService.SetSonarrService(sonarr.NewService(cfg.SonarrURL, cfg.SonarrAPIKey, cfg.ARRInsecureTLS))
+		appService.SetSonarrService(sonarr.NewService(cfg.SonarrURL, cfg.SonarrAPIKey))
 		logger.Info("sonarr service enabled")
 	}
 	if assistant != nil {
