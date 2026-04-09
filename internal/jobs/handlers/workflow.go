@@ -306,6 +306,10 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 			return err
 		} else if ok {
 			statusLine = "Last played at: " + humanTimeLabel(lastPlayedAt)
+		} else if createdAt, createdKnown, err := mostRecentCreatedForFlow(ctx, tx, flow); err != nil {
+			return err
+		} else if createdKnown {
+			statusLine = "Last played at: never (added " + humanTimeLabel(createdAt) + ")"
 		}
 		if flow.Discord.MessageID != "" {
 			shouldSend = false

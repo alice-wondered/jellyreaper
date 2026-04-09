@@ -875,6 +875,47 @@ func TestSendHITLPromptHandlerIncludesLastPlayedStatusLine(t *testing.T) {
 	}
 }
 
+func TestSendHITLPromptHandlerFallsBackToCreatedTimestampWhenNeverPlayed(t *testing.T) {
+	store := testStore(t)
+	now := time.Now().UTC()
+	createdAt := now.Add(-48 * time.Hour)
+
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:    "flow:item-never-played",
+			ItemID:    "item-never-played",
+			State:     domain.FlowStatePendingReview,
+			Version:   0,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "item-never-played", CreatedAt: createdAt, UpdatedAt: now})
+	}); err != nil {
+		t.Fatalf("seed flow/media: %v", err)
+	}
+
+	pub, _, _ := ed25519.GenerateKey(nil)
+	discordSvc, err := discord.NewService("", pub)
+	if err != nil {
+		t.Fatalf("discord service: %v", err)
+	}
+	receivedStatus := ""
+	discordSvc.SetSendPromptHookForTest(func(_ context.Context, _ string, _ string, _ int64, _ string, _ string, status string) (string, error) {
+		receivedStatus = status
+		return "msg-status-created", nil
+	})
+
+	h := NewSendHITLPromptHandler(store, nil, discordSvc, "channel-1", 48*time.Hour)
+	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "prompt-never-played", ItemID: "item-never-played"}); err != nil {
+		t.Fatalf("handle prompt: %v", err)
+	}
+	if !strings.Contains(receivedStatus, "Last played at: never (added") {
+		t.Fatalf("expected created-time fallback status, got %q", receivedStatus)
+	}
+}
+
 func TestSendHITLPromptHandlerUsesCurrentFlowVersionInCustomID(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
