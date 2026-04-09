@@ -353,6 +353,113 @@ func TestIntegrationBackfillIndexesStateFromGeneratedTypes(t *testing.T) {
 	}
 }
 
+func TestIntegrationBackfillUsesUserPlaybackToDeferReviewScheduling(t *testing.T) {
+	store := openStore(t)
+	now := time.Now().UTC()
+	recentPlay := now.Add(-4 * 24 * time.Hour)
+	oldEpisodePlay := now.Add(-120 * 24 * time.Hour)
+
+	movieID := "11111111-2222-3333-4444-555555555555"
+	episodeID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+	var usersCalls atomic.Int64
+	var userItemsCalls atomic.Int64
+	backfillServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/Items":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"Items": []map[string]any{
+					{"Id": movieID, "Type": "Movie", "Name": "Sample Movie", "DateCreated": now.Add(-300 * 24 * time.Hour).Format(time.RFC3339), "DateLastMediaAdded": now.Add(-300 * 24 * time.Hour).Format(time.RFC3339)},
+					{"Id": episodeID, "Type": "Episode", "Name": "Sample Episode", "SeriesId": "series-1", "SeriesName": "Sample Series", "SeasonId": "season-2", "SeasonName": "Season 2", "DateCreated": now.Add(-200 * 24 * time.Hour).Format(time.RFC3339), "DateLastMediaAdded": now.Add(-200 * 24 * time.Hour).Format(time.RFC3339)},
+				},
+			})
+		case "/Users":
+			usersCalls.Add(1)
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"Id": "u1"}, {"Id": "u2"}})
+		case "/Users/u1/Items":
+			userItemsCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"Items": []map[string]any{
+					{"Id": movieID, "Type": "Movie", "Name": "Sample Movie", "UserData": map[string]any{"PlayCount": 0}},
+					{"Id": episodeID, "Type": "Episode", "Name": "Sample Episode", "UserData": map[string]any{"PlayCount": 0}},
+				},
+			})
+		case "/Users/u2/Items":
+			userItemsCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"Items": []map[string]any{
+					{"Id": movieID, "Type": "Movie", "Name": "Sample Movie", "UserData": map[string]any{"LastPlayedDate": recentPlay.Format(time.RFC3339Nano), "PlayCount": 4}},
+					{"Id": episodeID, "Type": "Episode", "Name": "Sample Episode", "UserData": map[string]any{"LastPlayedDate": oldEpisodePlay.Format(time.RFC3339Nano), "PlayCount": 1}},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer backfillServer.Close()
+
+	b, err := jellyfin.NewBackfillService(backfillServer.URL, "api", backfillServer.Client())
+	if err != nil {
+		t.Fatalf("new backfill service: %v", err)
+	}
+
+	items, err := b.FetchChangedItemsSince(context.Background(), now.Add(-365*24*time.Hour), 100)
+	if err != nil {
+		t.Fatalf("fetch changed items: %v", err)
+	}
+	if usersCalls.Load() == 0 || userItemsCalls.Load() == 0 {
+		t.Fatalf("expected user playback enrichment calls, users=%d user_items=%d", usersCalls.Load(), userItemsCalls.Load())
+	}
+
+	appSvc := app.NewService(store, nil, nil)
+	appSvc.SetPolicyDefaults(60, 15*24*time.Hour)
+	if err := appSvc.IngestBackfillItems(context.Background(), items); err != nil {
+		t.Fatalf("ingest backfill items: %v", err)
+	}
+
+	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		media, found, err := tx.GetMedia(context.Background(), movieID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatalf("expected movie media record")
+		}
+		if media.LastPlayedAt.IsZero() {
+			t.Fatalf("expected movie last played to be populated from user data")
+		}
+		if media.LastPlayedAt.Before(recentPlay.Add(-time.Second)) || media.LastPlayedAt.After(recentPlay.Add(time.Second)) {
+			t.Fatalf("unexpected movie last played: got=%s want~=%s", media.LastPlayedAt, recentPlay)
+		}
+
+		jobID := "job:eval:scheduled:target:movie:" + movieID
+		job, found, err := tx.GetJob(context.Background(), jobID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatalf("expected scheduled evaluate job for movie flow")
+		}
+		if !job.RunAt.After(now) {
+			t.Fatalf("expected evaluation to be deferred to future, got run_at=%s now=%s", job.RunAt, now)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("verify stored state: %v", err)
+	}
+
+	leased, err := store.LeaseDueJobs(context.Background(), now.Add(5*time.Minute), 200, "it", time.Minute)
+	if err != nil {
+		t.Fatalf("lease due jobs: %v", err)
+	}
+	for _, job := range leased {
+		if job.Kind == domain.JobKindSendHITLPrompt && job.ItemID == "target:movie:"+movieID {
+			t.Fatalf("did not expect immediate HITL prompt job for recently played movie")
+		}
+	}
+}
+
 func getFlow(store *bboltrepo.Store, itemID string) (domain.Flow, bool, error) {
 	var flow domain.Flow
 	var found bool
