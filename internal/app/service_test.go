@@ -1042,6 +1042,105 @@ func TestIngestBackfillReplayIsIdempotentForSameRevision(t *testing.T) {
 	}
 }
 
+func TestBackfillAfterLivePlaybackCanAdvanceMissedDowntimePlay(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	base := time.Date(2026, 4, 8, 12, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return base }
+
+	item := jellyfin.ItemSnapshot{
+		ItemID:             "movie-magicians-1",
+		ItemType:           "Movie",
+		Name:               "The Magicians",
+		DateLastMediaAdded: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
+		LastPlayedAt:       base.Add(-3 * time.Hour),
+		PlayCount:          1,
+	}
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{item}); err != nil {
+		t.Fatalf("seed backfill: %v", err)
+	}
+
+	livePlay := base.Add(-2 * time.Hour)
+	if err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload:    jellyfin.WebhookPayload{ItemID: "movie-magicians-1", ItemType: "Movie", NotificationType: "PlaybackStart", EventID: "evt-live-play-1"},
+		Raw:        map[string]any{"EventId": "evt-live-play-1"},
+		ItemID:     "movie-magicians-1",
+		EventID:    "evt-live-play-1",
+		EventType:  "PlaybackStart",
+		DedupeKey:  "jellyfin:evt-live-play-1",
+		OccurredAt: livePlay,
+	}); err != nil {
+		t.Fatalf("live playback webhook: %v", err)
+	}
+
+	missedPlay := base.Add(-time.Hour)
+	item.LastPlayedAt = missedPlay
+	item.PlayCount = 3
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{item}); err != nil {
+		t.Fatalf("downtime backfill replay: %v", err)
+	}
+
+	media := mustGetMedia(t, store, "movie-magicians-1")
+	if !media.LastPlayedAt.Equal(missedPlay) {
+		t.Fatalf("expected backfill to advance last played after downtime, got=%s want=%s", media.LastPlayedAt, missedPlay)
+	}
+	if media.PlayCountTotal != 3 {
+		t.Fatalf("expected backfill to advance play count after downtime, got %d", media.PlayCountTotal)
+	}
+}
+
+func TestFullBackfillOverLiveIndexCanAdvancePlaybackWithoutRegression(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	base := time.Date(2026, 4, 8, 15, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return base }
+
+	if err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload:    jellyfin.WebhookPayload{ItemID: "movie-magicians-2", ItemType: "Movie", Name: "The Magicians", NotificationType: "ItemAdded", EventID: "evt-live-add-2"},
+		Raw:        map[string]any{"EventId": "evt-live-add-2"},
+		ItemID:     "movie-magicians-2",
+		EventID:    "evt-live-add-2",
+		EventType:  "ItemAdded",
+		DedupeKey:  "jellyfin:evt-live-add-2",
+		OccurredAt: base.Add(-4 * time.Hour),
+	}); err != nil {
+		t.Fatalf("seed live item added: %v", err)
+	}
+
+	livePlay := base.Add(-3 * time.Hour)
+	if err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
+		Payload:    jellyfin.WebhookPayload{ItemID: "movie-magicians-2", ItemType: "Movie", NotificationType: "PlaybackStart", EventID: "evt-live-play-2"},
+		Raw:        map[string]any{"EventId": "evt-live-play-2"},
+		ItemID:     "movie-magicians-2",
+		EventID:    "evt-live-play-2",
+		EventType:  "PlaybackStart",
+		DedupeKey:  "jellyfin:evt-live-play-2",
+		OccurredAt: livePlay,
+	}); err != nil {
+		t.Fatalf("seed live playback: %v", err)
+	}
+
+	missedPlay := base.Add(-time.Hour)
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+		ItemID:             "movie-magicians-2",
+		ItemType:           "Movie",
+		Name:               "The Magicians",
+		DateLastMediaAdded: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
+		LastPlayedAt:       missedPlay,
+		PlayCount:          5,
+	}}); err != nil {
+		t.Fatalf("full backfill replay over live index: %v", err)
+	}
+
+	media := mustGetMedia(t, store, "movie-magicians-2")
+	if !media.LastPlayedAt.Equal(missedPlay) {
+		t.Fatalf("expected full backfill to advance last played over live index, got=%s want=%s", media.LastPlayedAt, missedPlay)
+	}
+	if media.PlayCountTotal != 5 {
+		t.Fatalf("expected full backfill to advance play count over live index, got %d", media.PlayCountTotal)
+	}
+}
+
 func TestIngestBackfillItemsEpisodeUsesSeriesProviderIDsAndCache(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)
@@ -1214,6 +1313,20 @@ func TestBackfillItemDedupeKeyUsesRevisionNotOrdinalWhenAvailable(t *testing.T) 
 	keyB := backfillItemDedupeKey(item, 999)
 	if keyA != keyB {
 		t.Fatalf("expected stable dedupe key across ordinals when revision exists: %s != %s", keyA, keyB)
+	}
+}
+
+func TestBackfillItemDedupeKeyChangesWhenPlaybackRevisionChanges(t *testing.T) {
+	added := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	itemA := jellyfin.ItemSnapshot{ItemID: "movie-2", DateLastMediaAdded: added, LastPlayedAt: time.Date(2026, 4, 2, 10, 0, 0, 0, time.UTC), PlayCount: 1}
+	itemB := itemA
+	itemB.LastPlayedAt = itemA.LastPlayedAt.Add(2 * time.Hour)
+	itemB.PlayCount = 2
+
+	keyA := backfillItemDedupeKey(itemA, 1)
+	keyB := backfillItemDedupeKey(itemB, 1)
+	if keyA == keyB {
+		t.Fatalf("expected dedupe key to change when playback revision changes: %s", keyA)
 	}
 }
 

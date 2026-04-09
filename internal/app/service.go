@@ -1851,20 +1851,14 @@ func supportsMediaIndexType(itemType string) bool {
 }
 
 func backfillItemDedupeKey(item jellyfin.ItemSnapshot, ordinal int) string {
-	revision := item.DateLastMediaAdded.UnixNano()
-	if revision == 0 {
-		revision = item.DateCreated.UnixNano()
+	added := item.DateLastMediaAdded.UnixNano()
+	created := item.DateCreated.UnixNano()
+	played := item.LastPlayedAt.UnixNano()
+	plays := int64(item.PlayCount)
+	if added == 0 && created == 0 && played == 0 && plays == 0 {
+		return "backfill:item:" + item.ItemID + ":o" + strconv.Itoa(ordinal)
 	}
-	if revision == 0 {
-		revision = item.LastPlayedAt.UnixNano()
-	}
-	if revision == 0 {
-		revision = int64(item.PlayCount)
-	}
-	if revision == 0 {
-		revision = int64(ordinal)
-	}
-	return "backfill:item:" + item.ItemID + ":" + strconv.FormatInt(revision, 10)
+	return fmt.Sprintf("backfill:item:%s:a%d:c%d:p%d:n%d", item.ItemID, added, created, played, plays)
 }
 
 func formatSeasonLabel(seasonName string, seriesName string, fallback string) string {
