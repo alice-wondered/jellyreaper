@@ -267,6 +267,14 @@ func main() {
 		}
 	}
 
+	// Reconcile flows that got stuck in a prior run (e.g. pending_review
+	// with no HITL prompt, or active flows past their nextActionAt).
+	if reconciled, err := appService.ReconcileStaleFlows(ctx); err != nil {
+		logger.Warn("stale flow reconciliation failed", "error", err)
+	} else if reconciled > 0 {
+		logger.Info("reconciled stale flows on startup", "count", reconciled)
+	}
+
 	go func() {
 		logger.Info("scheduler started")
 		if err := schedulerLoop.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {

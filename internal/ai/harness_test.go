@@ -592,3 +592,59 @@ func TestQueryLibrary_ReturnsRichFlowsAndMediaForIntrospection(t *testing.T) {
 		t.Fatalf("expected non-empty rich media results, got %#v", payload["media"])
 	}
 }
+
+func TestQueryLibraryFilteredCounts(t *testing.T) {
+	store := newTestStore(t)
+
+	// Seed a Scooby Doo movie and some unrelated movies.
+	seedFlow(t, store, "target:movie:scooby1", "Scooby-Doo", domain.FlowStateActive)
+	seedFlow(t, store, "target:movie:scooby2", "Scooby-Doo 2: Monsters Unleashed", domain.FlowStateActive)
+	seedFlow(t, store, "target:movie:alien1", "Alien", domain.FlowStateActive)
+	seedFlow(t, store, "target:movie:alien2", "Aliens", domain.FlowStateActive)
+	seedFlow(t, store, "target:movie:alien3", "Alien 3", domain.FlowStateActive)
+
+	h := NewHarness(store, "", "")
+	out, _, err := h.queryLibrary(context.Background(), "scooby", "both", "movie", 20)
+	if err != nil {
+		t.Fatalf("query library: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	// movie_projection_count should be 2 (only scooby movies), not 5.
+	movieCount := int(payload["movie_projection_count"].(float64))
+	if movieCount != 2 {
+		t.Fatalf("expected 2 scooby movie projections, got %d", movieCount)
+	}
+
+	// total_movie_projection_count should be the global count (5).
+	totalMovieCount := int(payload["total_movie_projection_count"].(float64))
+	if totalMovieCount != 5 {
+		t.Fatalf("expected 5 total movie projections, got %d", totalMovieCount)
+	}
+}
+
+func TestRequestReviewMovesFlowToPendingReview(t *testing.T) {
+	store := newTestStore(t)
+	seedFlow(t, store, "target:movie:review-me", "Review Me", domain.FlowStateActive)
+
+	svc := app.NewService(store, nil, nil)
+	h := NewHarness(store, "", "")
+	h.SetDecisionService(svc)
+	threadID := "thread-review"
+
+	out, _, err := h.requestReview(context.Background(), threadID, "review me")
+	if err != nil {
+		t.Fatalf("request review: %v", err)
+	}
+	if !strings.Contains(out, `"status":"done"`) {
+		t.Fatalf("expected done status, got: %s", out)
+	}
+
+	flow := mustGetFlow(t, store, "target:movie:review-me")
+	if flow.State != domain.FlowStatePendingReview {
+		t.Fatalf("expected pending_review state, got %s", flow.State)
+	}
+}

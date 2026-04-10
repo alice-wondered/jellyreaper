@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -44,6 +45,9 @@ type Service struct {
 	jellyfinAPIKey  string
 	botUserID       string
 	mentionCallback MentionCallback
+
+	activeThreadsMu sync.RWMutex
+	activeThreads   map[string]struct{} // thread IDs the bot is monitoring
 }
 
 func NewService(botToken string, publicKey ed25519.PublicKey) (*Service, error) {
@@ -90,6 +94,27 @@ func (s *Service) CloseGateway() error {
 
 func (s *Service) SetMentionCallback(cb MentionCallback) {
 	s.mentionCallback = cb
+}
+
+// TrackThread marks a thread as actively monitored. Messages in active
+// threads are routed through the AI harness without requiring an @mention.
+func (s *Service) TrackThread(threadID string) {
+	if strings.TrimSpace(threadID) == "" {
+		return
+	}
+	s.activeThreadsMu.Lock()
+	defer s.activeThreadsMu.Unlock()
+	if s.activeThreads == nil {
+		s.activeThreads = map[string]struct{}{}
+	}
+	s.activeThreads[threadID] = struct{}{}
+}
+
+func (s *Service) isActiveThread(threadID string) bool {
+	s.activeThreadsMu.RLock()
+	defer s.activeThreadsMu.RUnlock()
+	_, ok := s.activeThreads[threadID]
+	return ok
 }
 
 func (s *Service) VerifyRequest(r *http.Request) bool {
@@ -299,7 +324,15 @@ func (s *Service) handleMentionMessage(session *discordgo.Session, msg *discordg
 			break
 		}
 	}
+
+	// Auto-respond in active threads without requiring @mention.
+	inActiveThread := false
 	if !mentioned {
+		if ch, chErr := session.Channel(msg.ChannelID); chErr == nil && ch != nil && isThreadChannel(ch) && s.isActiveThread(msg.ChannelID) {
+			inActiveThread = true
+		}
+	}
+	if !mentioned && !inActiveThread {
 		return
 	}
 
@@ -310,9 +343,22 @@ func (s *Service) handleMentionMessage(session *discordgo.Session, msg *discordg
 
 	replyChannel := msg.ChannelID
 	threadID := ""
+	parentChannelID := msg.ChannelID
 	if msg.Message != nil && msg.Message.Thread != nil && msg.Message.Thread.ID != "" {
 		replyChannel = msg.Message.Thread.ID
 		threadID = msg.Message.Thread.ID
+		if msg.Message.Thread.ParentID != "" {
+			parentChannelID = msg.Message.Thread.ParentID
+		}
+	} else if ch, chErr := session.Channel(msg.ChannelID); chErr == nil && ch != nil && isThreadChannel(ch) {
+		// Messages sent inside an existing thread have ChannelID set to
+		// the thread itself, but msg.Thread is nil. Detect this by
+		// looking up the channel type.
+		threadID = msg.ChannelID
+		replyChannel = msg.ChannelID
+		if ch.ParentID != "" {
+			parentChannelID = ch.ParentID
+		}
 	} else {
 		thread, err := session.MessageThreadStart(msg.ChannelID, msg.ID, "jellyreaper-ai", 60)
 		if err == nil && thread != nil && thread.ID != "" {
@@ -321,13 +367,18 @@ func (s *Service) handleMentionMessage(session *discordgo.Session, msg *discordg
 		}
 	}
 
+	// Start monitoring this thread for follow-up messages.
+	if threadID != "" {
+		s.TrackThread(threadID)
+	}
+
 	// Show "JellyReaper is typing..." immediately so the user knows we're
 	// working on it. Discord's typing indicator lasts ~10s; for long AI
 	// calls the harness will re-trigger it via the TypingFunc callback.
 	_ = session.ChannelTyping(replyChannel)
 
 	out, err := s.mentionCallback(context.Background(), MentionMessage{
-		ChannelID: msg.ChannelID,
+		ChannelID: parentChannelID,
 		ThreadID:  threadID,
 		MessageID: msg.ID,
 		AuthorID:  msg.Author.ID,
@@ -424,6 +475,15 @@ func (s *Service) LoadThreadHistory(ctx context.Context, threadID string, limit 
 	}
 
 	return lines, nil
+}
+
+func isThreadChannel(ch *discordgo.Channel) bool {
+	if ch == nil {
+		return false
+	}
+	return ch.Type == discordgo.ChannelTypeGuildPublicThread ||
+		ch.Type == discordgo.ChannelTypeGuildPrivateThread ||
+		ch.Type == discordgo.ChannelTypeGuildNewsThread
 }
 
 func isSnowflake(value string) bool {

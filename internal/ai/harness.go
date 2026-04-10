@@ -43,6 +43,7 @@ type DecisionService interface {
 	ApplyAIDecision(context.Context, string, string) error
 	ApplyAIDecisionBatch(context.Context, []string, string) error
 	ApplyAIDelayDays(context.Context, string, int) error
+	RequestImmediateReview(context.Context, string) error
 	SetGlobalReviewDays(context.Context, int) error
 	SetGlobalDeferDays(context.Context, int) error
 	SetGlobalHITLTimeoutHours(context.Context, int) error
@@ -196,7 +197,7 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 		"Only handle requests related to this media server and its review/archive workflow.",
 		storageSkill,
 		"Use tools to gather data and take actions.",
-		"Tool usage guide: list_ready for queue overviews and next-up questions; query_library for generalized counting/filtering across flows and indexed media; fuzzy_search_targets for discovery; query_target_state to inspect one target; remember_alias to bind user phrases to a target; archive_target for archive/unarchive intents; schedule_delete for deletion scheduling on one projection target; schedule_delete_many for show-level intents mapped to multiple season targets; delay_target_days to defer a target by an explicit number of days; choose_candidate when user provides a numbered option; confirm_pending for yes/no confirmations; set_review_days, set_defer_days, and set_hitl_timeout_hours for policy tuning.",
+		"Tool usage guide: list_ready for queue overviews and next-up questions; query_library for generalized counting/filtering across flows and indexed media; fuzzy_search_targets for discovery; query_target_state to inspect one target; remember_alias to bind user phrases to a target; archive_target for archive/unarchive intents; schedule_delete for deletion scheduling on one projection target; schedule_delete_many for show-level intents mapped to multiple season targets; delay_target_days to defer a target by an explicit number of days; request_review to immediately bump a target to the front of the review queue for human decision; choose_candidate when user provides a numbered option; confirm_pending for yes/no confirmations; set_review_days, set_defer_days, and set_hitl_timeout_hours for policy tuning.",
 		"Flow semantics: A flow is the schedulable review record. A projection is the user-facing target represented by the flow. For TV, one season flow maps many episode media items. Media items are index records used for context and counting, not direct operation targets.",
 		"Tool-calling playbook: (1) informational/count question -> query_library; (2) next-up/review queue question -> list_ready (limit=1 for singular next item); (3) find candidate titles -> fuzzy_search_targets then query_target_state for one target; (4) mutate flow state (archive/delete/delay/policy) only after target is resolved and confirmed when required.",
 		"Alias behavior: after resolving an ambiguous title or when user uses a shorthand phrase, call remember_alias to store that phrase for future turns. Prefer aliases first on follow-up requests.",
@@ -233,6 +234,7 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 		{Name: "archive_target", Description: "Start archive or unarchive flow for a target title.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "archived": map[string]any{"type": "boolean"}}, "required": []string{"archived"}}},
 		{Name: "choose_candidate", Description: "Choose one of the numbered candidates from the last disambiguation list.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"number": map[string]any{"type": "integer", "minimum": 1}}, "required": []string{"number"}}},
 		{Name: "confirm_pending", Description: "Confirm or cancel the pending archive/unarchive action.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"confirmed": map[string]any{"type": "boolean"}}, "required": []string{"confirmed"}}},
+		{Name: "request_review", Description: "Immediately schedule a target for human review, bumping it to the front of the HITL queue. Use when the user wants to review something right now.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"target_ref": map[string]any{"type": "string"}}}},
 		{Name: "set_review_days", Description: "Set policy review period in days for active flows.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"days": map[string]any{"type": "integer", "minimum": 1, "maximum": 3650}}, "required": []string{"days"}}},
 		{Name: "set_defer_days", Description: "Set default defer period in days.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"days": map[string]any{"type": "integer", "minimum": 1, "maximum": 365}}, "required": []string{"days"}}},
 		{Name: "set_hitl_timeout_hours", Description: "Set default HITL review timeout in hours before timeout action.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"hours": map[string]any{"type": "integer", "minimum": 1, "maximum": 8760}}, "required": []string{"hours"}}},
@@ -420,6 +422,12 @@ func (h *Harness) executeToolCall(ctx context.Context, threadID string, toolName
 			return h.handleFollowUp(ctx, threadID, "yes")
 		}
 		return h.handleFollowUp(ctx, threadID, "no")
+	case "request_review":
+		args, err := decodeToolArgs[toolRequestReviewArgs](rawArguments)
+		if err != nil {
+			return "", "", err
+		}
+		return h.requestReview(ctx, threadID, args.TargetRef)
 	case "set_review_days":
 		args, err := decodeToolArgs[toolSetReviewDaysArgs](rawArguments)
 		if err != nil {
@@ -497,6 +505,10 @@ type toolChooseCandidateArgs struct {
 
 type toolConfirmPendingArgs struct {
 	Confirmed bool `json:"confirmed"`
+}
+
+type toolRequestReviewArgs struct {
+	TargetRef string `json:"target_ref"`
 }
 
 type toolSetReviewDaysArgs struct {
@@ -597,6 +609,11 @@ func (h *Harness) queryLibrary(ctx context.Context, query string, scope string, 
 	movieFlowCount := 0
 	seasonFlowCount := 0
 	showNames := map[string]struct{}{}
+	// Query-filtered counts so the AI reports accurate numbers for
+	// scoped questions like "how many scooby doo movies".
+	matchedMovieFlowCount := 0
+	matchedSeasonFlowCount := 0
+	matchedShowNames := map[string]struct{}{}
 
 	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
 		flows, err := tx.ListFlows(ctx)
@@ -625,6 +642,15 @@ func (h *Harness) queryLibrary(ctx context.Context, query string, scope string, 
 				title := strings.ToLower(strings.TrimSpace(flow.DisplayName))
 				if query == "" || strings.Contains(title, query) {
 					flowTotal++
+					switch typeLower {
+					case "movie":
+						matchedMovieFlowCount++
+					case "season":
+						matchedSeasonFlowCount++
+						if name := h.seasonSeriesName(ctx, tx, flow); name != "" {
+							matchedShowNames[name] = struct{}{}
+						}
+					}
 					if len(flowResults) < limit {
 						flowResults = append(flowResults, flowToolPayloadInTx(flow, h.seasonSeriesName(ctx, tx, flow)))
 					}
@@ -678,6 +704,17 @@ func (h *Harness) queryLibrary(ctx context.Context, query string, scope string, 
 		return "", "", err
 	}
 
+	// When a query is provided, report query-filtered counts as the
+	// primary projection counts so the AI answers scoped questions
+	// accurately (e.g. "how many scooby doo movies" → 8, not 160).
+	reportedMovieCount := movieFlowCount
+	reportedSeasonCount := seasonFlowCount
+	reportedShowCount := len(showNames)
+	if query != "" {
+		reportedMovieCount = matchedMovieFlowCount
+		reportedSeasonCount = matchedSeasonFlowCount
+		reportedShowCount = len(matchedShowNames)
+	}
 	payload := map[string]any{
 		"status":                  "ok",
 		"scope":                   scope,
@@ -685,9 +722,14 @@ func (h *Harness) queryLibrary(ctx context.Context, query string, scope string, 
 		"subject_type":            subjectType,
 		"flow_total":              flowTotal,
 		"media_total":             mediaTotal,
-		"movie_projection_count":  movieFlowCount,
-		"season_projection_count": seasonFlowCount,
-		"tv_show_count":           len(showNames),
+		"movie_projection_count":  reportedMovieCount,
+		"season_projection_count": reportedSeasonCount,
+		"tv_show_count":           reportedShowCount,
+	}
+	if query != "" {
+		payload["total_movie_projection_count"] = movieFlowCount
+		payload["total_season_projection_count"] = seasonFlowCount
+		payload["total_tv_show_count"] = len(showNames)
 	}
 	if scope == "flows" || scope == "both" {
 		payload["flows"] = flowResults
@@ -778,6 +820,37 @@ func flowToolPayloadInTx(flow domain.Flow, seriesName string) map[string]any {
 		payload["series_name"] = strings.TrimSpace(seriesName)
 	}
 	return payload
+}
+
+func (h *Harness) requestReview(ctx context.Context, threadID string, targetRef string) (string, string, error) {
+	targetID, err := h.resolveTargetRef(ctx, threadID, targetRef)
+	if err != nil {
+		return "", "", err
+	}
+	if strings.TrimSpace(targetID) == "" {
+		return marshalToolResult(map[string]any{"status": "needs_target"}), "", nil
+	}
+	flow, found, err := h.getFlowByID(ctx, targetID)
+	if err != nil {
+		return "", "", err
+	}
+	if !found || !isProjectionSubjectType(flow.SubjectType) {
+		return marshalToolResult(map[string]any{"status": "needs_projection_target"}), "", nil
+	}
+	decision := h.getDecisionService()
+	if decision == nil {
+		return "", "", fmt.Errorf("decision service is not configured")
+	}
+	if err := decision.RequestImmediateReview(ctx, targetID); err != nil {
+		return "", "", err
+	}
+	state := h.getThreadState(threadID)
+	state.SelectedTargetID = targetID
+	h.rememberFlowAlias(&state, flow, "")
+	h.setThreadState(threadID, state)
+	// Re-fetch to get updated state.
+	flow, _, _ = h.getFlowByID(ctx, targetID)
+	return marshalToolResult(map[string]any{"status": "done", "action": "request_review", "target": h.flowToolPayload(ctx, flow)}), "", nil
 }
 
 func (h *Harness) setReviewDays(ctx context.Context, days int) (string, string, error) {

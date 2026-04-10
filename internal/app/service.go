@@ -194,6 +194,72 @@ func (s *Service) SetJellyfinClient(client *jellyfin.Client) {
 	s.providerIDsMu.Unlock()
 }
 
+// ReconcileStaleFlows scans for flows that are stuck and re-enqueues
+// the appropriate jobs. This catches:
+//   - pending_review flows with no active send_hitl_prompt job
+//   - active flows whose nextActionAt is in the past (missed evals)
+func (s *Service) ReconcileStaleFlows(ctx context.Context) (int, error) {
+	now := s.now().UTC()
+	reconciled := 0
+	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		flows, err := tx.ListFlows(ctx)
+		if err != nil {
+			return err
+		}
+		for _, flow := range flows {
+			switch flow.State {
+			case domain.FlowStatePendingReview:
+				// If pending_review but no Discord message has been sent,
+				// the prompt job was likely lost. Re-enqueue one.
+				if strings.TrimSpace(flow.Discord.MessageID) == "" {
+					promptPayload, err := json.Marshal(jobs.SendHITLPromptPayload{
+						ChannelID:   flow.Discord.ChannelID,
+						FlowVersion: flow.Version,
+					})
+					if err != nil {
+						return err
+					}
+					if err := tx.EnqueueJob(ctx, domain.JobRecord{
+						JobID:          "job:reconcile:prompt:" + flow.ItemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
+						FlowID:         flow.FlowID,
+						ItemID:         flow.ItemID,
+						Kind:           domain.JobKindSendHITLPrompt,
+						Status:         domain.JobStatusPending,
+						RunAt:          now,
+						MaxAttempts:    5,
+						IdempotencyKey: "reconcile:prompt:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version, 10),
+						PayloadJSON:    promptPayload,
+						CreatedAt:      now,
+						UpdatedAt:      now,
+					}); err != nil {
+						return err
+					}
+					reconciled++
+					s.logger.Info("reconciled stale pending_review flow", "lex", "RECONCILE", "item_id", flow.ItemID, "display_name", flow.DisplayName)
+				}
+			case domain.FlowStateActive:
+				// Active flows with nextActionAt in the past missed their
+				// evaluate_policy run. Schedule one now.
+				if !flow.NextActionAt.IsZero() && flow.NextActionAt.Before(now) {
+					if err := s.evalScheduler.RequestEval(ctx, tx, flow, now, now, "reconcile_stale", "reconcile:eval:"+flow.ItemID, flow.Version); err != nil {
+						return err
+					}
+					reconciled++
+					s.logger.Info("reconciled stale active flow", "lex", "RECONCILE", "item_id", flow.ItemID, "display_name", flow.DisplayName, "next_action_at", flow.NextActionAt)
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	if reconciled > 0 {
+		s.wake(now)
+	}
+	return reconciled, nil
+}
+
 func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.WebhookEvent) error {
 	s.enrichProviderIDsFromJellyfin(ctx, &event)
 
@@ -1086,6 +1152,94 @@ func (s *Service) ApplyAIDelayDays(ctx context.Context, itemID string, days int)
 		if err := s.discord.FinalizeHITLPrompt(ctx, finalizeChannelID, finalizeMessageID, content); err != nil {
 			s.logger.Warn("failed to finalize ai delay HITL message", "item_id", itemID, "error", err)
 		}
+	}
+	s.wake(now)
+	return nil
+}
+
+// RequestImmediateReview moves a flow to pending_review and enqueues a
+// send_hitl_prompt job so a human can act on it right away.
+func (s *Service) RequestImmediateReview(ctx context.Context, itemID string) error {
+	itemID = strings.TrimSpace(itemID)
+	if itemID == "" {
+		return fmt.Errorf("item id is required")
+	}
+	now := s.now().UTC()
+	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(ctx, itemID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("flow not found for item %s", itemID)
+		}
+		if flow.State == domain.FlowStatePendingReview {
+			// Already pending — just ensure a prompt job exists.
+			promptPayload, err := json.Marshal(jobs.SendHITLPromptPayload{
+				ChannelID:   flow.Discord.ChannelID,
+				FlowVersion: flow.Version,
+			})
+			if err != nil {
+				return err
+			}
+			return tx.EnqueueJob(ctx, domain.JobRecord{
+				JobID:          "job:prompt:" + itemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
+				FlowID:         flow.FlowID,
+				ItemID:         flow.ItemID,
+				Kind:           domain.JobKindSendHITLPrompt,
+				Status:         domain.JobStatusPending,
+				RunAt:          now,
+				MaxAttempts:    5,
+				IdempotencyKey: "job:prompt:review:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version, 10),
+				PayloadJSON:    promptPayload,
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			})
+		}
+		expected := flow.Version
+		flow.State = domain.FlowStatePendingReview
+		flow.HITLOutcome = ""
+		flow.DecisionDeadlineAt = time.Time{}
+		flow.NextActionAt = now
+		flow.UpdatedAt = now
+		flow.Version = expected + 1
+		if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+			return err
+		}
+		promptPayload, err := json.Marshal(jobs.SendHITLPromptPayload{
+			ChannelID:   flow.Discord.ChannelID,
+			FlowVersion: flow.Version,
+		})
+		if err != nil {
+			return err
+		}
+		if err := tx.EnqueueJob(ctx, domain.JobRecord{
+			JobID:          "job:prompt:" + itemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
+			FlowID:         flow.FlowID,
+			ItemID:         flow.ItemID,
+			Kind:           domain.JobKindSendHITLPrompt,
+			Status:         domain.JobStatusPending,
+			RunAt:          now,
+			MaxAttempts:    5,
+			IdempotencyKey: "job:prompt:review:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version, 10),
+			PayloadJSON:    promptPayload,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}); err != nil {
+			return err
+		}
+		return tx.AppendEvent(ctx, domain.Event{
+			EventID:        "evt:ai:review:" + shortHash(itemID+":"+strconv.FormatInt(now.UnixNano(), 10)),
+			FlowID:         flow.FlowID,
+			ItemID:         flow.ItemID,
+			Type:           "ai.request_review",
+			Source:         "ai",
+			OccurredAt:     now,
+			IdempotencyKey: "ai:review:" + itemID + ":" + strconv.FormatInt(flow.Version, 10),
+		})
+	})
+	if err != nil {
+		return err
 	}
 	s.wake(now)
 	return nil
