@@ -37,10 +37,12 @@ func NewEvaluatePolicyHandler(repository repo.Repository, logger *slog.Logger) *
 	if logger == nil {
 		logger = slog.Default()
 	}
+	eval := scheduler.NewScheduler(nil, nil)
 	return &EvaluatePolicyHandler{
 		repository:        repository,
 		logger:            logger,
-		evalScheduler:     scheduler.NewScheduler(nil, nil),
+		evalScheduler:     eval,
+		flowManager:       scheduler.NewFlowManager(repository, eval, logger),
 		defaultExpireDays: 30,
 		defaultHITLHours:  48,
 	}

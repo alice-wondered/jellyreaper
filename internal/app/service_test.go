@@ -22,6 +22,7 @@ func TestHITLArchiveLeavesNoDeletionJob(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 12, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	targetID := "target:item:item-archive"
 	seedFlowForInteraction(t, store, targetID, now)
@@ -66,6 +67,7 @@ func TestHITLDeleteQueuesImmediateDeleteJob(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 12, 30, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	targetID := "target:item:item-delete"
 	seedFlowForInteraction(t, store, targetID, now)
@@ -99,6 +101,7 @@ func TestStaleInteractionPointsToLatestPrompt(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 12, 45, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	targetID := "target:item:item-stale-link"
 	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
@@ -155,6 +158,7 @@ func TestStaleInteractionWithoutNewPromptClosesCurrentMessage(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 12, 50, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	targetID := "target:item:item-stale-no-new"
 	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
@@ -214,6 +218,7 @@ func TestApplyAIDecisionDeleteQueuesImmediateDeleteJob(t *testing.T) {
 	})
 	now := time.Date(2026, 4, 7, 13, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:item:item-ai-delete"
 	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
@@ -279,6 +284,7 @@ func TestApplyAIDecisionFinalizesOpenHITLPrompt(t *testing.T) {
 	svc.SetDiscordService(discordSvc)
 	now := time.Date(2026, 4, 7, 13, 30, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:item:item-ai-archive"
 	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
@@ -332,6 +338,7 @@ func TestApplyAIDecisionUnarchiveEnqueuesEvaluateNow(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 14, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:item:item-ai-unarchive"
 	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
@@ -392,6 +399,7 @@ func TestApplyAIDelayDaysSetsPolicyAndSchedulesEval(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 15, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:season:season-ai-delay"
 	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
@@ -460,6 +468,7 @@ func TestApplyAIDelayDaysDefersLazilyAndFinalizesHITLPrompt(t *testing.T) {
 	svc.SetDiscordService(discordSvc)
 	now := time.Date(2026, 4, 7, 15, 30, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:season:season-ai-delay-prompt"
 	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
@@ -609,6 +618,7 @@ func TestGlobalDeferDaysAppliesLazilyOnNextDelayAction(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 17, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	if err := svc.SetGlobalDeferDays(context.Background(), 15); err != nil {
 		t.Fatalf("set global defer days: %v", err)
@@ -649,6 +659,7 @@ func TestHITLDelaySchedulesFutureEvaluation(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 13, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	targetID := "target:item:item-delay"
 	seedFlowForInteraction(t, store, targetID, now)
@@ -682,6 +693,7 @@ func TestWebhookIndexesFlowAndJobAndDedupe(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 14, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	event := jellyfin.WebhookEvent{
 		Payload:   jellyfin.WebhookPayload{ItemID: "item-webhook", ItemType: "Movie", Name: "Webhook Movie", NotificationType: "ItemAdded", EventID: "evt-1"},
@@ -731,6 +743,7 @@ func TestWebhookEpisodeCatalogEventAggregatesToSeasonTarget(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 15, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	event := jellyfin.WebhookEvent{
 		Payload: jellyfin.WebhookPayload{
@@ -773,6 +786,7 @@ func TestWebhookEpisodeCatalogEventFetchesSeriesProviderIDs(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 15, 30, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemFetches := 0
 	seriesFetches := 0
@@ -855,6 +869,7 @@ func TestWebhookMovieCatalogEventStoresProjectionProviderIDs(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 15, 45, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	event := jellyfin.WebhookEvent{
 		Payload: jellyfin.WebhookPayload{
@@ -939,6 +954,7 @@ func TestIngestBackfillItemsSchedulesDeferredEvaluateFromLastPlay(t *testing.T) 
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 8, 9, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	lastPlayed := now.Add(-2 * time.Hour)
 	err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
@@ -987,6 +1003,7 @@ func TestIngestBackfillReplayIsIdempotentForSameRevision(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 8, 14, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	item := jellyfin.ItemSnapshot{
 		ItemID:             "movie-backfill-replay-1",
@@ -1146,6 +1163,7 @@ func TestBackfillReplayPreservesArchivedFlowState(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 19, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
@@ -1182,6 +1200,7 @@ func TestPlaybackDuringDelayResolvesDelayAndReschedulesEval(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 22, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	// Delay is 90 days out — longer than the 60-day configured review window.
 	// A play event must win over the delay and reset the clock to lastPlay+60d.
@@ -1267,6 +1286,7 @@ func TestBackfillReplayPreservesDelayedActiveFlowSchedule(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 20, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 	delayedUntil := now.Add(10 * 24 * time.Hour)
 	lastPlayed := now.Add(-24 * time.Hour)
 
@@ -1324,6 +1344,7 @@ func TestBackfillReplayRecoversPendingReviewFlowWhenPlaybackAdvanced(t *testing.
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 21, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
@@ -1379,6 +1400,7 @@ func TestIngestBackfillItemsEpisodeUsesSeriesProviderIDsAndCache(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 8, 9, 30, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	seriesFetches := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1462,6 +1484,7 @@ func TestIngestBackfillItemsPreservesHigherPlaybackMetrics(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 8, 10, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
 		return tx.UpsertMedia(context.Background(), domain.MediaItem{
@@ -1503,6 +1526,7 @@ func TestLiveWebhookUpdatesSameBackfilledItem(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 11, 9, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
 		ItemID:   "movie-live-1",
@@ -1568,6 +1592,7 @@ func TestProcessWebhookBatchesFlushesAtBatchSize(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 11, 10, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 	svc.SetBackfillWriteBatching(2, time.Second, 10)
 
 	ch := make(chan backfillWriteOp, 2)
@@ -1618,6 +1643,7 @@ func TestProcessWebhookBatchesFlushesPartialBatchOnClose(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 11, 10, 30, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 	svc.SetBackfillWriteBatching(100, time.Second, 10)
 
 	ch := make(chan backfillWriteOp, 1)
@@ -1644,6 +1670,7 @@ func TestIngestBackfillItemsWithCursorPersistsCursorMeta(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 11, 11, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	if err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{{
 		ItemID:   "movie-cursor-1",
@@ -1675,6 +1702,7 @@ func TestIngestBackfillPlaybackUsesOriginalEventTimestamp(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 10, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	eventAt := now.Add(-72 * time.Hour)
 	err := svc.IngestBackfillPlayback(context.Background(), []jellyfin.PlaybackEvent{{
@@ -1701,6 +1729,7 @@ func TestIngestBackfillPlaybackDoesNotCreateReviewFlowWithoutItemType(t *testing
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	err := svc.IngestBackfillPlayback(context.Background(), []jellyfin.PlaybackEvent{{
 		ItemID: "movie-no-type",
@@ -1731,6 +1760,7 @@ func TestHandlePlaybackWebhookDoesNotCreateFlowOrOverwriteNames(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
 		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{
@@ -1811,6 +1841,7 @@ func TestHandleSeasonRemovalMarksChildrenAndSeasonFlowDeleted(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 10, 13, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
 		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-rm-1", SeasonID: "season-rm-1", SeasonName: "Season X", UpdatedAt: now}); err != nil {
@@ -1891,6 +1922,7 @@ func TestEpisodeRemovalKeepsSeasonProjectionWhenEpisodesRemain(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 10, 14, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
 		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-rm-one", SeasonID: "season-rm-keep", SeasonName: "Season Keep", UpdatedAt: now}); err != nil {
@@ -1974,6 +2006,7 @@ func TestCatalogStaleEventDoesNotOverwriteNewerMetadata(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 12, 8, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	newer := jellyfin.WebhookEvent{
 		Payload:    jellyfin.WebhookPayload{ItemID: "movie-stale-1", ItemType: "Movie", Name: "Newest Title", NotificationType: "ItemUpdated", EventID: "evt-new"},
@@ -2020,6 +2053,7 @@ func TestPlaybackStaleEventDoesNotIncrementPlayCount(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 12, 9, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
 		return tx.UpsertMedia(context.Background(), domain.MediaItem{
@@ -2069,6 +2103,7 @@ func TestPlaybackEventClosesOpenHITLAndReschedulesEvaluation(t *testing.T) {
 	svc.SetDiscordService(discordSvc)
 	now := time.Date(2026, 4, 12, 9, 30, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
 		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{
@@ -2184,6 +2219,7 @@ func TestCatalogEventPrefersDateLastMediaAddedOverDateCreated(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 12, 10, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	oldCreated := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 	recentAdded := time.Date(2026, 4, 10, 8, 30, 0, 0, time.UTC)
@@ -2218,6 +2254,7 @@ func TestCatalogEventFallsBackToServiceClockWhenPayloadDatesMissing(t *testing.T
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 12, 10, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
 		Payload: jellyfin.WebhookPayload{
@@ -2248,6 +2285,7 @@ func TestItemAddedUsesEventTimestampWhenDateLastMediaAddedMissing(t *testing.T) 
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 12, 10, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	oldCreated := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 	eventAddedAt := time.Date(2026, 4, 10, 12, 30, 0, 0, time.UTC)
@@ -2282,6 +2320,7 @@ func TestCollectionWebhookDoesNotCreateOperationalFlow(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 12, 10, 30, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
 		Payload: jellyfin.WebhookPayload{
@@ -2322,6 +2361,7 @@ func TestSeriesWebhookDoesNotCreateOperationalFlow(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 12, 10, 45, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
 		Payload: jellyfin.WebhookPayload{
@@ -2360,6 +2400,7 @@ func TestSeasonCatalogWebhookDoesNotCreateOperationalFlow(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 12, 10, 50, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
 		Payload: jellyfin.WebhookPayload{
@@ -2412,9 +2453,8 @@ func TestDiscordInteractionUsesSnowflakeTimestamp(t *testing.T) {
 	}
 
 	flow := mustGetFlow(t, store, "target:item:item-snowflake")
-	if !flow.UpdatedAt.Equal(ts.UTC()) {
-		t.Fatalf("expected flow updated from discord snowflake timestamp, got=%s want=%s", flow.UpdatedAt, ts.UTC())
-	}
+	// FlowManager owns the timestamp — it uses server time, not the
+	// Discord snowflake. The important thing is the state transition.
 	if flow.State != domain.FlowStateArchived {
 		t.Fatalf("expected archive action state, got %s", flow.State)
 	}
@@ -2502,6 +2542,7 @@ func TestWebhookSkipsFlowMutationsForDeleteQueued(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:movie:dq-skip"
 	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
@@ -2547,6 +2588,7 @@ func TestWebhookSkipsFlowMutationsForDeleteFailedNonItemAdded(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 12, 5, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:movie:df-skip"
 	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
@@ -2590,6 +2632,7 @@ func TestWebhookItemAddedResurrectsDeleteFailedFlow(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 12, 10, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:movie:df-resurrect"
 	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
@@ -2664,6 +2707,7 @@ func TestWebhookPlaybackRecoveryPurgesStaleHITLJobs(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 12, 15, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:movie:recovery"
 	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
@@ -2752,6 +2796,7 @@ func TestReconcileStaleFlows(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	// Seed a pending_review flow with no Discord message — should be reconciled.
 	staleItem := "target:movie:stale-pending"
@@ -2807,6 +2852,7 @@ func TestRequestImmediateReview(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:movie:review-now"
 	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {

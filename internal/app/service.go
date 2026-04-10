@@ -123,6 +123,15 @@ func (s *Service) SetEvalScheduler(es scheduler.EvalRequester) {
 	if es != nil {
 		s.evalScheduler = es
 		s.flowManager = scheduler.NewFlowManager(s.repository, es, s.logger)
+		s.flowManager.SetNowFunc(s.now)
+	}
+}
+
+// SyncFlowManagerClock propagates the service's clock to the flow
+// manager. Call after overriding `svc.now` in tests.
+func (s *Service) SyncFlowManagerClock() {
+	if s.flowManager != nil {
+		s.flowManager.SetNowFunc(s.now)
 	}
 }
 
@@ -323,9 +332,7 @@ func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.Webh
 }
 
 type pendingPlayedRecovery struct {
-	itemID    string
-	nextEval  time.Time
-	dedupeKey string
+	itemID string
 }
 
 func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.WebhookEvent, now time.Time) (string, []targetRef, []hitlFinalizeRequest, error) {
@@ -350,7 +357,6 @@ func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.Web
 	// FlowManager owns its own tx for each transition.
 	for _, pr := range playedRecoveries {
 		result, playErr := s.flowManager.Played(ctx, pr.itemID, scheduler.PlayedRequest{
-			NextEvalAt: pr.nextEval,
 			TransitionSource: scheduler.TransitionSource{
 				Source: "jellyfin",
 				Reason: "playback_recovered",
@@ -753,25 +759,11 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		}
 
 		if (playbackEvent || (catalogPlaybackAdvanced && flow.State == domain.FlowStatePendingReview)) && flow.State == domain.FlowStatePendingReview {
-			runAt := now
-			if playAt, known, err := mostRecentPlayForTarget(ctx, tx, flow); err != nil {
-				return err
-			} else if known {
-				expireDays := flow.PolicySnapshot.ExpireAfterDays
-				if expireDays <= 0 {
-					expireDays = defaultReviewDays
-				}
-				dueAt := playAt.Add(time.Duration(expireDays) * 24 * time.Hour)
-				if dueAt.After(runAt) {
-					runAt = dueAt
-				}
-			}
 			// Collect for post-tx playback recovery via FlowManager.
+			// FlowManager computes nextEvalAt from media history internally.
 			if pendingPlayed != nil {
 				*pendingPlayed = append(*pendingPlayed, pendingPlayedRecovery{
-					itemID:    target.Canonical,
-					nextEval:  runAt,
-					dedupeKey: dedupeKey,
+					itemID: target.Canonical,
 				})
 			}
 			continue
@@ -1194,6 +1186,7 @@ func (s *Service) processWebhookBatches(ctx context.Context, ops <-chan backfill
 	}
 
 	batch := make([]backfillWriteOp, 0, batchSize)
+	playedRecoveries := make([]pendingPlayedRecovery, 0)
 	timer := time.NewTimer(flushTimeout)
 	defer timer.Stop()
 
@@ -1231,7 +1224,7 @@ func (s *Service) processWebhookBatches(ctx context.Context, ops <-chan backfill
 					event.ItemID,
 					deriveTargets(event),
 					nil,
-					nil,
+					&playedRecoveries,
 				); err != nil {
 					return err
 				}
@@ -1240,6 +1233,15 @@ func (s *Service) processWebhookBatches(ctx context.Context, ops <-chan backfill
 		}); err != nil {
 			return err
 		}
+		// Execute pending playback recoveries outside the backfill tx.
+		for _, pr := range playedRecoveries {
+			if _, playErr := s.flowManager.Played(ctx, pr.itemID, scheduler.PlayedRequest{
+				TransitionSource: scheduler.TransitionSource{Source: "jellyfin", Reason: "backfill_playback_recovered"},
+			}); playErr != nil {
+				s.logger.Warn("backfill playback recovery failed", "item_id", pr.itemID, "error", playErr)
+			}
+		}
+		playedRecoveries = playedRecoveries[:0]
 		s.logger.InfoContext(ctx, "flushed backfill write batch", "lex", "BACKFILL-WRITE", "source", source, "batch_size", len(batch))
 		batch = batch[:0]
 		return nil
