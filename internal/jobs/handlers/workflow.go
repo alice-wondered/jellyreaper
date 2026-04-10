@@ -575,35 +575,25 @@ func (h *SendHITLPromptHandler) OnTerminalFailure(ctx context.Context, job domai
 }
 
 type HITLTimeoutHandler struct {
-	repository    repo.Repository
-	discord       *discord.Service
-	logger        *slog.Logger
-	evalScheduler scheduler.EvalRequester
+	repository repo.Repository
+	discord    *discord.Service
+	logger     *slog.Logger
 }
 
 func NewHITLTimeoutHandler(repository repo.Repository, discordSvc *discord.Service, logger *slog.Logger) *HITLTimeoutHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &HITLTimeoutHandler{
-		repository:    repository,
-		discord:       discordSvc,
-		logger:        logger,
-		evalScheduler: scheduler.NewScheduler(nil, nil),
-	}
-}
-
-func (h *HITLTimeoutHandler) SetEvalScheduler(s scheduler.EvalRequester) {
-	h.evalScheduler = s
+	return &HITLTimeoutHandler{repository: repository, discord: discordSvc, logger: logger}
 }
 
 func (h *HITLTimeoutHandler) Kind() domain.JobKind { return domain.JobKindHITLTimeout }
 
-// OnTerminalFailure rolls the flow back from pending_review to active
-// and re-schedules the singleton eval so the timeout cycle retries.
-// The HITL prompt message (if any) is left in Discord — when the eval
-// re-enters pending_review the prompt handler will detect the stale
-// message and re-send.
+// OnTerminalFailure re-enqueues a fresh timeout job so the default
+// action (delete) is re-attempted. The flow stays in pending_review —
+// the human already missed their window, so re-entering the
+// eval→prompt cycle would be wrong. We just need another shot at
+// applying the timeout action.
 func (h *HITLTimeoutHandler) OnTerminalFailure(ctx context.Context, job domain.JobRecord) error {
 	now := time.Now().UTC()
 	retryAfter := now.Add(10 * time.Minute)
@@ -618,18 +608,28 @@ func (h *HITLTimeoutHandler) OnTerminalFailure(ctx context.Context, job domain.J
 		if flow.State != domain.FlowStatePendingReview {
 			return nil
 		}
-		expected := flow.Version
-		flow.State = domain.FlowStateActive
-		flow.HITLOutcome = ""
-		flow.DecisionDeadlineAt = time.Time{}
-		flow.NextActionAt = retryAfter
-		flow.UpdatedAt = now
-		flow.Version = expected + 1
-		if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+
+		timeoutPayload, err := json.Marshal(jobs.HITLTimeoutPayload{
+			DefaultAction: "delete",
+			FlowVersion:   flow.Version,
+		})
+		if err != nil {
 			return err
 		}
-		h.logger.Info("hitl timeout terminal failure: rolled flow back to active", "lex", "HITL-TIMEOUT", "item_id", job.ItemID, "retry_at", retryAfter)
-		return h.evalScheduler.RequestEval(ctx, tx, flow, now, retryAfter, "hitl_timeout_recovery", "eval:recovery:"+flow.ItemID, flow.Version)
+		h.logger.Info("hitl timeout terminal failure: re-scheduling timeout", "lex", "HITL-TIMEOUT", "item_id", job.ItemID, "retry_at", retryAfter)
+		return tx.EnqueueJob(ctx, domain.JobRecord{
+			JobID:          "job:timeout:recovery:" + job.ItemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
+			FlowID:         flow.FlowID,
+			ItemID:         flow.ItemID,
+			Kind:           domain.JobKindHITLTimeout,
+			Status:         domain.JobStatusPending,
+			RunAt:          retryAfter,
+			MaxAttempts:    5,
+			IdempotencyKey: "timeout:recovery:" + flow.ItemID + ":" + strconv.FormatInt(now.Unix()/(10*60), 10),
+			PayloadJSON:    timeoutPayload,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		})
 	})
 }
 
