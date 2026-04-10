@@ -138,13 +138,18 @@ go run ./cmd/jellyreaper
    - `Read Message History`
 7. If using AI @mentions, enable **Message Content Intent** in Discord Developer Portal.
    - If disabled, Discord gateway may close with `4014 Disallowed intent(s)`.
-   - JellyReaper only opens the gateway when AI mentions are enabled (`OPENAI_API_KEY` set).
+- JellyReaper only opens the gateway when AI mentions are enabled (`AI_MODEL` + `AI_API_KEY` or `AI_BASE_URL` set).
 
 ### Enabling AI Assistant
 
 Set:
-- `OPENAI_API_KEY`
-- optional `OPENAI_MODEL` (default `gpt-5-mini`)
+- `AI_PROVIDER` (default `openai_compatible`)
+- `AI_MODEL` (default `gpt-5-mini`)
+- `AI_API_KEY` (for hosted providers)
+- `AI_BASE_URL` (for local/self-hosted OpenAI-compatible endpoints like Ollama)
+
+Backwards compatibility:
+- `OPENAI_API_KEY` and `OPENAI_MODEL` are still accepted as fallbacks.
 
 Behavior:
 - Responds to @mentions in Discord threads.
@@ -172,8 +177,10 @@ Behavior:
 | `DISCORD_PUBLIC_KEY_HEX` | yes | - | verifies Discord interaction signatures |
 | `DISCORD_BOT_TOKEN` | yes (for sending messages) | - | bot token for prompt sends; gateway used only for AI mentions |
 | `DISCORD_CHANNEL_ID` | yes (recommended) | - | fallback channel for HITL prompt delivery |
-| `OPENAI_API_KEY` | no | - | enables Discord @mention AI assistant |
-| `OPENAI_MODEL` | no | `gpt-5-mini` | OpenAI model for assistant |
+| `AI_PROVIDER` | no | `openai_compatible` | AI backend adapter |
+| `AI_MODEL` | no | `gpt-5-mini` | model name passed to provider |
+| `AI_API_KEY` | no | - | API key for hosted endpoints |
+| `AI_BASE_URL` | no | - | OpenAI-compatible base URL (e.g., Ollama `/v1`) |
 
 ### Jellyfin
 
