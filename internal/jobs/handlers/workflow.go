@@ -28,6 +28,7 @@ type EvaluatePolicyHandler struct {
 	repository        repo.Repository
 	logger            *slog.Logger
 	evalScheduler     scheduler.EvalRequester
+	flowManager       *scheduler.FlowManager
 	defaultExpireDays int
 	defaultHITLHours  int
 }
@@ -47,6 +48,7 @@ func NewEvaluatePolicyHandler(repository repo.Repository, logger *slog.Logger) *
 
 func (h *EvaluatePolicyHandler) SetEvalScheduler(s scheduler.EvalRequester) {
 	h.evalScheduler = s
+	h.flowManager = scheduler.NewFlowManager(s, h.logger)
 }
 
 func (h *EvaluatePolicyHandler) SetDefaultExpireDays(days int) {
@@ -183,45 +185,11 @@ func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord
 			}
 		}
 
-		expected := flow.Version
-		flow.State = domain.FlowStatePendingReview
-		// Clear any prior cycle's outcome so the fresh PendingReview phase
-		// starts unpoisoned. The previous outcome (e.g. "played", "delay")
-		// belonged to a cycle that has now closed.
-		flow.HITLOutcome = ""
-		flow.DecisionDeadlineAt = time.Time{}
-		flow.UpdatedAt = now
-		flow.Version = expected + 1
-		if flow.CreatedAt.IsZero() {
-			flow.CreatedAt = now
-		}
-		if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+		if _, err := h.flowManager.RequestReview(ctx, tx, &flow, now); err != nil {
 			return err
-		}
-
-		promptPayload, err := json.Marshal(jobs.SendHITLPromptPayload{
-			ChannelID:   flow.Discord.ChannelID,
-			FlowVersion: flow.Version,
-		})
-		if err != nil {
-			return err
-		}
-
-		promptJob := domain.JobRecord{
-			JobID:          "job:prompt:" + job.ItemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
-			FlowID:         flow.FlowID,
-			ItemID:         flow.ItemID,
-			Kind:           domain.JobKindSendHITLPrompt,
-			Status:         domain.JobStatusPending,
-			RunAt:          now,
-			MaxAttempts:    5,
-			IdempotencyKey: "job:prompt:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version, 10),
-			PayloadJSON:    promptPayload,
-			CreatedAt:      now,
-			UpdatedAt:      now,
 		}
 		h.logger.Info("policy evaluation queued hitl", "lex", "POLICY-EVAL", "item_id", job.ItemID, "reason", "stale_due", "flow_state", flow.State, "flow_version", flow.Version)
-		return tx.EnqueueJob(ctx, promptJob)
+		return nil
 	})
 }
 
@@ -301,6 +269,7 @@ type SendHITLPromptHandler struct {
 	defaultChannelID string
 	hitlTimeout      time.Duration
 	evalScheduler    scheduler.EvalRequester
+	flowManager      *scheduler.FlowManager
 }
 
 func NewSendHITLPromptHandler(repository repo.Repository, logger *slog.Logger, discord *discord.Service, defaultChannelID string, hitlTimeout time.Duration) *SendHITLPromptHandler {
@@ -322,6 +291,7 @@ func NewSendHITLPromptHandler(repository repo.Repository, logger *slog.Logger, d
 
 func (h *SendHITLPromptHandler) SetEvalScheduler(s scheduler.EvalRequester) {
 	h.evalScheduler = s
+	h.flowManager = scheduler.NewFlowManager(s, h.logger)
 }
 
 func (h *SendHITLPromptHandler) Kind() domain.JobKind { return domain.JobKindSendHITLPrompt }
@@ -553,38 +523,38 @@ func (h *SendHITLPromptHandler) OnTerminalFailure(ctx context.Context, job domai
 		if err != nil {
 			return err
 		}
-		if !found {
+		if !found || flow.State != domain.FlowStatePendingReview {
 			return nil
 		}
-		if flow.State != domain.FlowStatePendingReview {
-			return nil
-		}
-		expected := flow.Version
-		flow.State = domain.FlowStateActive
-		flow.HITLOutcome = ""
-		flow.DecisionDeadlineAt = time.Time{}
-		flow.NextActionAt = retryAfter
-		flow.UpdatedAt = now
-		flow.Version = expected + 1
-		if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+		if _, err := h.flowManager.RollbackToActive(ctx, tx, &flow, now, retryAfter, "hitl_prompt_recovery"); err != nil {
 			return err
 		}
 		h.logger.Info("hitl prompt terminal failure: rolled flow back to active", "lex", "HITL-PROMPT", "item_id", job.ItemID, "retry_at", retryAfter)
-		return h.evalScheduler.RequestEval(ctx, tx, flow, now, retryAfter, "hitl_prompt_recovery", "eval:recovery:"+flow.ItemID, flow.Version)
+		return nil
 	})
 }
 
 type HITLTimeoutHandler struct {
-	repository repo.Repository
-	discord    *discord.Service
-	logger     *slog.Logger
+	repository  repo.Repository
+	discord     *discord.Service
+	logger      *slog.Logger
+	flowManager *scheduler.FlowManager
 }
 
 func NewHITLTimeoutHandler(repository repo.Repository, discordSvc *discord.Service, logger *slog.Logger) *HITLTimeoutHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &HITLTimeoutHandler{repository: repository, discord: discordSvc, logger: logger}
+	return &HITLTimeoutHandler{
+		repository:  repository,
+		discord:     discordSvc,
+		logger:      logger,
+		flowManager: scheduler.NewFlowManager(nil, logger),
+	}
+}
+
+func (h *HITLTimeoutHandler) SetFlowManager(fm *scheduler.FlowManager) {
+	h.flowManager = fm
 }
 
 func (h *HITLTimeoutHandler) Kind() domain.JobKind { return domain.JobKindHITLTimeout }
@@ -701,39 +671,16 @@ func (h *HITLTimeoutHandler) Handle(ctx context.Context, job domain.JobRecord) e
 			})
 		}
 
-		expected := flow.Version
-		flow.State = domain.FlowStateDeleteQueued
-		flow.NextActionAt = now
-		flow.HITLOutcome = "delete"
-		flow.UpdatedAt = now
-		flow.Version = expected + 1
-		if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
-			return err
-		}
-
-		finalizeChannelID = flow.Discord.ChannelID
-		finalizeMessageID = flow.Discord.MessageID
-		finalizeDisplayName = flow.DisplayName
-
-		// Delete jobs intentionally carry no FlowVersion — destruction is
-		// authoritative.
-		deletePayload, err := json.Marshal(jobs.ExecuteDeletePayload{RequestedBy: "timeout"})
+		txResult, err := h.flowManager.Delete(ctx, tx, &flow, now, "timeout")
 		if err != nil {
 			return err
 		}
-		return tx.EnqueueJob(ctx, domain.JobRecord{
-			JobID:          "job:delete:" + job.ItemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
-			FlowID:         flow.FlowID,
-			ItemID:         flow.ItemID,
-			Kind:           domain.JobKindExecuteDelete,
-			Status:         domain.JobStatusPending,
-			RunAt:          now,
-			MaxAttempts:    5,
-			IdempotencyKey: "job:delete:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version, 10),
-			PayloadJSON:    deletePayload,
-			CreatedAt:      now,
-			UpdatedAt:      now,
-		})
+		if txResult != nil && txResult.FinalizePrompt != nil {
+			finalizeChannelID = txResult.FinalizePrompt.ChannelID
+			finalizeMessageID = txResult.FinalizePrompt.MessageID
+			finalizeDisplayName = flow.DisplayName
+		}
+		return nil
 	})
 	if err != nil {
 		return err
