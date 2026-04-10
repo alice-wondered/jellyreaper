@@ -98,8 +98,18 @@ func main() {
 	discordService.SetEmbedPersistenceDir(cfg.EmbedDir)
 	discordService.SetJellyfinImageSource(cfg.JellyfinURL, cfg.JellyfinAPIKey)
 	var assistant *ai.Harness
-	if strings.TrimSpace(cfg.OpenAIAPIKey) != "" {
-		assistant = ai.NewHarness(store, cfg.OpenAIAPIKey, cfg.OpenAIModel)
+	aiConfigured := strings.TrimSpace(cfg.AIModel) != "" && (strings.TrimSpace(cfg.AIAPIKey) != "" || strings.TrimSpace(cfg.AIBaseURL) != "")
+	if aiConfigured {
+		provider, err := ai.NewProvider(ai.ProviderConfig{
+			Provider: cfg.AIProvider,
+			APIKey:   cfg.AIAPIKey,
+			BaseURL:  cfg.AIBaseURL,
+		})
+		if err != nil {
+			logger.Error("create ai provider", "error", err, "provider", cfg.AIProvider)
+			os.Exit(1)
+		}
+		assistant = ai.NewHarnessWithProvider(store, provider, cfg.AIModel)
 		assistant.SetHistoryRestorer(func(ctx context.Context, threadID string, limit int) ([]string, error) {
 			return discordService.LoadThreadHistory(ctx, threadID, limit)
 		})
@@ -110,7 +120,7 @@ func main() {
 			}
 			return assistant.HandleMention(ctx, thread, mention.Author, mention.Content)
 		})
-		logger.Info("ai mention assistant enabled", "model", cfg.OpenAIModel)
+		logger.Info("ai mention assistant enabled", "provider", cfg.AIProvider, "model", cfg.AIModel)
 	}
 	if assistant != nil {
 		if err := discordService.OpenGateway(); err != nil {

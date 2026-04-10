@@ -12,11 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/openai/openai-go"
-	"github.com/openai/openai-go/option"
-	"github.com/openai/openai-go/responses"
-	"github.com/openai/openai-go/shared"
-
 	"jellyreaper/internal/domain"
 	"jellyreaper/internal/repo"
 )
@@ -30,7 +25,7 @@ const (
 
 type Harness struct {
 	repository repo.Repository
-	client     openai.Client
+	provider   ChatProvider
 	model      string
 	logger     *slog.Logger
 	decision   DecisionService
@@ -103,12 +98,20 @@ type intent struct {
 }
 
 func NewHarness(repository repo.Repository, apiKey string, model string) *Harness {
+	provider, _ := NewProvider(ProviderConfig{Provider: ProviderOpenAICompatible, APIKey: apiKey})
+	return NewHarnessWithProvider(repository, provider, model)
+}
+
+func NewHarnessWithProvider(repository repo.Repository, provider ChatProvider, model string) *Harness {
 	if strings.TrimSpace(model) == "" {
 		model = "gpt-5-mini"
 	}
+	if provider == nil {
+		provider, _ = NewProvider(ProviderConfig{Provider: ProviderOpenAICompatible})
+	}
 	return &Harness{
 		repository:  repository,
-		client:      openai.NewClient(option.WithAPIKey(strings.TrimSpace(apiKey))),
+		provider:    provider,
 		model:       model,
 		logger:      slog.Default(),
 		history:     map[string]*ringBuffer{},
@@ -201,62 +204,48 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 		"Recent context:\n" + strings.Join(history, "\n") + "\n" +
 		"User " + userName + ": " + input
 
-	tools := []responses.ToolUnionParam{
-		{OfFunction: &responses.FunctionToolParam{Name: "response", Description: openai.String("Send a Discord markdown response back to the user."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"message": map[string]any{"type": "string"}}, "required": []string{"message"}}}},
-		{OfFunction: &responses.FunctionToolParam{Name: "list_ready", Description: openai.String("List targets currently ready for review."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 20}}}}},
-		{OfFunction: &responses.FunctionToolParam{Name: "query_library", Description: openai.String("Generalized query over projection flows and indexed media. Use this for counts and lightweight discovery."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "scope": map[string]any{"type": "string", "enum": []string{"", "flows", "media", "both"}}, "subject_type": map[string]any{"type": "string", "enum": []string{"", "movie", "season", "episode"}}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 50}}}}},
-		{OfFunction: &responses.FunctionToolParam{Name: "fuzzy_search_targets", Description: openai.String("Find projection targets by fuzzy title/series/season text, optionally filtered by subject type."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "subject_type": map[string]any{"type": "string", "enum": []string{"", "movie", "season"}}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 30}}, "required": []string{"query"}}}},
-		{OfFunction: &responses.FunctionToolParam{Name: "query_target_state", Description: openai.String("Inspect state for a target by title text, or current selection when query omitted."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}}}},
-		{OfFunction: &responses.FunctionToolParam{Name: "remember_alias", Description: openai.String("Store a natural-language alias for a specific target so future follow-ups can resolve quickly."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"alias": map[string]any{"type": "string"}, "target_ref": map[string]any{"type": "string"}}, "required": []string{"alias"}}}},
-		{OfFunction: &responses.FunctionToolParam{Name: "schedule_delete", Description: openai.String("Schedule deletion for operational targets (movie/season) by title text, alias, or target id."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"target_ref": map[string]any{"type": "string"}}}}},
-		{OfFunction: &responses.FunctionToolParam{Name: "schedule_delete_many", Description: openai.String("Schedule deletion for many projection targets at once (useful for deleting all seasons in a show)."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"target_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}}, "required": []string{"target_ids"}}}},
-		{OfFunction: &responses.FunctionToolParam{Name: "delay_target_days", Description: openai.String("Delay a projection target by a specific number of days by updating flow policy/schedule."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"target_ref": map[string]any{"type": "string"}, "days": map[string]any{"type": "integer", "minimum": 1, "maximum": 3650}}, "required": []string{"days"}}}},
-		{OfFunction: &responses.FunctionToolParam{Name: "archive_target", Description: openai.String("Start archive or unarchive flow for a target title."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "archived": map[string]any{"type": "boolean"}}, "required": []string{"archived"}}}},
-		{OfFunction: &responses.FunctionToolParam{Name: "choose_candidate", Description: openai.String("Choose one of the numbered candidates from the last disambiguation list."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"number": map[string]any{"type": "integer", "minimum": 1}}, "required": []string{"number"}}}},
-		{OfFunction: &responses.FunctionToolParam{Name: "confirm_pending", Description: openai.String("Confirm or cancel the pending archive/unarchive action."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"confirmed": map[string]any{"type": "boolean"}}, "required": []string{"confirmed"}}}},
-		{OfFunction: &responses.FunctionToolParam{Name: "set_review_days", Description: openai.String("Set policy review period in days for active flows."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"days": map[string]any{"type": "integer", "minimum": 1, "maximum": 3650}}, "required": []string{"days"}}}},
-		{OfFunction: &responses.FunctionToolParam{Name: "set_defer_days", Description: openai.String("Set default defer period in days."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"days": map[string]any{"type": "integer", "minimum": 1, "maximum": 365}}, "required": []string{"days"}}}},
-		{OfFunction: &responses.FunctionToolParam{Name: "set_hitl_timeout_hours", Description: openai.String("Set default HITL review timeout in hours before timeout action."), Parameters: map[string]any{"type": "object", "properties": map[string]any{"hours": map[string]any{"type": "integer", "minimum": 1, "maximum": 8760}}, "required": []string{"hours"}}}},
+	tools := []ToolDefinition{
+		{Name: "response", Description: "Send a Discord markdown response back to the user.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"message": map[string]any{"type": "string"}}, "required": []string{"message"}}},
+		{Name: "list_ready", Description: "List targets currently ready for review.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 20}}}},
+		{Name: "query_library", Description: "Generalized query over projection flows and indexed media. Use this for counts and lightweight discovery.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "scope": map[string]any{"type": "string", "enum": []string{"", "flows", "media", "both"}}, "subject_type": map[string]any{"type": "string", "enum": []string{"", "movie", "season", "episode"}}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 50}}}},
+		{Name: "fuzzy_search_targets", Description: "Find projection targets by fuzzy title/series/season text, optionally filtered by subject type.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "subject_type": map[string]any{"type": "string", "enum": []string{"", "movie", "season"}}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 30}}, "required": []string{"query"}}},
+		{Name: "query_target_state", Description: "Inspect state for a target by title text, or current selection when query omitted.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}}},
+		{Name: "remember_alias", Description: "Store a natural-language alias for a specific target so future follow-ups can resolve quickly.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"alias": map[string]any{"type": "string"}, "target_ref": map[string]any{"type": "string"}}, "required": []string{"alias"}}},
+		{Name: "schedule_delete", Description: "Schedule deletion for operational targets (movie/season) by title text, alias, or target id.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"target_ref": map[string]any{"type": "string"}}}},
+		{Name: "schedule_delete_many", Description: "Schedule deletion for many projection targets at once (useful for deleting all seasons in a show).", Parameters: map[string]any{"type": "object", "properties": map[string]any{"target_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}}, "required": []string{"target_ids"}}},
+		{Name: "delay_target_days", Description: "Delay a projection target by a specific number of days by updating flow policy/schedule.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"target_ref": map[string]any{"type": "string"}, "days": map[string]any{"type": "integer", "minimum": 1, "maximum": 3650}}, "required": []string{"days"}}},
+		{Name: "archive_target", Description: "Start archive or unarchive flow for a target title.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}, "archived": map[string]any{"type": "boolean"}}, "required": []string{"archived"}}},
+		{Name: "choose_candidate", Description: "Choose one of the numbered candidates from the last disambiguation list.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"number": map[string]any{"type": "integer", "minimum": 1}}, "required": []string{"number"}}},
+		{Name: "confirm_pending", Description: "Confirm or cancel the pending archive/unarchive action.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"confirmed": map[string]any{"type": "boolean"}}, "required": []string{"confirmed"}}},
+		{Name: "set_review_days", Description: "Set policy review period in days for active flows.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"days": map[string]any{"type": "integer", "minimum": 1, "maximum": 3650}}, "required": []string{"days"}}},
+		{Name: "set_defer_days", Description: "Set default defer period in days.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"days": map[string]any{"type": "integer", "minimum": 1, "maximum": 365}}, "required": []string{"days"}}},
+		{Name: "set_hitl_timeout_hours", Description: "Set default HITL review timeout in hours before timeout action.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"hours": map[string]any{"type": "integer", "minimum": 1, "maximum": 8760}}, "required": []string{"hours"}}},
 	}
 
-	previousResponseID := ""
-	pendingInput := []responses.ResponseInputItemUnionParam{responses.ResponseInputItemParamOfMessage(userPrompt, responses.EasyInputMessageRoleUser)}
+	messages := []ChatMessage{{Role: "system", Content: system}, {Role: "user", Content: userPrompt}}
 
 	for i := 0; i < 6; i++ {
-		params := responses.ResponseNewParams{
-			Model:        shared.ResponsesModel(h.model),
-			Instructions: openai.String(system),
-			Tools:        tools,
-			Input: responses.ResponseNewParamsInputUnion{
-				OfInputItemList: pendingInput,
-			},
-		}
-		if strings.TrimSpace(previousResponseID) != "" {
-			params.PreviousResponseID = openai.String(previousResponseID)
-		}
-		resp, err := h.client.Responses.New(ctx, params)
+		resp, err := h.provider.Complete(ctx, h.model, messages, tools)
 		if err != nil {
 			return "", err
 		}
-		previousResponseID = resp.ID
-
-		toolCalls := make([]responses.ResponseFunctionToolCall, 0)
-		for _, item := range resp.Output {
-			if item.Type == "function_call" {
-				toolCalls = append(toolCalls, item.AsFunctionCall())
-			}
-		}
-
+		toolCalls := resp.ToolCalls
 		if len(toolCalls) == 0 {
-			content := strings.TrimSpace(resp.OutputText())
+			content := strings.TrimSpace(resp.Content)
 			if content != "" {
 				return content, nil
 			}
-			pendingInput = []responses.ResponseInputItemUnionParam{responses.ResponseInputItemParamOfMessage("Please respond with a concise Discord-markdown message for the user.", responses.EasyInputMessageRoleUser)}
+			messages = append(messages, ChatMessage{Role: "user", Content: "Please respond with a concise Discord-markdown message for the user."})
 			continue
 		}
 
-		toolOutputs := make([]responses.ResponseInputItemUnionParam, 0, len(toolCalls))
+		for j := range toolCalls {
+			if strings.TrimSpace(toolCalls[j].ID) == "" {
+				toolCalls[j].ID = fmt.Sprintf("call_%d_%d", i+1, j+1)
+			}
+		}
+		messages = append(messages, ChatMessage{Role: "assistant", Content: resp.Content, ToolCalls: toolCalls})
+
 		finalResponse := ""
 		for _, tc := range toolCalls {
 			result, out, err := h.executeToolCall(ctx, threadID, tc.Name, tc.Arguments)
@@ -264,7 +253,7 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 				h.logger.Warn("ai tool call failed", "thread_id", threadID, "tool", tc.Name, "error", err)
 				result = "tool error: " + err.Error()
 			}
-			toolOutputs = append(toolOutputs, responses.ResponseInputItemParamOfFunctionCallOutput(tc.CallID, result))
+			messages = append(messages, ChatMessage{Role: "tool", Content: result, ToolCallID: tc.ID})
 			if strings.TrimSpace(out) != "" && finalResponse == "" {
 				finalResponse = out
 			}
@@ -272,7 +261,6 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 		if strings.TrimSpace(finalResponse) != "" {
 			return finalResponse, nil
 		}
-		pendingInput = toolOutputs
 	}
 
 	return "I couldn't complete that yet. Could you share a bit more context and try again?", nil

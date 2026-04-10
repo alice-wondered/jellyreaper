@@ -45,8 +45,10 @@ type Config struct {
 	DiscordBotToken  string
 	DiscordPublicKey []byte
 	DiscordChannelID string
-	OpenAIAPIKey     string
-	OpenAIModel      string
+	AIProvider       string
+	AIAPIKey         string
+	AIModel          string
+	AIBaseURL        string
 
 	JellyfinURL          string
 	JellyfinPort         string
@@ -205,8 +207,10 @@ func LoadFromEnv() (Config, error) {
 
 		DiscordBotToken:      os.Getenv("DISCORD_BOT_TOKEN"),
 		DiscordChannelID:     os.Getenv("DISCORD_CHANNEL_ID"),
-		OpenAIAPIKey:         strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
-		OpenAIModel:          envOrDefault("OPENAI_MODEL", "gpt-5-mini"),
+		AIProvider:           envOrDefault("AI_PROVIDER", "openai_compatible"),
+		AIAPIKey:             strings.TrimSpace(firstNonEmptyEnv("AI_API_KEY", "OPENAI_API_KEY")),
+		AIModel:              envOrDefault("AI_MODEL", envOrDefault("OPENAI_MODEL", "gpt-5-mini")),
+		AIBaseURL:            strings.TrimSpace(firstNonEmptyEnv("AI_BASE_URL", "OPENAI_BASE_URL")),
 		JellyfinURL:          jellyfinURL,
 		JellyfinPort:         jellyfinPort,
 		JellyfinAPIKey:       os.Getenv("JELLYFIN_API_KEY"),
@@ -282,4 +286,13 @@ func envOrDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func firstNonEmptyEnv(keys ...string) string {
+	for _, key := range keys {
+		if value := os.Getenv(key); strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
