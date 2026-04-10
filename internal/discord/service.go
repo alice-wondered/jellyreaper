@@ -321,6 +321,11 @@ func (s *Service) handleMentionMessage(session *discordgo.Session, msg *discordg
 		}
 	}
 
+	// Show "JellyReaper is typing..." immediately so the user knows we're
+	// working on it. Discord's typing indicator lasts ~10s; for long AI
+	// calls the harness will re-trigger it via the TypingFunc callback.
+	_ = session.ChannelTyping(replyChannel)
+
 	out, err := s.mentionCallback(context.Background(), MentionMessage{
 		ChannelID: msg.ChannelID,
 		ThreadID:  threadID,
@@ -345,6 +350,16 @@ func stripBotMention(content string, botUserID string) string {
 	content = strings.ReplaceAll(content, "<@"+botUserID+">", "")
 	content = strings.ReplaceAll(content, "<@!"+botUserID+">", "")
 	return strings.TrimSpace(content)
+}
+
+// ChannelTyping triggers the "is typing..." indicator in Discord for the
+// given channel. The indicator lasts ~10 seconds; callers should re-trigger
+// periodically for long operations.
+func (s *Service) ChannelTyping(channelID string) error {
+	if s.session == nil || strings.TrimSpace(channelID) == "" {
+		return nil
+	}
+	return s.session.ChannelTyping(channelID)
 }
 
 func (s *Service) SendSystemMessage(channelID, content string) error {

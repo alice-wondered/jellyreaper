@@ -144,9 +144,18 @@ func (h *Harness) SetMaxThreadContexts(max int) {
 	h.pruneThreadContextsLocked()
 }
 
-func (h *Harness) HandleMention(ctx context.Context, threadID string, userName string, input string) (string, error) {
+// TypingFunc is called by the harness at the start of each tool-loop
+// iteration so that the caller can re-trigger a Discord typing indicator.
+// Discord's typing indicator lasts ~10 seconds; long AI round-trips need
+// periodic re-triggers to keep the "is typing..." visible.
+type TypingFunc func()
+
+// HandleMention processes a Discord @mention through the AI tool loop.
+// typing is called at the start of each loop iteration to keep the Discord
+// typing indicator alive; pass nil if no indicator is needed (e.g. tests).
+func (h *Harness) HandleMention(ctx context.Context, threadID string, userName string, input string, typing TypingFunc) (string, error) {
 	h.touchThread(threadID)
-	out, err := h.respondBestEffort(ctx, threadID, userName, input)
+	out, err := h.respondBestEffort(ctx, threadID, userName, input, typing)
 	if err != nil {
 		h.logger.Error("ai mention processing failed", "thread_id", threadID, "user", userName, "error", err)
 		return fmt.Sprintf("I couldn't complete that because the AI backend returned an error: `%s`", summarizeAIError(err)), nil
@@ -169,7 +178,7 @@ func summarizeAIError(err error) string {
 	return msg
 }
 
-func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userName string, input string) (string, error) {
+func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userName string, input string, typing TypingFunc) (string, error) {
 	h.ensureHistoryLoaded(ctx, threadID)
 	history := h.getHistory(threadID)
 	state := h.getThreadState(threadID)
@@ -225,6 +234,12 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 	messages := []ChatMessage{{Role: "system", Content: system}, {Role: "user", Content: userPrompt}}
 
 	for i := 0; i < 6; i++ {
+		// Re-trigger the typing indicator before each API round-trip so
+		// the Discord "is typing..." stays visible through multi-turn
+		// tool loops. Discord's indicator expires after ~10 seconds.
+		if typing != nil {
+			typing()
+		}
 		resp, err := h.provider.Complete(ctx, h.model, messages, tools)
 		if err != nil {
 			return "", err

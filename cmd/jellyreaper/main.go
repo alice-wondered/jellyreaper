@@ -118,7 +118,12 @@ func main() {
 			if strings.TrimSpace(thread) == "" {
 				thread = mention.ChannelID + ":msg:" + mention.MessageID
 			}
-			return assistant.HandleMention(ctx, thread, mention.Author, mention.Content)
+			replyChannel := mention.ThreadID
+			if replyChannel == "" {
+				replyChannel = mention.ChannelID
+			}
+			typing := func() { _ = discordService.ChannelTyping(replyChannel) }
+			return assistant.HandleMention(ctx, thread, mention.Author, mention.Content, typing)
 		})
 		logger.Info("ai mention assistant enabled", "provider", cfg.AIProvider, "model", cfg.AIModel)
 	}
