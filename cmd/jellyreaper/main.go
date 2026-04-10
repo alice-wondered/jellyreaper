@@ -275,6 +275,25 @@ func main() {
 		logger.Info("reconciled stale flows on startup", "count", reconciled)
 	}
 
+	// Run periodic reconciliation so runtime failures (e.g. a terminal
+	// send_hitl_prompt job) don't leave flows stuck until a restart.
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if reconciled, err := appService.ReconcileStaleFlows(ctx); err != nil {
+					logger.Warn("periodic reconciliation failed", "error", err)
+				} else if reconciled > 0 {
+					logger.Info("periodic reconciliation recovered flows", "count", reconciled)
+				}
+			}
+		}
+	}()
+
 	go func() {
 		logger.Info("scheduler started")
 		if err := schedulerLoop.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {

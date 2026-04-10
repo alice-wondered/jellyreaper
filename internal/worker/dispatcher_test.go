@@ -214,3 +214,61 @@ func TestDispatcher_NotifierFiresOnTerminalDeleteFailure(t *testing.T) {
 		t.Fatalf("expected notifier error to carry handler error, got %v", lastErr)
 	}
 }
+
+func TestDispatcher_RequeuesTerminalHITLPromptJob(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	store, err := bboltrepo.Open(path, 0o600, &bbolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close(); _ = os.Remove(path) })
+
+	// Seed the job that will fail terminally.
+	now := time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC)
+	job := domain.JobRecord{
+		JobID:       "job-hitl-fail",
+		FlowID:      "flow:target:movie:stuck",
+		ItemID:      "target:movie:stuck",
+		Kind:        domain.JobKindSendHITLPrompt,
+		Status:      domain.JobStatusPending,
+		RunAt:       now,
+		MaxAttempts: 1,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.EnqueueJob(context.Background(), job)
+	}); err != nil {
+		t.Fatalf("seed job: %v", err)
+	}
+
+	reg, _ := jobs.NewRegistry(testHandler{kind: domain.JobKindSendHITLPrompt, err: errors.New("discord unavailable")})
+	d := NewDispatcher(store, reg, nil)
+	d.now = func() time.Time { return now }
+
+	if err := d.Dispatch(context.Background(), job); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+
+	// Verify a recovery job was enqueued. The original job is now failed,
+	// so GetNextQueuedJob should return the recovery job.
+	nextJob, found, err := store.GetNextQueuedJob(context.Background())
+	if err != nil {
+		t.Fatalf("get next queued job: %v", err)
+	}
+	if !found {
+		t.Fatal("expected a recovery job to be enqueued after terminal HITL prompt failure")
+	}
+	if !strings.HasPrefix(nextJob.JobID, "job:recovery:") {
+		t.Fatalf("expected recovery job ID, got %s", nextJob.JobID)
+	}
+	if nextJob.ItemID != "target:movie:stuck" {
+		t.Fatalf("expected recovery job for stuck item, got %s", nextJob.ItemID)
+	}
+	if nextJob.Status != domain.JobStatusPending {
+		t.Fatalf("expected recovery job pending, got %s", nextJob.Status)
+	}
+	if !nextJob.RunAt.After(now) {
+		t.Fatalf("expected recovery job scheduled in the future, got %s", nextJob.RunAt)
+	}
+}
