@@ -90,7 +90,7 @@ func NewService(repository repo.Repository, logger *slog.Logger, wake func(time.
 		backfillBatchTimeout:  defaultBackfillBatchTimeout,
 		backfillQueueCapacity: defaultBackfillQueueCapacity,
 	}
-	svc.flowManager = scheduler.NewFlowManager(svc.evalScheduler, logger)
+	svc.flowManager = scheduler.NewFlowManager(repository, svc.evalScheduler, logger)
 	return svc
 }
 
@@ -105,20 +105,24 @@ func (s *Service) SetPolicyDefaults(defaultExpireDays int, defaultDelayWindow ti
 
 // finalizeAndWake handles the common post-commit pattern: finalize any
 // Discord HITL prompt from the transition result and signal the scheduler.
-func (s *Service) finalizeAndWake(ctx context.Context, result *scheduler.TransitionResult, now time.Time, itemID string) {
+func (s *Service) finalizeAndWake(ctx context.Context, result *scheduler.TransitionResult, itemID string) {
 	if result != nil && result.FinalizePrompt != nil && s.discord != nil {
 		fp := result.FinalizePrompt
 		if err := s.discord.FinalizeHITLPrompt(ctx, fp.ChannelID, fp.MessageID, fp.Content); err != nil {
 			s.logger.Warn("failed to finalize HITL prompt", "item_id", itemID, "error", err)
 		}
 	}
-	s.wake(now)
+	if result != nil && !result.WakeAt.IsZero() {
+		s.wake(result.WakeAt)
+	} else {
+		s.wake(time.Now().UTC())
+	}
 }
 
 func (s *Service) SetEvalScheduler(es scheduler.EvalRequester) {
 	if es != nil {
 		s.evalScheduler = es
-		s.flowManager = scheduler.NewFlowManager(es, s.logger)
+		s.flowManager = scheduler.NewFlowManager(s.repository, es, s.logger)
 	}
 }
 
@@ -318,6 +322,12 @@ func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.Webh
 	return nil
 }
 
+type pendingPlayedRecovery struct {
+	itemID    string
+	nextEval  time.Time
+	dedupeKey string
+}
+
 func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.WebhookEvent, now time.Time) (string, []targetRef, []hitlFinalizeRequest, error) {
 	eventAt, _ := sourceTimestampForJellyfinEvent(event)
 	playbackEvent := isPlaybackEvent(event.EventType)
@@ -327,17 +337,42 @@ func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.Web
 	itemID := event.ItemID
 	targets := deriveTargets(event)
 	finalizations := make([]hitlFinalizeRequest, 0)
+	playedRecoveries := make([]pendingPlayedRecovery, 0)
 
 	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
-		return s.applyJellyfinWebhookInTx(ctx, tx, event, now, eventAt, playbackEvent, catalogIndexEvent, removalEvent, dedupeKey, itemID, targets, &finalizations)
+		return s.applyJellyfinWebhookInTx(ctx, tx, event, now, eventAt, playbackEvent, catalogIndexEvent, removalEvent, dedupeKey, itemID, targets, &finalizations, &playedRecoveries)
 	})
 	if err != nil {
 		return "", nil, nil, err
 	}
+
+	// Execute playback recovery transitions outside the webhook tx.
+	// FlowManager owns its own tx for each transition.
+	for _, pr := range playedRecoveries {
+		result, playErr := s.flowManager.Played(ctx, pr.itemID, scheduler.PlayedRequest{
+			NextEvalAt: pr.nextEval,
+			TransitionSource: scheduler.TransitionSource{
+				Source: "jellyfin",
+				Reason: "playback_recovered",
+			},
+		})
+		if playErr != nil {
+			s.logger.Warn("webhook playback recovery failed", "item_id", pr.itemID, "error", playErr)
+			continue
+		}
+		if result.FinalizePrompt != nil {
+			finalizations = append(finalizations, hitlFinalizeRequest{
+				channelID: result.FinalizePrompt.ChannelID,
+				messageID: result.FinalizePrompt.MessageID,
+				content:   result.FinalizePrompt.Content,
+			})
+		}
+	}
+
 	return itemID, targets, finalizations, nil
 }
 
-func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxRepository, event jellyfin.WebhookEvent, now, eventAt time.Time, playbackEvent, catalogIndexEvent, removalEvent bool, dedupeKey, itemID string, targets []targetRef, finalizations *[]hitlFinalizeRequest) error {
+func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxRepository, event jellyfin.WebhookEvent, now, eventAt time.Time, playbackEvent, catalogIndexEvent, removalEvent bool, dedupeKey, itemID string, targets []targetRef, finalizations *[]hitlFinalizeRequest, pendingPlayed *[]pendingPlayedRecovery) error {
 	defaultReviewDays, _, defaultHITLTimeoutHours, err := s.currentDefaultsFromMeta(ctx, tx)
 	if err != nil {
 		return err
@@ -719,11 +754,9 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 
 		if (playbackEvent || (catalogPlaybackAdvanced && flow.State == domain.FlowStatePendingReview)) && flow.State == domain.FlowStatePendingReview {
 			runAt := now
-			resolvedPlayedAt := time.Time{}
 			if playAt, known, err := mostRecentPlayForTarget(ctx, tx, flow); err != nil {
 				return err
 			} else if known {
-				resolvedPlayedAt = playAt
 				expireDays := flow.PolicySnapshot.ExpireAfterDays
 				if expireDays <= 0 {
 					expireDays = defaultReviewDays
@@ -733,21 +766,12 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 					runAt = dueAt
 				}
 			}
-
-			txResult, err := s.flowManager.Played(ctx, tx, &flow, now, runAt, dedupeKey+":eval")
-			if err != nil {
-				return err
-			}
-			// Override finalization with the specific played-at timestamp.
-			if txResult.FinalizePrompt != nil && finalizations != nil {
-				display := strings.TrimSpace(flow.DisplayName)
-				if display == "" {
-					display = target.Canonical
-				}
-				*finalizations = append(*finalizations, hitlFinalizeRequest{
-					channelID: txResult.FinalizePrompt.ChannelID,
-					messageID: txResult.FinalizePrompt.MessageID,
-					content:   fmt.Sprintf("Resolved: PLAYED at %s for %s", humanTimeLabel(resolvedPlayedAt), display),
+			// Collect for post-tx playback recovery via FlowManager.
+			if pendingPlayed != nil {
+				*pendingPlayed = append(*pendingPlayed, pendingPlayedRecovery{
+					itemID:    target.Canonical,
+					nextEval:  runAt,
+					dedupeKey: dedupeKey,
 				})
 			}
 			continue
@@ -834,10 +858,16 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 	decisionDisplayName := parsed.ItemID
 	resolvedAction := parsed.Action
 
+	// Pre-check: deduplication and stale version detection.
+	defaultDeferDays := 0
 	err = s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
 		_, defaultDeferWindow, _, err := s.currentDefaultsFromMeta(ctx, tx)
 		if err != nil {
 			return err
+		}
+		defaultDeferDays = int(defaultDeferWindow.Hours() / 24)
+		if defaultDeferDays <= 0 {
+			defaultDeferDays = 15
 		}
 
 		processed, err := tx.IsProcessed(ctx, dedupeKey)
@@ -872,55 +902,44 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 		if strings.TrimSpace(flow.DisplayName) != "" {
 			decisionDisplayName = strings.TrimSpace(flow.DisplayName)
 		}
-
-		expectedVersion := flow.Version
-		if parsed.Version != expectedVersion {
+		if parsed.Version != flow.Version {
 			staleVersion = true
 			staleMessage = staleDecisionMessage(flow, decisionDisplayName, interaction)
 			return nil
 		}
 
-		effectiveAction := parsed.Action
-		resolvedAction = effectiveAction
-
-		var txResult *scheduler.TransitionResult
-		var txErr error
-		switch effectiveAction {
-		case "archive":
-			txResult, txErr = s.flowManager.Archive(ctx, tx, &flow, now)
-		case "delay":
-			txResult, txErr = s.flowManager.Delay(ctx, tx, &flow, now, now.Add(defaultDeferWindow), "discord_delay")
-		case "delete":
-			txResult, txErr = s.flowManager.Delete(ctx, tx, &flow, now, "discord")
-		default:
-			return fmt.Errorf("unsupported action %q", parsed.Action)
-		}
-		if txErr != nil {
-			return txErr
-		}
-		_ = txResult // finalization handled by Discord interaction response
-
-		event := domain.Event{
-			EventID:        "evt:discord:" + shortHash(dedupeKey),
-			FlowID:         flow.FlowID,
-			ItemID:         flow.ItemID,
-			Type:           "discord.interaction." + effectiveAction,
-			Source:         "discord",
-			OccurredAt:     now,
-			IdempotencyKey: dedupeKey,
-			Payload: map[string]any{
-				"interaction_id": interaction.InteractionID,
-				"custom_id":      interaction.CustomID,
-				"action":         effectiveAction,
-				"version":        parsed.Version,
-			},
-		}
-		if err := tx.AppendEvent(ctx, event); err != nil {
-			return err
-		}
-
 		return tx.MarkProcessed(ctx, dedupeKey, now)
 	})
+	if err != nil {
+		return nil, err
+	}
+	if alreadyProcessed || staleVersion {
+		// Early return — handled below.
+	} else {
+		// Transition via FlowManager (owns its own tx).
+		src := scheduler.TransitionSource{
+			Source: "discord",
+			Actor:  discordInteractionActor(interaction),
+			Extra: map[string]any{
+				"interaction_id": interaction.InteractionID,
+				"custom_id":      interaction.CustomID,
+			},
+		}
+		resolvedAction = parsed.Action
+		switch parsed.Action {
+		case "archive":
+			_, err = s.flowManager.Archive(ctx, parsed.ItemID, src)
+		case "delay":
+			_, err = s.flowManager.Delay(ctx, parsed.ItemID, scheduler.DelayRequest{
+				Days:             defaultDeferDays,
+				TransitionSource: src,
+			})
+		case "delete":
+			_, err = s.flowManager.Delete(ctx, parsed.ItemID, src)
+		default:
+			err = fmt.Errorf("unsupported action %q", parsed.Action)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -962,54 +981,23 @@ func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action str
 		return fmt.Errorf("action is required")
 	}
 
-	now := s.now().UTC()
+	src := scheduler.TransitionSource{Source: "ai", Reason: "ai_" + action}
 	var result *scheduler.TransitionResult
-	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
-		flow, found, err := tx.GetFlow(ctx, itemID)
-		if err != nil {
-			return err
-		}
-		if !found {
-			return fmt.Errorf("flow not found for item %s", itemID)
-		}
-
-		switch action {
-		case "archive":
-			result, err = s.flowManager.Archive(ctx, tx, &flow, now)
-		case "unarchive":
-			result, err = s.flowManager.Unarchive(ctx, tx, &flow, now, "ai_unarchive")
-		case "delete":
-			result, err = s.flowManager.Delete(ctx, tx, &flow, now, "ai")
-		default:
-			return fmt.Errorf("unsupported ai action %q", action)
-		}
-		if err != nil {
-			return err
-		}
-		// Customize finalization with "(AI)" suffix for AI-initiated decisions.
-		if result != nil && result.FinalizePrompt != nil {
-			display := strings.TrimSpace(flow.DisplayName)
-			if display == "" {
-				display = "item"
-			}
-			result.FinalizePrompt.Content = fmt.Sprintf("Resolved: %s for %s (AI).", interactionDecisionLabel(action), display)
-		}
-
-		return tx.AppendEvent(ctx, domain.Event{
-			EventID:        "evt:ai:" + shortHash(itemID+":"+action+":"+strconv.FormatInt(now.UnixNano(), 10)),
-			FlowID:         flow.FlowID,
-			ItemID:         flow.ItemID,
-			Type:           "ai.decision." + action,
-			Source:         "ai",
-			OccurredAt:     now,
-			IdempotencyKey: "ai:" + action + ":" + itemID + ":" + strconv.FormatInt(flow.Version, 10),
-			Payload:        map[string]any{"action": action},
-		})
-	})
+	var err error
+	switch action {
+	case "archive":
+		result, err = s.flowManager.Archive(ctx, itemID, src)
+	case "unarchive":
+		result, err = s.flowManager.Unarchive(ctx, itemID, src)
+	case "delete":
+		result, err = s.flowManager.Delete(ctx, itemID, src)
+	default:
+		return fmt.Errorf("unsupported ai action %q", action)
+	}
 	if err != nil {
 		return err
 	}
-	s.finalizeAndWake(ctx, result, now, itemID)
+	s.finalizeAndWake(ctx, result, itemID)
 	return nil
 }
 
@@ -1042,52 +1030,18 @@ func (s *Service) ApplyAIDelayDays(ctx context.Context, itemID string, days int)
 	if itemID == "" {
 		return fmt.Errorf("item id is required")
 	}
-	if days <= 0 {
-		return fmt.Errorf("days must be > 0")
-	}
-	now := s.now().UTC()
-	delayUntil := now.Add(time.Duration(days) * 24 * time.Hour)
-	var result *scheduler.TransitionResult
-	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
-		flow, found, err := tx.GetFlow(ctx, itemID)
-		if err != nil {
-			return err
-		}
-		if !found {
-			return fmt.Errorf("flow not found for item %s", itemID)
-		}
-		// Set policy before calling Delay — Delay performs the CAS write.
-		flow.PolicySnapshot.ExpireAfterDays = days
-		result, err = s.flowManager.Delay(ctx, tx, &flow, now, delayUntil, "ai_delay")
-		if err != nil {
-			return err
-		}
-		// Override the generic finalization content with the specific days info.
-		if result.FinalizePrompt != nil {
-			display := strings.TrimSpace(flow.DisplayName)
-			if display == "" {
-				display = "item"
-			}
-			result.FinalizePrompt.Content = fmt.Sprintf("Resolved: DELAYED %d days for %s (AI).", days, display)
-		}
-		return tx.AppendEvent(ctx, domain.Event{
-			EventID:        "evt:ai:delay:" + shortHash(itemID+":"+strconv.FormatInt(now.UnixNano(), 10)),
-			FlowID:         flow.FlowID,
-			ItemID:         flow.ItemID,
-			Type:           "ai.decision.delay",
-			Source:         "ai",
-			OccurredAt:     now,
-			IdempotencyKey: "ai:delay:" + itemID + ":" + strconv.Itoa(days) + ":" + strconv.FormatInt(flow.Version, 10),
-			Payload: map[string]any{
-				"days":        days,
-				"delay_until": delayUntil.Format(time.RFC3339),
-			},
-		})
+	result, err := s.flowManager.Delay(ctx, itemID, scheduler.DelayRequest{
+		Days:            days,
+		ExpireAfterDays: days,
+		TransitionSource: scheduler.TransitionSource{
+			Source: "ai",
+			Reason: "ai_delay",
+		},
 	})
 	if err != nil {
 		return err
 	}
-	s.finalizeAndWake(ctx, result, now, itemID)
+	s.finalizeAndWake(ctx, result, itemID)
 	return nil
 }
 
@@ -1098,32 +1052,14 @@ func (s *Service) RequestImmediateReview(ctx context.Context, itemID string) err
 	if itemID == "" {
 		return fmt.Errorf("item id is required")
 	}
-	now := s.now().UTC()
-	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
-		flow, found, err := tx.GetFlow(ctx, itemID)
-		if err != nil {
-			return err
-		}
-		if !found {
-			return fmt.Errorf("flow not found for item %s", itemID)
-		}
-		if _, err := s.flowManager.RequestReview(ctx, tx, &flow, now); err != nil {
-			return err
-		}
-		return tx.AppendEvent(ctx, domain.Event{
-			EventID:        "evt:ai:review:" + shortHash(itemID+":"+strconv.FormatInt(now.UnixNano(), 10)),
-			FlowID:         flow.FlowID,
-			ItemID:         flow.ItemID,
-			Type:           "ai.request_review",
-			Source:         "ai",
-			OccurredAt:     now,
-			IdempotencyKey: "ai:review:" + itemID + ":" + strconv.FormatInt(flow.Version, 10),
-		})
+	result, err := s.flowManager.RequestReview(ctx, itemID, scheduler.TransitionSource{
+		Source: "ai",
+		Reason: "ai_request_review",
 	})
 	if err != nil {
 		return err
 	}
-	s.wake(now)
+	s.finalizeAndWake(ctx, result, itemID)
 	return nil
 }
 
@@ -1294,6 +1230,7 @@ func (s *Service) processWebhookBatches(ctx context.Context, ops <-chan backfill
 					event.DedupeKey,
 					event.ItemID,
 					deriveTargets(event),
+					nil,
 					nil,
 				); err != nil {
 					return err

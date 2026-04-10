@@ -210,7 +210,7 @@ func main() {
 	schedulerObj := scheduler.NewScheduler(schedulerLoop, wake)
 	evaluatePolicyHandler.SetEvalScheduler(schedulerObj)
 	sendHITLPromptHandler.SetEvalScheduler(schedulerObj)
-	hitlTimeoutHandler.SetFlowManager(scheduler.NewFlowManager(schedulerObj, logger))
+	hitlTimeoutHandler.SetFlowManager(scheduler.NewFlowManager(store, schedulerObj, logger))
 	appService.SetEvalScheduler(schedulerObj)
 
 	if len(cfg.DiscordPublicKey) == 0 {
