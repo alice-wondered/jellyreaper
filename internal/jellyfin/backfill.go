@@ -272,7 +272,7 @@ func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.
 	includeItemTypes := []gen.BaseItemKind{gen.BaseItemKindMovie, gen.BaseItemKindEpisode}
 	sortBy := []gen.ItemSortBy{gen.ItemSortByDateCreated}
 	sortOrder := []gen.SortOrder{gen.SortOrder("Descending")}
-	fields := []gen.ItemFields{gen.ItemFieldsProviderIds}
+	fields := []gen.ItemFields{gen.ItemFieldsProviderIds, gen.ItemFieldsDateCreated}
 	pageSize := limit
 	if pageSize <= 0 {
 		pageSize = 500
