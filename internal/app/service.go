@@ -56,6 +56,7 @@ type Service struct {
 	discord               *discord.Service
 	wake                  func(time.Time)
 	evalScheduler         scheduler.EvalRequester
+	flowManager           *scheduler.FlowManager
 	now                   func() time.Time
 	defaultDelayWindow    time.Duration
 	defaultExpireDays     int
@@ -75,7 +76,7 @@ func NewService(repository repo.Repository, logger *slog.Logger, wake func(time.
 	if wake == nil {
 		wake = func(time.Time) {}
 	}
-	return &Service{
+	svc := &Service{
 		repository:            repository,
 		logger:                logger,
 		wake:                  wake,
@@ -89,6 +90,8 @@ func NewService(repository repo.Repository, logger *slog.Logger, wake func(time.
 		backfillBatchTimeout:  defaultBackfillBatchTimeout,
 		backfillQueueCapacity: defaultBackfillQueueCapacity,
 	}
+	svc.flowManager = scheduler.NewFlowManager(svc.evalScheduler, logger)
+	return svc
 }
 
 func (s *Service) SetPolicyDefaults(defaultExpireDays int, defaultDelayWindow time.Duration) {
@@ -100,9 +103,22 @@ func (s *Service) SetPolicyDefaults(defaultExpireDays int, defaultDelayWindow ti
 	}
 }
 
+// finalizeAndWake handles the common post-commit pattern: finalize any
+// Discord HITL prompt from the transition result and signal the scheduler.
+func (s *Service) finalizeAndWake(ctx context.Context, result *scheduler.TransitionResult, now time.Time, itemID string) {
+	if result != nil && result.FinalizePrompt != nil && s.discord != nil {
+		fp := result.FinalizePrompt
+		if err := s.discord.FinalizeHITLPrompt(ctx, fp.ChannelID, fp.MessageID, fp.Content); err != nil {
+			s.logger.Warn("failed to finalize HITL prompt", "item_id", itemID, "error", err)
+		}
+	}
+	s.wake(now)
+}
+
 func (s *Service) SetEvalScheduler(es scheduler.EvalRequester) {
 	if es != nil {
 		s.evalScheduler = es
+		s.flowManager = scheduler.NewFlowManager(es, s.logger)
 	}
 }
 
@@ -718,40 +734,19 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 				}
 			}
 
-			expected := flow.Version
-			flow.State = domain.FlowStateActive
-			flow.HITLOutcome = "played"
-			flow.DecisionDeadlineAt = time.Time{}
-			flow.NextActionAt = runAt
-			flow.UpdatedAt = now
-			flow.Version = expected + 1
-			if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
-				return err
-			}
-			// Opportunistic cleanup: a play during PendingReview makes the
-			// prompt/timeout chain stale. Wipe them so they don't fire and
-			// log+bail. This also wipes the eval singleton, which RequestEval
-			// recreates immediately below.
-			purged, err := tx.DeleteJobsForItem(ctx, target.Canonical)
+			txResult, err := s.flowManager.Played(ctx, tx, &flow, now, runAt, dedupeKey+":eval")
 			if err != nil {
 				return err
 			}
-			s.logger.InfoContext(ctx, "webhook playback recovery purged stale jobs",
-				"lex", "FLOW-LIFECYCLE",
-				"item_id", target.Canonical,
-				"jobs_purged", purged,
-			)
-			if err := s.evalScheduler.RequestEval(ctx, tx, flow, now, runAt, "jellyfin_playback_recovered", dedupeKey+":eval", flow.Version); err != nil {
-				return err
-			}
-			if finalizations != nil && strings.TrimSpace(flow.Discord.ChannelID) != "" && strings.TrimSpace(flow.Discord.MessageID) != "" {
+			// Override finalization with the specific played-at timestamp.
+			if txResult.FinalizePrompt != nil && finalizations != nil {
 				display := strings.TrimSpace(flow.DisplayName)
 				if display == "" {
 					display = target.Canonical
 				}
 				*finalizations = append(*finalizations, hitlFinalizeRequest{
-					channelID: flow.Discord.ChannelID,
-					messageID: flow.Discord.MessageID,
+					channelID: txResult.FinalizePrompt.ChannelID,
+					messageID: txResult.FinalizePrompt.MessageID,
 					content:   fmt.Sprintf("Resolved: PLAYED at %s for %s", humanTimeLabel(resolvedPlayedAt), display),
 				})
 			}
@@ -885,39 +880,25 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 			return nil
 		}
 
-		flow.UpdatedAt = now
 		effectiveAction := parsed.Action
 		resolvedAction = effectiveAction
-		flow.HITLOutcome = effectiveAction
 
+		var txResult *scheduler.TransitionResult
+		var txErr error
 		switch effectiveAction {
 		case "archive":
-			flow.State = domain.FlowStateArchived
+			txResult, txErr = s.flowManager.Archive(ctx, tx, &flow, now)
 		case "delay":
-			flow.State = domain.FlowStateActive
-			flow.NextActionAt = now.Add(defaultDeferWindow)
-			flow.DecisionDeadlineAt = time.Time{}
-			clearDiscordPromptLink(&flow.Discord)
-			if err := s.evalScheduler.RequestEval(ctx, tx, flow, now, flow.NextActionAt, "discord_delay", "discord:eval:"+flow.ItemID, flow.Version); err != nil {
-				return err
-			}
+			txResult, txErr = s.flowManager.Delay(ctx, tx, &flow, now, now.Add(defaultDeferWindow), "discord_delay")
 		case "delete":
-			flow.State = domain.FlowStateDeleteQueued
-			flow.NextActionAt = now
-			if err := enqueueExecuteDelete(ctx, tx, flow, now); err != nil {
-				return err
-			}
+			txResult, txErr = s.flowManager.Delete(ctx, tx, &flow, now, "discord")
 		default:
 			return fmt.Errorf("unsupported action %q", parsed.Action)
 		}
-
-		flow.Version = expectedVersion + 1
-		if flow.CreatedAt.IsZero() {
-			flow.CreatedAt = now
+		if txErr != nil {
+			return txErr
 		}
-		if err := tx.UpsertFlowCAS(ctx, flow, expectedVersion); err != nil {
-			return err
-		}
+		_ = txResult // finalization handled by Discord interaction response
 
 		event := domain.Event{
 			EventID:        "evt:discord:" + shortHash(dedupeKey),
@@ -982,9 +963,7 @@ func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action str
 	}
 
 	now := s.now().UTC()
-	finalizeChannelID := ""
-	finalizeMessageID := ""
-	finalizeDisplayName := ""
+	var result *scheduler.TransitionResult
 	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, itemID)
 		if err != nil {
@@ -994,69 +973,43 @@ func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action str
 			return fmt.Errorf("flow not found for item %s", itemID)
 		}
 
-		expectedVersion := flow.Version
-		flow.UpdatedAt = now
-		flow.HITLOutcome = action
-		finalizeChannelID = flow.Discord.ChannelID
-		finalizeMessageID = flow.Discord.MessageID
-		finalizeDisplayName = strings.TrimSpace(flow.DisplayName)
-
 		switch action {
 		case "archive":
-			flow.State = domain.FlowStateArchived
-			flow.NextActionAt = time.Time{}
-			flow.DecisionDeadlineAt = time.Time{}
+			result, err = s.flowManager.Archive(ctx, tx, &flow, now)
 		case "unarchive":
-			flow.State = domain.FlowStateActive
-			flow.DecisionDeadlineAt = time.Time{}
-			clearDiscordPromptLink(&flow.Discord)
-			if err := s.evalScheduler.RequestEval(ctx, tx, flow, now, now, "ai_unarchive", "ai:eval:"+flow.ItemID, flow.Version); err != nil {
-				return err
-			}
+			result, err = s.flowManager.Unarchive(ctx, tx, &flow, now, "ai_unarchive")
 		case "delete":
-			flow.State = domain.FlowStateDeleteQueued
-			flow.NextActionAt = now
-			flow.DecisionDeadlineAt = time.Time{}
-			if err := enqueueExecuteDelete(ctx, tx, flow, now); err != nil {
-				return err
-			}
+			result, err = s.flowManager.Delete(ctx, tx, &flow, now, "ai")
 		default:
 			return fmt.Errorf("unsupported ai action %q", action)
 		}
-
-		flow.Version = expectedVersion + 1
-		if err := tx.UpsertFlowCAS(ctx, flow, expectedVersion); err != nil {
+		if err != nil {
 			return err
 		}
+		// Customize finalization with "(AI)" suffix for AI-initiated decisions.
+		if result != nil && result.FinalizePrompt != nil {
+			display := strings.TrimSpace(flow.DisplayName)
+			if display == "" {
+				display = "item"
+			}
+			result.FinalizePrompt.Content = fmt.Sprintf("Resolved: %s for %s (AI).", interactionDecisionLabel(action), display)
+		}
 
-		event := domain.Event{
+		return tx.AppendEvent(ctx, domain.Event{
 			EventID:        "evt:ai:" + shortHash(itemID+":"+action+":"+strconv.FormatInt(now.UnixNano(), 10)),
 			FlowID:         flow.FlowID,
 			ItemID:         flow.ItemID,
 			Type:           "ai.decision." + action,
 			Source:         "ai",
 			OccurredAt:     now,
-			IdempotencyKey: "ai:" + action + ":" + itemID + ":" + strconv.FormatInt(expectedVersion+1, 10),
-			Payload: map[string]any{
-				"action": action,
-			},
-		}
-		return tx.AppendEvent(ctx, event)
+			IdempotencyKey: "ai:" + action + ":" + itemID + ":" + strconv.FormatInt(flow.Version, 10),
+			Payload:        map[string]any{"action": action},
+		})
 	})
 	if err != nil {
 		return err
 	}
-	if s.discord != nil && finalizeChannelID != "" && finalizeMessageID != "" {
-		display := finalizeDisplayName
-		if display == "" {
-			display = "item"
-		}
-		content := fmt.Sprintf("Resolved: %s for %s (AI).", interactionDecisionLabel(action), display)
-		if err := s.discord.FinalizeHITLPrompt(ctx, finalizeChannelID, finalizeMessageID, content); err != nil {
-			s.logger.Warn("failed to finalize ai decision HITL message", "item_id", itemID, "error", err)
-		}
-	}
-	s.wake(now)
+	s.finalizeAndWake(ctx, result, now, itemID)
 	return nil
 }
 
@@ -1094,9 +1047,7 @@ func (s *Service) ApplyAIDelayDays(ctx context.Context, itemID string, days int)
 	}
 	now := s.now().UTC()
 	delayUntil := now.Add(time.Duration(days) * 24 * time.Hour)
-	finalizeChannelID := ""
-	finalizeMessageID := ""
-	finalizeDisplayName := ""
+	var result *scheduler.TransitionResult
 	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, itemID)
 		if err != nil {
@@ -1105,26 +1056,19 @@ func (s *Service) ApplyAIDelayDays(ctx context.Context, itemID string, days int)
 		if !found {
 			return fmt.Errorf("flow not found for item %s", itemID)
 		}
-		expectedVersion := flow.Version
-		finalizeChannelID = flow.Discord.ChannelID
-		finalizeMessageID = flow.Discord.MessageID
-		finalizeDisplayName = strings.TrimSpace(flow.DisplayName)
-		flow.State = domain.FlowStateActive
-		flow.HITLOutcome = "delay"
-		flow.NextActionAt = delayUntil
-		flow.DecisionDeadlineAt = time.Time{}
-		if flow.PolicySnapshot.ExpireAfterDays <= 0 {
-			flow.PolicySnapshot.ExpireAfterDays = s.defaultExpireDays
-		}
+		// Set policy before calling Delay — Delay performs the CAS write.
 		flow.PolicySnapshot.ExpireAfterDays = days
-		clearDiscordPromptLink(&flow.Discord)
-		flow.UpdatedAt = now
-		flow.Version = expectedVersion + 1
-		if err := tx.UpsertFlowCAS(ctx, flow, expectedVersion); err != nil {
+		result, err = s.flowManager.Delay(ctx, tx, &flow, now, delayUntil, "ai_delay")
+		if err != nil {
 			return err
 		}
-		if err := s.evalScheduler.RequestEval(ctx, tx, flow, now, delayUntil, "ai_delay", "ai:eval:"+flow.ItemID, flow.Version); err != nil {
-			return err
+		// Override the generic finalization content with the specific days info.
+		if result.FinalizePrompt != nil {
+			display := strings.TrimSpace(flow.DisplayName)
+			if display == "" {
+				display = "item"
+			}
+			result.FinalizePrompt.Content = fmt.Sprintf("Resolved: DELAYED %d days for %s (AI).", days, display)
 		}
 		return tx.AppendEvent(ctx, domain.Event{
 			EventID:        "evt:ai:delay:" + shortHash(itemID+":"+strconv.FormatInt(now.UnixNano(), 10)),
@@ -1143,17 +1087,7 @@ func (s *Service) ApplyAIDelayDays(ctx context.Context, itemID string, days int)
 	if err != nil {
 		return err
 	}
-	if s.discord != nil && finalizeChannelID != "" && finalizeMessageID != "" {
-		display := finalizeDisplayName
-		if display == "" {
-			display = "item"
-		}
-		content := fmt.Sprintf("Resolved: DELAYED %d days for %s (AI).", days, display)
-		if err := s.discord.FinalizeHITLPrompt(ctx, finalizeChannelID, finalizeMessageID, content); err != nil {
-			s.logger.Warn("failed to finalize ai delay HITL message", "item_id", itemID, "error", err)
-		}
-	}
-	s.wake(now)
+	s.finalizeAndWake(ctx, result, now, itemID)
 	return nil
 }
 
@@ -1173,59 +1107,7 @@ func (s *Service) RequestImmediateReview(ctx context.Context, itemID string) err
 		if !found {
 			return fmt.Errorf("flow not found for item %s", itemID)
 		}
-		if flow.State == domain.FlowStatePendingReview {
-			// Already pending — just ensure a prompt job exists.
-			promptPayload, err := json.Marshal(jobs.SendHITLPromptPayload{
-				ChannelID:   flow.Discord.ChannelID,
-				FlowVersion: flow.Version,
-			})
-			if err != nil {
-				return err
-			}
-			return tx.EnqueueJob(ctx, domain.JobRecord{
-				JobID:          "job:prompt:" + itemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
-				FlowID:         flow.FlowID,
-				ItemID:         flow.ItemID,
-				Kind:           domain.JobKindSendHITLPrompt,
-				Status:         domain.JobStatusPending,
-				RunAt:          now,
-				MaxAttempts:    5,
-				IdempotencyKey: "job:prompt:review:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version, 10),
-				PayloadJSON:    promptPayload,
-				CreatedAt:      now,
-				UpdatedAt:      now,
-			})
-		}
-		expected := flow.Version
-		flow.State = domain.FlowStatePendingReview
-		flow.HITLOutcome = ""
-		flow.DecisionDeadlineAt = time.Time{}
-		flow.NextActionAt = now
-		flow.UpdatedAt = now
-		flow.Version = expected + 1
-		if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
-			return err
-		}
-		promptPayload, err := json.Marshal(jobs.SendHITLPromptPayload{
-			ChannelID:   flow.Discord.ChannelID,
-			FlowVersion: flow.Version,
-		})
-		if err != nil {
-			return err
-		}
-		if err := tx.EnqueueJob(ctx, domain.JobRecord{
-			JobID:          "job:prompt:" + itemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
-			FlowID:         flow.FlowID,
-			ItemID:         flow.ItemID,
-			Kind:           domain.JobKindSendHITLPrompt,
-			Status:         domain.JobStatusPending,
-			RunAt:          now,
-			MaxAttempts:    5,
-			IdempotencyKey: "job:prompt:review:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version, 10),
-			PayloadJSON:    promptPayload,
-			CreatedAt:      now,
-			UpdatedAt:      now,
-		}); err != nil {
+		if _, err := s.flowManager.RequestReview(ctx, tx, &flow, now); err != nil {
 			return err
 		}
 		return tx.AppendEvent(ctx, domain.Event{
@@ -1559,26 +1441,6 @@ func parseCustomID(value string) (customID, error) {
 	return customID{Action: action, ItemID: itemID, Version: version}, nil
 }
 
-func enqueueExecuteDelete(ctx context.Context, tx repo.TxRepository, flow domain.Flow, now time.Time) error {
-	payload, err := json.Marshal(jobs.ExecuteDeletePayload{RequestedBy: "discord"})
-	if err != nil {
-		return err
-	}
-
-	return tx.EnqueueJob(ctx, domain.JobRecord{
-		JobID:          "job:delete:" + flow.ItemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
-		FlowID:         flow.FlowID,
-		ItemID:         flow.ItemID,
-		Kind:           domain.JobKindExecuteDelete,
-		Status:         domain.JobStatusPending,
-		RunAt:          now,
-		MaxAttempts:    5,
-		IdempotencyKey: "discord:delete:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version+1, 10),
-		PayloadJSON:    payload,
-		CreatedAt:      now,
-		UpdatedAt:      now,
-	})
-}
 
 func interactionResponse(content string) *discordgo.InteractionResponse {
 	return &discordgo.InteractionResponse{
@@ -1674,17 +1536,6 @@ func latestPromptReference(flow domain.Flow, interaction discord.IncomingInterac
 	return fmt.Sprintf("This prompt is stale. Use the latest one in channel %s (message %s).", targetChannelID, targetMessageID)
 }
 
-func clearDiscordPromptLink(ctx *domain.DiscordContext) {
-	if ctx == nil {
-		return
-	}
-	msg := strings.TrimSpace(ctx.MessageID)
-	if msg != "" {
-		ctx.PreviousChannelID = strings.TrimSpace(ctx.ChannelID)
-		ctx.PreviousMessageID = msg
-	}
-	ctx.MessageID = ""
-}
 
 func interactionDecisionLabel(action string) string {
 	switch strings.ToLower(strings.TrimSpace(action)) {

@@ -60,6 +60,9 @@ func (m *FlowManager) Archive(ctx context.Context, tx repo.TxRepository, flow *d
 		return nil, fmt.Errorf("cannot archive flow in state %s", flow.State)
 	}
 	result := &TransitionResult{}
+	if flow.State == domain.FlowStatePendingReview {
+		result.FinalizePrompt = captureFinalization(flow, "archive")
+	}
 	expected := flow.Version
 	flow.State = domain.FlowStateArchived
 	flow.HITLOutcome = "archive"
@@ -282,6 +285,8 @@ func captureFinalization(flow *domain.Flow, action string) *PromptFinalization {
 	}
 	var content string
 	switch action {
+	case "archive":
+		content = fmt.Sprintf("Resolved: ARCHIVED for %s.", display)
 	case "delete":
 		content = fmt.Sprintf("Resolved: DELETE REQUESTED for %s.", display)
 	case "delay":
