@@ -179,6 +179,13 @@ func summarizeAIError(err error) string {
 }
 
 func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userName string, input string, typing TypingFunc) (string, error) {
+	// Trigger typing immediately — ensureHistoryLoaded and
+	// serializeThreadContext below may take a few seconds (Discord API +
+	// DB reads) which is enough to expire the initial indicator set by
+	// the Discord handler.
+	if typing != nil {
+		typing()
+	}
 	h.ensureHistoryLoaded(ctx, threadID)
 	history := h.getHistory(threadID)
 	state := h.getThreadState(threadID)
