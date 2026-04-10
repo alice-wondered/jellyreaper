@@ -63,6 +63,26 @@ func (h *EvaluatePolicyHandler) SetDefaultHITLTimeoutHours(hours int) {
 
 func (h *EvaluatePolicyHandler) Kind() domain.JobKind { return domain.JobKindEvaluatePolicy }
 
+// OnTerminalFailure re-schedules the singleton eval job with a cooldown
+// so the flow doesn't get stuck if policy evaluation hits a persistent
+// error (e.g. corrupt media index, transient DB issue that outlasted
+// all retries).
+func (h *EvaluatePolicyHandler) OnTerminalFailure(ctx context.Context, job domain.JobRecord) error {
+	now := time.Now().UTC()
+	retryAfter := now.Add(10 * time.Minute)
+	return h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(ctx, job.ItemID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return nil
+		}
+		h.logger.Info("eval policy terminal failure: re-scheduling eval", "lex", "POLICY-EVAL", "item_id", job.ItemID, "retry_at", retryAfter)
+		return h.evalScheduler.RequestEval(ctx, tx, flow, now, retryAfter, "eval_recovery", "eval:recovery:"+flow.ItemID, flow.Version)
+	})
+}
+
 func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord) error {
 	now := time.Now().UTC()
 
@@ -280,6 +300,7 @@ type SendHITLPromptHandler struct {
 	discord          *discord.Service
 	defaultChannelID string
 	hitlTimeout      time.Duration
+	evalScheduler    scheduler.EvalRequester
 }
 
 func NewSendHITLPromptHandler(repository repo.Repository, logger *slog.Logger, discord *discord.Service, defaultChannelID string, hitlTimeout time.Duration) *SendHITLPromptHandler {
@@ -295,7 +316,12 @@ func NewSendHITLPromptHandler(repository repo.Repository, logger *slog.Logger, d
 		discord:          discord,
 		defaultChannelID: defaultChannelID,
 		hitlTimeout:      hitlTimeout,
+		evalScheduler:    scheduler.NewScheduler(nil, nil),
 	}
+}
+
+func (h *SendHITLPromptHandler) SetEvalScheduler(s scheduler.EvalRequester) {
+	h.evalScheduler = s
 }
 
 func (h *SendHITLPromptHandler) Kind() domain.JobKind { return domain.JobKindSendHITLPrompt }
@@ -514,6 +540,38 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 		}
 	}
 	return nil
+}
+
+// OnTerminalFailure rolls the flow back from pending_review to active
+// and re-schedules the singleton evaluate_policy job so the state machine
+// will re-attempt the HITL cycle after a cooldown.
+func (h *SendHITLPromptHandler) OnTerminalFailure(ctx context.Context, job domain.JobRecord) error {
+	now := time.Now().UTC()
+	retryAfter := now.Add(10 * time.Minute)
+	return h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(ctx, job.ItemID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return nil
+		}
+		if flow.State != domain.FlowStatePendingReview {
+			return nil
+		}
+		expected := flow.Version
+		flow.State = domain.FlowStateActive
+		flow.HITLOutcome = ""
+		flow.DecisionDeadlineAt = time.Time{}
+		flow.NextActionAt = retryAfter
+		flow.UpdatedAt = now
+		flow.Version = expected + 1
+		if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+			return err
+		}
+		h.logger.Info("hitl prompt terminal failure: rolled flow back to active", "lex", "HITL-PROMPT", "item_id", job.ItemID, "retry_at", retryAfter)
+		return h.evalScheduler.RequestEval(ctx, tx, flow, now, retryAfter, "hitl_prompt_recovery", "eval:recovery:"+flow.ItemID, flow.Version)
+	})
 }
 
 type HITLTimeoutHandler struct {

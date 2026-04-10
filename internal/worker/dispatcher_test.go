@@ -215,60 +215,66 @@ func TestDispatcher_NotifierFiresOnTerminalDeleteFailure(t *testing.T) {
 	}
 }
 
-func TestDispatcher_RequeuesTerminalHITLPromptJob(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "test.db")
-	store, err := bboltrepo.Open(path, 0o600, &bbolt.Options{Timeout: time.Second})
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { _ = store.Close(); _ = os.Remove(path) })
+type recoverableHandler struct {
+	testHandler
+	recoveryCalls int
+	lastJob       domain.JobRecord
+}
 
-	// Seed the job that will fail terminally.
-	now := time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC)
+func (h *recoverableHandler) OnTerminalFailure(_ context.Context, job domain.JobRecord) error {
+	h.recoveryCalls++
+	h.lastJob = job
+	return nil
+}
+
+func TestDispatcher_CallsOnTerminalFailureForRecoverableHandler(t *testing.T) {
+	r := &fakeRepo{}
+	handler := &recoverableHandler{
+		testHandler: testHandler{kind: domain.JobKindSendHITLPrompt, err: errors.New("discord unavailable")},
+	}
+	reg, _ := jobs.NewRegistry(handler)
+	d := NewDispatcher(r, reg, nil)
+
 	job := domain.JobRecord{
 		JobID:       "job-hitl-fail",
-		FlowID:      "flow:target:movie:stuck",
 		ItemID:      "target:movie:stuck",
 		Kind:        domain.JobKindSendHITLPrompt,
-		Status:      domain.JobStatusPending,
-		RunAt:       now,
-		MaxAttempts: 1,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		Attempts:    0,
+		MaxAttempts: 1, // terminal on first failure
 	}
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
-		return tx.EnqueueJob(context.Background(), job)
-	}); err != nil {
-		t.Fatalf("seed job: %v", err)
-	}
-
-	reg, _ := jobs.NewRegistry(testHandler{kind: domain.JobKindSendHITLPrompt, err: errors.New("discord unavailable")})
-	d := NewDispatcher(store, reg, nil)
-	d.now = func() time.Time { return now }
-
 	if err := d.Dispatch(context.Background(), job); err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
+	if r.failCalls != 1 || !r.lastTerminal {
+		t.Fatalf("expected terminal FailJob call, got failCalls=%d terminal=%v", r.failCalls, r.lastTerminal)
+	}
+	if handler.recoveryCalls != 1 {
+		t.Fatalf("expected OnTerminalFailure to be called once, got %d", handler.recoveryCalls)
+	}
+	if handler.lastJob.ItemID != "target:movie:stuck" {
+		t.Fatalf("expected recovery for stuck item, got %s", handler.lastJob.ItemID)
+	}
+}
 
-	// Verify a recovery job was enqueued. The original job is now failed,
-	// so GetNextQueuedJob should return the recovery job.
-	nextJob, found, err := store.GetNextQueuedJob(context.Background())
-	if err != nil {
-		t.Fatalf("get next queued job: %v", err)
+func TestDispatcher_DoesNotCallRecoveryForNonTerminal(t *testing.T) {
+	r := &fakeRepo{}
+	handler := &recoverableHandler{
+		testHandler: testHandler{kind: domain.JobKindSendHITLPrompt, err: errors.New("transient")},
 	}
-	if !found {
-		t.Fatal("expected a recovery job to be enqueued after terminal HITL prompt failure")
+	reg, _ := jobs.NewRegistry(handler)
+	d := NewDispatcher(r, reg, nil)
+
+	job := domain.JobRecord{
+		JobID:       "job-hitl-retry",
+		ItemID:      "target:movie:retry",
+		Kind:        domain.JobKindSendHITLPrompt,
+		Attempts:    0,
+		MaxAttempts: 3, // not terminal — still has retries
 	}
-	if !strings.HasPrefix(nextJob.JobID, "job:recovery:") {
-		t.Fatalf("expected recovery job ID, got %s", nextJob.JobID)
+	if err := d.Dispatch(context.Background(), job); err != nil {
+		t.Fatalf("dispatch: %v", err)
 	}
-	if nextJob.ItemID != "target:movie:stuck" {
-		t.Fatalf("expected recovery job for stuck item, got %s", nextJob.ItemID)
-	}
-	if nextJob.Status != domain.JobStatusPending {
-		t.Fatalf("expected recovery job pending, got %s", nextJob.Status)
-	}
-	if !nextJob.RunAt.After(now) {
-		t.Fatalf("expected recovery job scheduled in the future, got %s", nextJob.RunAt)
+	if handler.recoveryCalls != 0 {
+		t.Fatalf("expected no recovery call for non-terminal failure, got %d", handler.recoveryCalls)
 	}
 }

@@ -85,19 +85,17 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job domain.JobRecord) error {
 			return fmt.Errorf("mark job failed %s: %w", job.JobID, failErr)
 		}
 		if terminal {
-			switch job.Kind {
-			case domain.JobKindExecuteDelete:
+			if job.Kind == domain.JobKindExecuteDelete {
 				if markErr := d.markDeleteFlowFailed(ctx, job, err); markErr != nil {
 					d.logger.Warn("failed to mark delete flow failed", "lex", "DELETION", "job_id", job.JobID, "item_id", job.ItemID, "error", markErr)
 				}
-			case domain.JobKindSendHITLPrompt, domain.JobKindEvaluatePolicy:
-				// When a prompt or eval job exhausts retries, the flow is
-				// stuck (pending_review with no message, or active with a
-				// stale nextActionAt). Re-enqueue so the next reconciliation
-				// cycle or scheduler tick picks it up instead of waiting for
-				// a full restart.
-				if requeue := d.requeueTerminalFlowJob(ctx, job); requeue != nil {
-					d.logger.Warn("failed to requeue after terminal failure", "lex", jobLogLexicon(job.Kind), "job_id", job.JobID, "item_id", job.ItemID, "error", requeue)
+			}
+			// Let the handler roll the flow back to a recoverable state
+			// and re-schedule the singleton eval so the state machine
+			// continues from a known point.
+			if recoverer, ok := handler.(jobs.TerminalFailureRecoverer); ok {
+				if recoverErr := recoverer.OnTerminalFailure(ctx, job); recoverErr != nil {
+					d.logger.Warn("terminal failure recovery failed", "lex", jobLogLexicon(job.Kind), "job_id", job.JobID, "item_id", job.ItemID, "error", recoverErr)
 				}
 			}
 		}
@@ -112,31 +110,6 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job domain.JobRecord) error {
 	fields = append(fields, d.jobOutcomeFields(ctx, job)...)
 	d.logger.Info("job completed", fields...)
 	return nil
-}
-
-// requeueTerminalFlowJob re-enqueues a fresh job after a terminal failure
-// for job kinds that would otherwise leave a flow permanently stuck. The
-// new job runs after a cooldown so we don't spin-loop on persistent errors.
-func (d *Dispatcher) requeueTerminalFlowJob(ctx context.Context, job domain.JobRecord) error {
-	now := d.now().UTC()
-	retryAfter := now.Add(10 * time.Minute)
-	newJobID := fmt.Sprintf("job:recovery:%s:%s:%d", job.Kind, job.ItemID, now.UnixNano())
-	idempotencyKey := fmt.Sprintf("recovery:%s:%s:%d", job.Kind, job.ItemID, now.Unix()/(10*60))
-	return d.repository.WithTx(ctx, func(tx repo.TxRepository) error {
-		return tx.EnqueueJob(ctx, domain.JobRecord{
-			JobID:          newJobID,
-			FlowID:         job.FlowID,
-			ItemID:         job.ItemID,
-			Kind:           job.Kind,
-			Status:         domain.JobStatusPending,
-			RunAt:          retryAfter,
-			MaxAttempts:    job.MaxAttempts,
-			IdempotencyKey: idempotencyKey,
-			PayloadJSON:    job.PayloadJSON,
-			CreatedAt:      now,
-			UpdatedAt:      now,
-		})
-	})
 }
 
 func (d *Dispatcher) markDeleteFlowFailed(ctx context.Context, job domain.JobRecord, deleteErr error) error {
