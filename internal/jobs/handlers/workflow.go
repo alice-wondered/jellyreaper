@@ -28,6 +28,7 @@ type EvaluatePolicyHandler struct {
 	repository        repo.Repository
 	logger            *slog.Logger
 	evalScheduler     scheduler.EvalRequester
+	flowManager       *scheduler.FlowManager
 	defaultExpireDays int
 	defaultHITLHours  int
 }
@@ -36,10 +37,12 @@ func NewEvaluatePolicyHandler(repository repo.Repository, logger *slog.Logger) *
 	if logger == nil {
 		logger = slog.Default()
 	}
+	eval := scheduler.NewScheduler(nil, nil)
 	return &EvaluatePolicyHandler{
 		repository:        repository,
 		logger:            logger,
-		evalScheduler:     scheduler.NewScheduler(nil, nil),
+		evalScheduler:     eval,
+		flowManager:       scheduler.NewFlowManager(repository, eval, logger),
 		defaultExpireDays: 30,
 		defaultHITLHours:  48,
 	}
@@ -47,6 +50,7 @@ func NewEvaluatePolicyHandler(repository repo.Repository, logger *slog.Logger) *
 
 func (h *EvaluatePolicyHandler) SetEvalScheduler(s scheduler.EvalRequester) {
 	h.evalScheduler = s
+	h.flowManager = scheduler.NewFlowManager(h.repository, s, h.logger)
 }
 
 func (h *EvaluatePolicyHandler) SetDefaultExpireDays(days int) {
@@ -91,19 +95,17 @@ func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord
 		return err
 	}
 
-	return h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	shouldReview := false
+	err = h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, job.ItemID)
 		if err != nil {
 			return err
 		}
 		if !found {
-			// Flow is gone (e.g. delete handler purged it). Stale eval — bail.
 			h.logger.Info("policy evaluation skipped", "lex", "POLICY-EVAL", "item_id", job.ItemID, "reason", "flow_missing")
 			return nil
 		}
 		if payload.FlowVersion != 0 && flow.Version != payload.FlowVersion {
-			// Something newer mutated the flow after this eval was scheduled.
-			// The latest writer is responsible for scheduling the next action.
 			h.logger.Info("policy evaluation skipped", "lex", "POLICY-EVAL", "item_id", job.ItemID, "reason", "stale_version", "payload_version", payload.FlowVersion, "flow_version", flow.Version)
 			return nil
 		}
@@ -160,11 +162,9 @@ func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord
 			if createdKnown {
 				lastPlayed = createdAt
 				known = true
-				h.logger.Info("policy evaluation fallback timestamp", "lex", "POLICY-EVAL", "item_id", job.ItemID, "reason", "use_created_at", "fallback_at", lastPlayed)
 			} else {
 				lastPlayed = time.Unix(0, 0).UTC()
 				known = true
-				h.logger.Info("policy evaluation fallback timestamp", "lex", "POLICY-EVAL", "item_id", job.ItemID, "reason", "use_epoch", "fallback_at", lastPlayed)
 			}
 		}
 		if known {
@@ -177,52 +177,27 @@ func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord
 				if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
 					return err
 				}
-
 				h.logger.Info("policy evaluation deferred", "lex", "POLICY-EVAL", "item_id", job.ItemID, "reason", "not_due_yet", "last_played_at", lastPlayed, "due_at", dueAt)
 				return h.evalScheduler.RequestEval(ctx, tx, flow, now, dueAt, "not_due_yet", "eval:"+flow.ItemID, flow.Version)
 			}
 		}
 
-		expected := flow.Version
-		flow.State = domain.FlowStatePendingReview
-		// Clear any prior cycle's outcome so the fresh PendingReview phase
-		// starts unpoisoned. The previous outcome (e.g. "played", "delay")
-		// belonged to a cycle that has now closed.
-		flow.HITLOutcome = ""
-		flow.DecisionDeadlineAt = time.Time{}
-		flow.UpdatedAt = now
-		flow.Version = expected + 1
-		if flow.CreatedAt.IsZero() {
-			flow.CreatedAt = now
-		}
-		if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
-			return err
-		}
-
-		promptPayload, err := json.Marshal(jobs.SendHITLPromptPayload{
-			ChannelID:   flow.Discord.ChannelID,
-			FlowVersion: flow.Version,
-		})
-		if err != nil {
-			return err
-		}
-
-		promptJob := domain.JobRecord{
-			JobID:          "job:prompt:" + job.ItemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
-			FlowID:         flow.FlowID,
-			ItemID:         flow.ItemID,
-			Kind:           domain.JobKindSendHITLPrompt,
-			Status:         domain.JobStatusPending,
-			RunAt:          now,
-			MaxAttempts:    5,
-			IdempotencyKey: "job:prompt:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version, 10),
-			PayloadJSON:    promptPayload,
-			CreatedAt:      now,
-			UpdatedAt:      now,
-		}
-		h.logger.Info("policy evaluation queued hitl", "lex", "POLICY-EVAL", "item_id", job.ItemID, "reason", "stale_due", "flow_state", flow.State, "flow_version", flow.Version)
-		return tx.EnqueueJob(ctx, promptJob)
+		shouldReview = true
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if shouldReview {
+		if _, err := h.flowManager.RequestReview(ctx, job.ItemID, scheduler.TransitionSource{
+			Source: "scheduler",
+			Reason: "policy_eval_due",
+		}); err != nil {
+			return err
+		}
+		h.logger.Info("policy evaluation queued hitl", "lex", "POLICY-EVAL", "item_id", job.ItemID, "reason", "due")
+	}
+	return nil
 }
 
 func mostRecentPlayForFlow(ctx context.Context, tx repo.TxRepository, flow domain.Flow) (time.Time, bool, error) {
@@ -301,6 +276,7 @@ type SendHITLPromptHandler struct {
 	defaultChannelID string
 	hitlTimeout      time.Duration
 	evalScheduler    scheduler.EvalRequester
+	flowManager      *scheduler.FlowManager
 }
 
 func NewSendHITLPromptHandler(repository repo.Repository, logger *slog.Logger, discord *discord.Service, defaultChannelID string, hitlTimeout time.Duration) *SendHITLPromptHandler {
@@ -322,6 +298,7 @@ func NewSendHITLPromptHandler(repository repo.Repository, logger *slog.Logger, d
 
 func (h *SendHITLPromptHandler) SetEvalScheduler(s scheduler.EvalRequester) {
 	h.evalScheduler = s
+	h.flowManager = scheduler.NewFlowManager(h.repository, s, h.logger)
 }
 
 func (h *SendHITLPromptHandler) Kind() domain.JobKind { return domain.JobKindSendHITLPrompt }
@@ -546,45 +523,39 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 // and re-schedules the singleton evaluate_policy job so the state machine
 // will re-attempt the HITL cycle after a cooldown.
 func (h *SendHITLPromptHandler) OnTerminalFailure(ctx context.Context, job domain.JobRecord) error {
-	now := time.Now().UTC()
-	retryAfter := now.Add(10 * time.Minute)
-	return h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
-		flow, found, err := tx.GetFlow(ctx, job.ItemID)
-		if err != nil {
-			return err
-		}
-		if !found {
-			return nil
-		}
-		if flow.State != domain.FlowStatePendingReview {
-			return nil
-		}
-		expected := flow.Version
-		flow.State = domain.FlowStateActive
-		flow.HITLOutcome = ""
-		flow.DecisionDeadlineAt = time.Time{}
-		flow.NextActionAt = retryAfter
-		flow.UpdatedAt = now
-		flow.Version = expected + 1
-		if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
-			return err
-		}
-		h.logger.Info("hitl prompt terminal failure: rolled flow back to active", "lex", "HITL-PROMPT", "item_id", job.ItemID, "retry_at", retryAfter)
-		return h.evalScheduler.RequestEval(ctx, tx, flow, now, retryAfter, "hitl_prompt_recovery", "eval:recovery:"+flow.ItemID, flow.Version)
+	_, err := h.flowManager.RollbackToActive(ctx, job.ItemID, 10*time.Minute, scheduler.TransitionSource{
+		Source: "scheduler",
+		Reason: "hitl_prompt_recovery",
 	})
+	if err != nil {
+		h.logger.Warn("hitl prompt terminal failure recovery failed", "lex", "HITL-PROMPT", "item_id", job.ItemID, "error", err)
+		return err
+	}
+	h.logger.Info("hitl prompt terminal failure: rolled flow back to active", "lex", "HITL-PROMPT", "item_id", job.ItemID)
+	return nil
 }
 
 type HITLTimeoutHandler struct {
-	repository repo.Repository
-	discord    *discord.Service
-	logger     *slog.Logger
+	repository  repo.Repository
+	discord     *discord.Service
+	logger      *slog.Logger
+	flowManager *scheduler.FlowManager
 }
 
 func NewHITLTimeoutHandler(repository repo.Repository, discordSvc *discord.Service, logger *slog.Logger) *HITLTimeoutHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &HITLTimeoutHandler{repository: repository, discord: discordSvc, logger: logger}
+	return &HITLTimeoutHandler{
+		repository:  repository,
+		discord:     discordSvc,
+		logger:      logger,
+		flowManager: scheduler.NewFlowManager(repository, nil, logger),
+	}
+}
+
+func (h *HITLTimeoutHandler) SetFlowManager(fm *scheduler.FlowManager) {
+	h.flowManager = fm
 }
 
 func (h *HITLTimeoutHandler) Kind() domain.JobKind { return domain.JobKindHITLTimeout }
@@ -641,9 +612,7 @@ func (h *HITLTimeoutHandler) Handle(ctx context.Context, job domain.JobRecord) e
 		return fmt.Errorf("decode timeout payload: %w", err)
 	}
 
-	finalizeChannelID := ""
-	finalizeMessageID := ""
-	finalizeDisplayName := ""
+	shouldDelete := false
 	err = h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, job.ItemID)
 		if err != nil {
@@ -701,55 +670,28 @@ func (h *HITLTimeoutHandler) Handle(ctx context.Context, job domain.JobRecord) e
 			})
 		}
 
-		expected := flow.Version
-		flow.State = domain.FlowStateDeleteQueued
-		flow.NextActionAt = now
-		flow.HITLOutcome = "delete"
-		flow.UpdatedAt = now
-		flow.Version = expected + 1
-		if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
-			return err
-		}
-
-		finalizeChannelID = flow.Discord.ChannelID
-		finalizeMessageID = flow.Discord.MessageID
-		finalizeDisplayName = flow.DisplayName
-
-		// Delete jobs intentionally carry no FlowVersion — destruction is
-		// authoritative.
-		deletePayload, err := json.Marshal(jobs.ExecuteDeletePayload{RequestedBy: "timeout"})
-		if err != nil {
-			return err
-		}
-		return tx.EnqueueJob(ctx, domain.JobRecord{
-			JobID:          "job:delete:" + job.ItemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
-			FlowID:         flow.FlowID,
-			ItemID:         flow.ItemID,
-			Kind:           domain.JobKindExecuteDelete,
-			Status:         domain.JobStatusPending,
-			RunAt:          now,
-			MaxAttempts:    5,
-			IdempotencyKey: "job:delete:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version, 10),
-			PayloadJSON:    deletePayload,
-			CreatedAt:      now,
-			UpdatedAt:      now,
-		})
+		shouldDelete = true
+		return nil
 	})
 	if err != nil {
 		return err
 	}
+	if !shouldDelete {
+		return nil
+	}
 
-	if h.discord != nil && finalizeChannelID != "" && finalizeMessageID != "" {
-		name := strings.TrimSpace(finalizeDisplayName)
-		if name == "" {
-			name = strings.TrimSpace(job.ItemID)
-		}
-		content := fmt.Sprintf("Resolved: DELETE REQUESTED for %s (timeout).", name)
-		if err := h.discord.FinalizeHITLPrompt(ctx, finalizeChannelID, finalizeMessageID, content); err != nil {
+	result, err := h.flowManager.Delete(ctx, job.ItemID, scheduler.TransitionSource{
+		Source: "scheduler",
+		Reason: "hitl_timeout",
+	})
+	if err != nil {
+		return err
+	}
+	if h.discord != nil && result.FinalizePrompt != nil {
+		if err := h.discord.FinalizeHITLPrompt(ctx, result.FinalizePrompt.ChannelID, result.FinalizePrompt.MessageID, result.FinalizePrompt.Content); err != nil {
 			h.logger.Warn("failed to finalize timeout HITL message", "item_id", job.ItemID, "error", err)
 		}
 	}
-
 	return nil
 }
 

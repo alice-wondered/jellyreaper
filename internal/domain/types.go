@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 type FlowState string
 
@@ -76,6 +79,20 @@ type DiscordContext struct {
 	PreviousChannelID string `json:"previous_channel_id"`
 	PreviousMessageID string `json:"previous_message_id"`
 	ThreadID          string `json:"thread_id"`
+}
+
+// ClearPromptLink archives the current message link into Previous fields
+// and clears MessageID so a new prompt can be sent.
+func (d *DiscordContext) ClearPromptLink() {
+	if d == nil {
+		return
+	}
+	msg := strings.TrimSpace(d.MessageID)
+	if msg != "" {
+		d.PreviousChannelID = strings.TrimSpace(d.ChannelID)
+		d.PreviousMessageID = msg
+	}
+	d.MessageID = ""
 }
 
 type Flow struct {

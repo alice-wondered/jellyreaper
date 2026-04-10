@@ -144,10 +144,11 @@ func main() {
 	executeDeleteHandler.SetDiscordService(discordService)
 	hitlTimeout := time.Duration(cfg.DefaultHITLTimeoutHours) * time.Hour
 	sendHITLPromptHandler := handlers.NewSendHITLPromptHandler(store, logger, discordService, cfg.DiscordChannelID, hitlTimeout)
+	hitlTimeoutHandler := handlers.NewHITLTimeoutHandler(store, discordService, logger)
 	handlerList := []jobs.JobHandler{
 		evaluatePolicyHandler,
 		sendHITLPromptHandler,
-		handlers.NewHITLTimeoutHandler(store, discordService, logger),
+		hitlTimeoutHandler,
 		executeDeleteHandler,
 		handlers.NewNoopHandler(domain.JobKindVerifyDelete, logger),
 		handlers.NewNoopHandler(domain.JobKindReconcileItem, logger),
@@ -209,6 +210,7 @@ func main() {
 	schedulerObj := scheduler.NewScheduler(schedulerLoop, wake)
 	evaluatePolicyHandler.SetEvalScheduler(schedulerObj)
 	sendHITLPromptHandler.SetEvalScheduler(schedulerObj)
+	hitlTimeoutHandler.SetFlowManager(scheduler.NewFlowManager(store, schedulerObj, logger))
 	appService.SetEvalScheduler(schedulerObj)
 
 	if len(cfg.DiscordPublicKey) == 0 {
