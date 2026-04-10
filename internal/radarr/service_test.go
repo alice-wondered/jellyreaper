@@ -10,22 +10,36 @@ import (
 )
 
 func TestRemoveByProviderIDsDeletesMatchedMovie(t *testing.T) {
-	var sawDelete bool
+	var sawFileList, sawFileBulkDelete, sawMovieDelete bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/movie":
 			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 42, "tmdbId": 603, "imdbId": "tt0133093", "title": "Sample Movie"}})
-		case r.Method == http.MethodDelete && r.URL.Path == "/api/v3/movie/42":
-			if got := r.URL.Query().Get("deleteFiles"); got != "true" {
-				t.Fatalf("expected deleteFiles=true, got %q", got)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/moviefile":
+			if got := r.URL.Query().Get("movieId"); got != "42" {
+				t.Fatalf("expected movieId=42, got %q", got)
 			}
-			if got := r.URL.Query().Get("addImportExclusion"); got != "false" {
-				t.Fatalf("expected addImportExclusion=false, got %q", got)
+			sawFileList = true
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 101}, {"id": 102}})
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v3/moviefile/bulk":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode bulk delete body: %v", err)
+			}
+			ids, ok := body["movieFileIds"].([]any)
+			if !ok || len(ids) != 2 {
+				t.Fatalf("expected 2 movieFileIds, got %#v", body["movieFileIds"])
+			}
+			sawFileBulkDelete = true
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v3/movie/42":
+			if got := r.URL.Query().Get("deleteFiles"); got != "false" {
+				t.Fatalf("expected deleteFiles=false (files already removed), got %q", got)
 			}
 			if got := r.Header.Get("X-Api-Key"); got != "k" {
 				t.Fatalf("expected api key header, got %q", got)
 			}
-			sawDelete = true
+			sawMovieDelete = true
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -37,8 +51,14 @@ func TestRemoveByProviderIDsDeletesMatchedMovie(t *testing.T) {
 	if err := svc.RemoveByProviderIDs(context.Background(), map[string]string{"tmdb": "603"}); err != nil {
 		t.Fatalf("remove by provider ids: %v", err)
 	}
-	if !sawDelete {
-		t.Fatal("expected matched movie to be deleted")
+	if !sawFileList {
+		t.Fatal("expected moviefile list call")
+	}
+	if !sawFileBulkDelete {
+		t.Fatal("expected moviefile bulk delete call")
+	}
+	if !sawMovieDelete {
+		t.Fatal("expected movie entry delete call")
 	}
 }
 
@@ -47,6 +67,8 @@ func TestRemoveByProviderIDs404IsIdempotent(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/movie":
 			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 7, "tmdbId": 603, "imdbId": "tt0133093"}})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/moviefile":
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
 		case r.Method == http.MethodDelete && r.URL.Path == "/api/v3/movie/7":
 			w.WriteHeader(http.StatusNotFound)
 		default:
