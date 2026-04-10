@@ -57,3 +57,13 @@ type JobHandler interface {
 	Kind() domain.JobKind
 	Handle(ctx context.Context, job domain.JobRecord) error
 }
+
+// TerminalFailureRecoverer is optionally implemented by handlers that need
+// to clean up flow state when a job exhausts its retries. The dispatcher
+// calls OnTerminalFailure after marking the job as failed-terminal.
+// Implementations should transactionally roll the flow back to a good
+// state and re-schedule the singleton eval job so the state machine
+// continues from a known point.
+type TerminalFailureRecoverer interface {
+	OnTerminalFailure(ctx context.Context, job domain.JobRecord) error
+}

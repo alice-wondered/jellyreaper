@@ -143,9 +143,10 @@ func main() {
 	executeDeleteHandler := handlers.NewExecuteDeleteHandler(store, jellyfin.NewClient(cfg.JellyfinURL, cfg.JellyfinAPIKey, nil))
 	executeDeleteHandler.SetDiscordService(discordService)
 	hitlTimeout := time.Duration(cfg.DefaultHITLTimeoutHours) * time.Hour
+	sendHITLPromptHandler := handlers.NewSendHITLPromptHandler(store, logger, discordService, cfg.DiscordChannelID, hitlTimeout)
 	handlerList := []jobs.JobHandler{
 		evaluatePolicyHandler,
-		handlers.NewSendHITLPromptHandler(store, logger, discordService, cfg.DiscordChannelID, hitlTimeout),
+		sendHITLPromptHandler,
 		handlers.NewHITLTimeoutHandler(store, discordService, logger),
 		executeDeleteHandler,
 		handlers.NewNoopHandler(domain.JobKindVerifyDelete, logger),
@@ -207,6 +208,7 @@ func main() {
 	})
 	schedulerObj := scheduler.NewScheduler(schedulerLoop, wake)
 	evaluatePolicyHandler.SetEvalScheduler(schedulerObj)
+	sendHITLPromptHandler.SetEvalScheduler(schedulerObj)
 	appService.SetEvalScheduler(schedulerObj)
 
 	if len(cfg.DiscordPublicKey) == 0 {
@@ -265,6 +267,17 @@ func main() {
 				go runBackfillLoop(ctx, logger, store, appService, discordService, cfg, backfillSvc, false)
 			}
 		}
+	}
+
+	// One-time startup reconciliation catches flows that got stuck in a
+	// prior run (e.g. pending_review with no HITL prompt, or active flows
+	// past their nextActionAt). At runtime, handlers themselves manage
+	// recovery by rolling flows back to a good state and re-scheduling
+	// the singleton eval job on terminal failure.
+	if reconciled, err := appService.ReconcileStaleFlows(ctx); err != nil {
+		logger.Warn("stale flow reconciliation failed", "error", err)
+	} else if reconciled > 0 {
+		logger.Info("reconciled stale flows on startup", "count", reconciled)
 	}
 
 	go func() {

@@ -84,9 +84,19 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job domain.JobRecord) error {
 		if failErr := d.repository.FailJob(ctx, job.JobID, err.Error(), retryAt, terminal); failErr != nil {
 			return fmt.Errorf("mark job failed %s: %w", job.JobID, failErr)
 		}
-		if terminal && job.Kind == domain.JobKindExecuteDelete {
-			if markErr := d.markDeleteFlowFailed(ctx, job, err); markErr != nil {
-				d.logger.Warn("failed to mark delete flow failed", "lex", "DELETION", "job_id", job.JobID, "item_id", job.ItemID, "error", markErr)
+		if terminal {
+			if job.Kind == domain.JobKindExecuteDelete {
+				if markErr := d.markDeleteFlowFailed(ctx, job, err); markErr != nil {
+					d.logger.Warn("failed to mark delete flow failed", "lex", "DELETION", "job_id", job.JobID, "item_id", job.ItemID, "error", markErr)
+				}
+			}
+			// Let the handler roll the flow back to a recoverable state
+			// and re-schedule the singleton eval so the state machine
+			// continues from a known point.
+			if recoverer, ok := handler.(jobs.TerminalFailureRecoverer); ok {
+				if recoverErr := recoverer.OnTerminalFailure(ctx, job); recoverErr != nil {
+					d.logger.Warn("terminal failure recovery failed", "lex", jobLogLexicon(job.Kind), "job_id", job.JobID, "item_id", job.ItemID, "error", recoverErr)
+				}
 			}
 		}
 		return nil

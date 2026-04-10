@@ -2746,3 +2746,96 @@ func TestWebhookPlaybackRecoveryPurgesStaleHITLJobs(t *testing.T) {
 		t.Fatalf("verify jobs: %v", err)
 	}
 }
+
+func TestReconcileStaleFlows(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	// Seed a pending_review flow with no Discord message — should be reconciled.
+	staleItem := "target:movie:stale-pending"
+	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:" + staleItem,
+			ItemID:      staleItem,
+			SubjectType: "movie",
+			DisplayName: "Stale Pending Movie",
+			State:       domain.FlowStatePendingReview,
+			Version:     0,
+			NextActionAt: time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC),
+			PolicySnapshot: domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 48, TimeoutAction: "delete"},
+			CreatedAt:   now.Add(-365 * 24 * time.Hour),
+			UpdatedAt:   now.Add(-365 * 24 * time.Hour),
+		}, 0)
+	})
+	if err != nil {
+		t.Fatalf("seed stale flow: %v", err)
+	}
+
+	// Seed an active flow with past nextActionAt — should also be reconciled.
+	staleActive := "target:movie:stale-active"
+	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:       "flow:" + staleActive,
+			ItemID:       staleActive,
+			SubjectType:  "movie",
+			DisplayName:  "Stale Active Movie",
+			State:        domain.FlowStateActive,
+			Version:      0,
+			NextActionAt: time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC),
+			PolicySnapshot: domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 48, TimeoutAction: "delete"},
+			CreatedAt:    now.Add(-730 * 24 * time.Hour),
+			UpdatedAt:    now.Add(-730 * 24 * time.Hour),
+		}, 0)
+	})
+	if err != nil {
+		t.Fatalf("seed stale active flow: %v", err)
+	}
+
+	reconciled, err := svc.ReconcileStaleFlows(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile stale flows: %v", err)
+	}
+	if reconciled != 2 {
+		t.Fatalf("expected 2 reconciled flows, got %d", reconciled)
+	}
+}
+
+func TestRequestImmediateReview(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	itemID := "target:movie:review-now"
+	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:       "flow:" + itemID,
+			ItemID:       itemID,
+			SubjectType:  "movie",
+			DisplayName:  "Review Now Movie",
+			State:        domain.FlowStateActive,
+			Version:      0,
+			NextActionAt: now.Add(30 * 24 * time.Hour),
+			PolicySnapshot: domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 48, TimeoutAction: "delete"},
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		}, 0)
+	})
+	if err != nil {
+		t.Fatalf("seed flow: %v", err)
+	}
+
+	if err := svc.RequestImmediateReview(context.Background(), itemID); err != nil {
+		t.Fatalf("request immediate review: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, itemID)
+	if flow.State != domain.FlowStatePendingReview {
+		t.Fatalf("expected pending_review, got %s", flow.State)
+	}
+	if flow.NextActionAt != now {
+		t.Fatalf("expected next_action_at to be now, got %s", flow.NextActionAt)
+	}
+}

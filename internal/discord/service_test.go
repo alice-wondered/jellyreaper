@@ -1,6 +1,10 @@
 package discord
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/bwmarrin/discordgo"
+)
 
 func TestNormalizeHTTPURL_StrictValidation(t *testing.T) {
 	if got := normalizeHTTPURL("https://example.com/image.jpg"); got == "" {
@@ -30,6 +34,38 @@ func TestFinalizeEmojiForOutcome(t *testing.T) {
 	}
 	if got := finalizeEmojiForOutcome("Resolved: DELAYED for X"); got != "⏸" {
 		t.Fatalf("unexpected delay emoji: %q", got)
+	}
+}
+
+func TestIsThreadChannel(t *testing.T) {
+	if isThreadChannel(nil) {
+		t.Fatal("nil should not be a thread")
+	}
+	ch := &discordgo.Channel{Type: discordgo.ChannelTypeGuildPublicThread}
+	if !isThreadChannel(ch) {
+		t.Fatal("public thread should be detected")
+	}
+	ch.Type = discordgo.ChannelTypeGuildPrivateThread
+	if !isThreadChannel(ch) {
+		t.Fatal("private thread should be detected")
+	}
+	ch.Type = discordgo.ChannelTypeGuildText
+	if isThreadChannel(ch) {
+		t.Fatal("text channel should not be detected as thread")
+	}
+}
+
+func TestTrackAndDetectActiveThread(t *testing.T) {
+	svc := &Service{}
+	if svc.isActiveThread("thread-1") {
+		t.Fatal("empty service should not have active threads")
+	}
+	svc.TrackThread("thread-1")
+	if !svc.isActiveThread("thread-1") {
+		t.Fatal("tracked thread should be detected as active")
+	}
+	if svc.isActiveThread("thread-other") {
+		t.Fatal("untracked thread should not be active")
 	}
 }
 
