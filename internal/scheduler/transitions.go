@@ -417,7 +417,7 @@ func (m *FlowManager) RequestReview(ctx context.Context, itemID string, src Tran
 			return err
 		}
 		if err := tx.EnqueueJob(ctx, domain.JobRecord{
-			JobID:          "job:prompt:" + flow.ItemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
+			JobID:          "job:prompt:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version, 10) + ":" + strconv.FormatInt(now.UnixNano(), 10),
 			FlowID:         flow.FlowID,
 			ItemID:         flow.ItemID,
 			Kind:           domain.JobKindSendHITLPrompt,
@@ -501,7 +501,7 @@ func (m *FlowManager) appendTransitionEvent(ctx context.Context, tx repo.TxRepos
 		payload["actor"] = src.Actor
 	}
 	return tx.AppendEvent(ctx, domain.Event{
-		EventID:        "evt:" + shortHash(flow.ItemID+":"+action+":"+strconv.FormatInt(now.UnixNano(), 10)),
+		EventID:        "evt:" + shortHash(flow.ItemID+":"+action+":"+strconv.FormatInt(flow.Version, 10)+":"+strconv.FormatInt(now.UnixNano(), 10)),
 		FlowID:         flow.FlowID,
 		ItemID:         flow.ItemID,
 		Type:           eventType,
