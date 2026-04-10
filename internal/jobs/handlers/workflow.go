@@ -575,19 +575,63 @@ func (h *SendHITLPromptHandler) OnTerminalFailure(ctx context.Context, job domai
 }
 
 type HITLTimeoutHandler struct {
-	repository repo.Repository
-	discord    *discord.Service
-	logger     *slog.Logger
+	repository    repo.Repository
+	discord       *discord.Service
+	logger        *slog.Logger
+	evalScheduler scheduler.EvalRequester
 }
 
 func NewHITLTimeoutHandler(repository repo.Repository, discordSvc *discord.Service, logger *slog.Logger) *HITLTimeoutHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &HITLTimeoutHandler{repository: repository, discord: discordSvc, logger: logger}
+	return &HITLTimeoutHandler{
+		repository:    repository,
+		discord:       discordSvc,
+		logger:        logger,
+		evalScheduler: scheduler.NewScheduler(nil, nil),
+	}
+}
+
+func (h *HITLTimeoutHandler) SetEvalScheduler(s scheduler.EvalRequester) {
+	h.evalScheduler = s
 }
 
 func (h *HITLTimeoutHandler) Kind() domain.JobKind { return domain.JobKindHITLTimeout }
+
+// OnTerminalFailure rolls the flow back from pending_review to active
+// and re-schedules the singleton eval so the timeout cycle retries.
+// The HITL prompt message (if any) is left in Discord — when the eval
+// re-enters pending_review the prompt handler will detect the stale
+// message and re-send.
+func (h *HITLTimeoutHandler) OnTerminalFailure(ctx context.Context, job domain.JobRecord) error {
+	now := time.Now().UTC()
+	retryAfter := now.Add(10 * time.Minute)
+	return h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		flow, found, err := tx.GetFlow(ctx, job.ItemID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return nil
+		}
+		if flow.State != domain.FlowStatePendingReview {
+			return nil
+		}
+		expected := flow.Version
+		flow.State = domain.FlowStateActive
+		flow.HITLOutcome = ""
+		flow.DecisionDeadlineAt = time.Time{}
+		flow.NextActionAt = retryAfter
+		flow.UpdatedAt = now
+		flow.Version = expected + 1
+		if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
+			return err
+		}
+		h.logger.Info("hitl timeout terminal failure: rolled flow back to active", "lex", "HITL-TIMEOUT", "item_id", job.ItemID, "retry_at", retryAfter)
+		return h.evalScheduler.RequestEval(ctx, tx, flow, now, retryAfter, "hitl_timeout_recovery", "eval:recovery:"+flow.ItemID, flow.Version)
+	})
+}
 
 func (h *HITLTimeoutHandler) Handle(ctx context.Context, job domain.JobRecord) error {
 	now := time.Now().UTC()
