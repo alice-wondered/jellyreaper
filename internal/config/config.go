@@ -31,6 +31,7 @@ const (
 	defaultDelayWindow                = 15 * 24 * time.Hour
 	defaultLastPlayedThresholdDays    = 60
 	defaultHITLTimeoutHours           = 48
+	defaultEventRetention             = 90 * 24 * time.Hour // 2160h
 )
 
 type Config struct {
@@ -73,6 +74,7 @@ type Config struct {
 	DefaultDelayWindow             time.Duration
 	DefaultLastPlayedThresholdDays int
 	DefaultHITLTimeoutHours        int
+	EventRetention                 time.Duration
 }
 
 func LoadFromEnv() (Config, error) {
@@ -196,6 +198,11 @@ func LoadFromEnv() (Config, error) {
 		defaultHITLTimeoutHours = parsed
 	}
 
+	eventRetention, err := parseDurationEnv("EVENT_RETENTION", defaultEventRetention)
+	if err != nil {
+		return Config{}, err
+	}
+
 	cfg := Config{
 		HTTPAddr: httpAddr,
 		HTTPPort: httpPort,
@@ -234,6 +241,7 @@ func LoadFromEnv() (Config, error) {
 		DefaultDelayWindow:             defaultDelayWindow,
 		DefaultLastPlayedThresholdDays: defaultLastPlayedThresholdDays,
 		DefaultHITLTimeoutHours:        defaultHITLTimeoutHours,
+		EventRetention:                 eventRetention,
 	}
 
 	if raw := os.Getenv("DISCORD_PUBLIC_KEY_HEX"); raw != "" {

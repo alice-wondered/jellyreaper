@@ -1008,6 +1008,54 @@ func humanTimeLabel(t time.Time) string {
 	return fmt.Sprintf("<t:%d:R> (<t:%d:f>)", unix, unix)
 }
 
+// EventPruner prunes event records older than a retention window. The concrete
+// implementation lives in internal/app (Service.PruneOldEvents) and is
+// injected at wire-up time to avoid a circular import.
+type EventPruner interface {
+	PruneOldEvents(ctx context.Context, retention time.Duration) (int, error)
+}
+
+// PruneEventsHandler handles JobKindPruneEvents jobs by delegating to the
+// EventPruner. It is scheduled daily and is safe to run concurrently with
+// normal webhook processing because all mutations happen inside a write
+// transaction.
+type PruneEventsHandler struct {
+	pruner    EventPruner
+	retention time.Duration
+	logger    *slog.Logger
+}
+
+func NewPruneEventsHandler(pruner EventPruner, retention time.Duration, logger *slog.Logger) *PruneEventsHandler {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if retention <= 0 {
+		retention = 90 * 24 * time.Hour
+	}
+	return &PruneEventsHandler{pruner: pruner, retention: retention, logger: logger}
+}
+
+// SetPruner injects the EventPruner after construction. Used when the pruner
+// (app.Service) must be constructed after the handler list is assembled.
+func (h *PruneEventsHandler) SetPruner(p EventPruner) {
+	h.pruner = p
+}
+
+func (h *PruneEventsHandler) Kind() domain.JobKind { return domain.JobKindPruneEvents }
+
+func (h *PruneEventsHandler) Handle(ctx context.Context, job domain.JobRecord) error {
+	if h.pruner == nil {
+		h.logger.InfoContext(ctx, "prune events skipped: no pruner configured", "lex", "PRUNE-EVENTS", "job_id", job.JobID)
+		return nil
+	}
+	pruned, err := h.pruner.PruneOldEvents(ctx, h.retention)
+	if err != nil {
+		return fmt.Errorf("prune events job %s: %w", job.JobID, err)
+	}
+	h.logger.InfoContext(ctx, "prune events job complete", "lex", "PRUNE-EVENTS", "job_id", job.JobID, "pruned", pruned)
+	return nil
+}
+
 // OOBReconciler performs out-of-band deletion reconciliation. The concrete
 // implementation lives in internal/app (Service.ReconcileOOBDeletions) and is
 // injected at wire-up time to avoid a circular import.

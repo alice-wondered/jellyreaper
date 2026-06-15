@@ -40,6 +40,10 @@ const (
 	JobKindExecuteDelete  JobKind = "execute_delete"
 	JobKindVerifyDelete   JobKind = "verify_delete"
 	JobKindReconcileItem  JobKind = "reconcile_item"
+	// JobKindPruneEvents is the scheduled maintenance job that deletes event
+	// records older than the configured retention window. It is singleton-keyed
+	// by calendar day (like JobKindReconcileItem) and is safe to enqueue daily.
+	JobKindPruneEvents JobKind = "prune_events"
 )
 
 type MediaItem struct {

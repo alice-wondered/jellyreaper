@@ -692,6 +692,46 @@ func (t *txRepo) AppendEvent(ctx context.Context, event domain.Event) error {
 	return nil
 }
 
+// PruneEvents deletes all events from the events bucket whose OccurredAt is
+// strictly before olderThan. It decodes each event to read OccurredAt, using
+// the same JSON encoding that AppendEvent writes. Returns the count deleted.
+func (t *txRepo) PruneEvents(ctx context.Context, olderThan time.Time) (int, error) {
+	if err := checkContext(ctx); err != nil {
+		return 0, err
+	}
+	b, err := requireBucket(t.tx, bucketEvents)
+	if err != nil {
+		return 0, err
+	}
+
+	// Collect keys to delete first; bbolt cursors must not be mutated during
+	// forward iteration.
+	var toDelete []string
+	if err := b.ForEach(func(k, v []byte) error {
+		if err := checkContext(ctx); err != nil {
+			return err
+		}
+		var evt domain.Event
+		if err := json.Unmarshal(v, &evt); err != nil {
+			// Skip entries we cannot decode rather than aborting the prune run.
+			return nil
+		}
+		if evt.OccurredAt.Before(olderThan) {
+			toDelete = append(toDelete, string(k))
+		}
+		return nil
+	}); err != nil {
+		return 0, fmt.Errorf("prune events scan: %w", err)
+	}
+
+	for _, key := range toDelete {
+		if err := b.Delete(keyBytes(key)); err != nil {
+			return 0, fmt.Errorf("prune events delete %s: %w", key, err)
+		}
+	}
+	return len(toDelete), nil
+}
+
 func (t *txRepo) EnqueueJob(ctx context.Context, job domain.JobRecord) error {
 	if err := checkContext(ctx); err != nil {
 		return err
