@@ -22,6 +22,12 @@ import (
 	"jellyreaper/internal/scheduler"
 )
 
+// itemExistenceChecker is the narrow read-only Jellyfin interface used for
+// out-of-band deletion reconciliation. *jellyfin.Client satisfies it.
+type itemExistenceChecker interface {
+	CheckItemsExist(ctx context.Context, itemIDs []string) (map[string]bool, error)
+}
+
 const (
 	defaultDelayDuration         = 24 * time.Hour
 	defaultExpireDays            = 30
@@ -287,6 +293,274 @@ func (s *Service) ReconcileStaleFlows(ctx context.Context) (int, error) {
 		s.wake(now)
 	}
 	return reconciled, nil
+}
+
+// ReconcileOOBDeletions detects flows whose underlying Jellyfin items have
+// been deleted out-of-band (e.g. via Sonarr/Radarr without jellyreaper
+// receiving a removal webhook) and prunes them idempotently.
+//
+// This is the public entry point called by the scheduler job handler
+// (handlers.ReconcileOOBHandler). It uses the service's configured Jellyfin
+// client. For tests that need to inject a mock checker use
+// ReconcileOOBDeletionsWithChecker.
+//
+// TRANSACTION RULE: all network I/O against Jellyfin happens OUTSIDE any
+// bbolt transaction. We collect the live ID set first, then open write
+// transactions to apply the pruning. This prevents ErrIOInTransaction.
+func (s *Service) ReconcileOOBDeletions(ctx context.Context) (int, error) {
+	return s.ReconcileOOBDeletionsWithChecker(ctx, nil)
+}
+
+// ReconcileOOBDeletionsWithChecker is the testable variant that accepts an
+// explicit checker. Pass nil to fall back to the configured jellyfinClient.
+//
+// All state mutations route through the same repository primitives used by the
+// removal-event webhook path (tx.DeleteFlow, tx.DeleteMedia,
+// tx.DeleteJobsForItem) — no flow or job records are mutated directly from
+// outside the transaction, and no scheduler state is touched outside of those
+// primitives.
+//
+// checker is the Jellyfin client used to probe which items are still alive. Pass
+// nil to use the service's configured jellyfinClient; an explicit checker is
+// accepted here so the method is testable without real HTTP.
+func (s *Service) ReconcileOOBDeletionsWithChecker(ctx context.Context, checker itemExistenceChecker) (int, error) {
+	if checker == nil {
+		if s.jellyfinClient == nil {
+			s.logger.InfoContext(ctx, "oob reconciliation skipped: no jellyfin client configured", "lex", "RECONCILE-OOB")
+			return 0, nil
+		}
+		checker = s.jellyfinClient
+	}
+
+	// ── Step 1: collect all active flows (read-only tx) ──────────────────────
+	var flows []domain.Flow
+	if err := s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
+		var err error
+		flows, err = tx.ListFlows(ctx)
+		return err
+	}); err != nil {
+		return 0, fmt.Errorf("reconcile oob: list flows: %w", err)
+	}
+	if len(flows) == 0 {
+		return 0, nil
+	}
+
+	// ── Step 2: build the set of Jellyfin item IDs to probe ──────────────────
+	// We only probe flows that are still "live" from jellyreaper's perspective
+	// (not already DeleteQueued / DeleteFailed / Deleted / Archived). Those
+	// terminal states are either already being handled or have been explicitly
+	// decided by the user.
+	type flowEntry struct {
+		flow           domain.Flow
+		jellyfinItemID string // the raw Jellyfin ID to probe
+	}
+	candidates := make([]flowEntry, 0, len(flows))
+	jellyfinIDSet := make([]string, 0, len(flows))
+
+	for _, f := range flows {
+		switch f.State {
+		case domain.FlowStateDeleteQueued, domain.FlowStateDeleteFailed,
+			domain.FlowStateDeleted, domain.FlowStateArchived:
+			// Skip – terminal or user-decided.
+			continue
+		}
+
+		// Extract the raw Jellyfin item ID from the canonical target key.
+		// Format: "target:<type>:<jellyfinID>"  OR just a bare item ID (legacy).
+		rawID := extractJellyfinIDFromFlowItemID(f.ItemID)
+		if rawID == "" {
+			continue
+		}
+		candidates = append(candidates, flowEntry{flow: f, jellyfinItemID: rawID})
+		jellyfinIDSet = append(jellyfinIDSet, rawID)
+	}
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+
+	// ── Step 3: probe Jellyfin (OUTSIDE any transaction) ─────────────────────
+	present, err := checker.CheckItemsExist(ctx, jellyfinIDSet)
+	if err != nil {
+		return 0, fmt.Errorf("reconcile oob: jellyfin check: %w", err)
+	}
+
+	// ── Step 4: prune stale entries (write tx per item for isolation) ─────────
+	pruned := 0
+	for _, entry := range candidates {
+		normID := domain.NormalizeID(entry.jellyfinItemID)
+		if present[normID] {
+			// Item still exists in Jellyfin — do not touch it.
+			continue
+		}
+
+		flow := entry.flow
+		now := s.now().UTC()
+		if err := s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
+			return pruneStaleFlow(ctx, tx, flow, now)
+		}); err != nil {
+			s.logger.WarnContext(ctx, "oob reconciliation: prune failed",
+				"lex", "RECONCILE-OOB",
+				"item_id", flow.ItemID,
+				"error", err,
+			)
+			continue
+		}
+		s.logger.InfoContext(ctx, "oob reconciliation: pruned stale flow",
+			"lex", "RECONCILE-OOB",
+			"item_id", flow.ItemID,
+			"subject_type", flow.SubjectType,
+			"display_name", flow.DisplayName,
+			"jellyfin_id", entry.jellyfinItemID,
+		)
+		pruned++
+	}
+
+	s.logger.InfoContext(ctx, "oob reconciliation complete",
+		"lex", "RECONCILE-OOB",
+		"candidates", len(candidates),
+		"pruned", pruned,
+	)
+	return pruned, nil
+}
+
+// pruneStaleFlow removes the flow record, all associated media items, and all
+// pending jobs for the given item from the repository. It is the write half of
+// the out-of-band deletion reconciliation and mirrors the in-transaction
+// cleanup that the removal-event webhook path performs.
+//
+// It is intentionally idempotent: if the flow has already been removed (e.g.
+// by a concurrent deletion or a second reconciliation run) the function
+// returns without error.
+func pruneStaleFlow(ctx context.Context, tx repo.TxRepository, flow domain.Flow, now time.Time) error {
+	// Re-read the flow inside the transaction so we have a fresh snapshot and
+	// to guard against concurrent mutations between the read-only listing pass
+	// (Step 1) and this write pass.
+	current, found, err := tx.GetFlow(ctx, flow.ItemID)
+	if err != nil {
+		return fmt.Errorf("re-read flow %s: %w", flow.ItemID, err)
+	}
+	if !found {
+		// Already gone — idempotent success.
+		return nil
+	}
+	// If the flow moved to a terminal / user-decided state between our listing
+	// and now, leave it alone.
+	switch current.State {
+	case domain.FlowStateDeleteQueued, domain.FlowStateDeleteFailed,
+		domain.FlowStateDeleted, domain.FlowStateArchived:
+		return nil
+	}
+
+	// Delete the flow record.
+	if err := tx.DeleteFlow(ctx, current.ItemID); err != nil {
+		return fmt.Errorf("delete flow %s: %w", current.ItemID, err)
+	}
+
+	// Delete associated media items. For season flows the underlying episodes
+	// are stored as individual MediaItems keyed by their episode Jellyfin ID.
+	parts := strings.SplitN(current.ItemID, ":", 3)
+	if len(parts) == 3 && parts[0] == "target" {
+		subjectType := parts[1]
+		subjectID := parts[2]
+		children, err := tx.ListMediaBySubject(ctx, subjectType, subjectID)
+		if err != nil {
+			return fmt.Errorf("list children for %s: %w", current.ItemID, err)
+		}
+		for _, child := range children {
+			if child.ItemID == "" {
+				continue
+			}
+			if err := tx.DeleteMedia(ctx, child.ItemID); err != nil {
+				return fmt.Errorf("delete child media %s: %w", child.ItemID, err)
+			}
+			// Also delete any child-level flow keys that may exist (mirrors the
+			// removal-event path in applyJellyfinWebhookInTx).
+			if err := tx.DeleteFlow(ctx, "target:item:"+child.ItemID); err != nil {
+				return fmt.Errorf("delete child item flow %s: %w", child.ItemID, err)
+			}
+			if err := tx.DeleteFlow(ctx, "target:movie:"+child.ItemID); err != nil {
+				return fmt.Errorf("delete child movie flow %s: %w", child.ItemID, err)
+			}
+		}
+		// Also delete a bare media record keyed by the subject ID itself (movie
+		// flows use the Jellyfin item ID as both the media key and the target ID).
+		if err := tx.DeleteMedia(ctx, subjectID); err != nil {
+			return fmt.Errorf("delete subject media %s: %w", subjectID, err)
+		}
+	}
+
+	// Cancel all pending/scheduled jobs for this item so no orphan jobs remain
+	// in the due index.
+	if _, err := tx.DeleteJobsForItem(ctx, current.ItemID); err != nil {
+		return fmt.Errorf("delete jobs for %s: %w", current.ItemID, err)
+	}
+
+	// Record a domain event for auditability.
+	_ = tx.AppendEvent(ctx, domain.Event{
+		EventID:        "evt:reconcile:oob:" + shortHash(current.ItemID+":"+strconv.FormatInt(now.UnixNano(), 10)),
+		FlowID:         current.FlowID,
+		ItemID:         current.ItemID,
+		Type:           "jellyreaper.reconcile.oob_deleted",
+		Source:         "reconciler",
+		OccurredAt:     now,
+		IdempotencyKey: "reconcile:oob:" + current.ItemID + ":" + strconv.FormatInt(now.Truncate(24*time.Hour).Unix(), 10),
+		Payload: map[string]any{
+			"display_name": current.DisplayName,
+			"subject_type": current.SubjectType,
+			"flow_state":   string(current.State),
+		},
+	})
+	return nil
+}
+
+// ScheduleOOBReconcile enqueues a JobKindReconcileItem job to run at runAt.
+// The job is a singleton keyed by a daily idempotency key so scheduling it
+// twice in the same calendar day is a no-op.
+//
+// Ownership: this method is intended to be called by the scheduled backfill
+// loop (in main.go) or by any startup path that owns the scheduler lifecycle.
+// It must NOT be called from inside a bbolt write transaction.
+func (s *Service) ScheduleOOBReconcile(ctx context.Context, runAt time.Time) error {
+	now := s.now().UTC()
+	if runAt.IsZero() {
+		runAt = now
+	}
+	dayKey := runAt.UTC().Format("2006-01-02")
+	payload, err := json.Marshal(jobs.ReconcileItemPayload{Source: "scheduled"})
+	if err != nil {
+		return fmt.Errorf("schedule oob reconcile: marshal payload: %w", err)
+	}
+	return s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
+		return tx.EnqueueJob(ctx, domain.JobRecord{
+			JobID:          "job:reconcile:oob:" + dayKey,
+			FlowID:         "",
+			ItemID:         "reconcile:oob",
+			Kind:           domain.JobKindReconcileItem,
+			Status:         domain.JobStatusPending,
+			RunAt:          runAt,
+			MaxAttempts:    3,
+			IdempotencyKey: "reconcile:oob:" + dayKey,
+			PayloadJSON:    payload,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		})
+	})
+}
+
+// extractJellyfinIDFromFlowItemID extracts the raw Jellyfin item ID from a
+// canonical flow ItemID. Supported formats:
+//
+//	"target:movie:<id>"  → "<id>"
+//	"target:item:<id>"   → "<id>"
+//	"target:season:<id>" → "<id>"   (season flow; episodes checked separately)
+//
+// Returns "" if the format is unrecognised or the ID component is blank.
+func extractJellyfinIDFromFlowItemID(itemID string) string {
+	parts := strings.SplitN(itemID, ":", 3)
+	if len(parts) == 3 && parts[0] == "target" && parts[2] != "" {
+		return parts[2]
+	}
+	return ""
 }
 
 func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.WebhookEvent) error {

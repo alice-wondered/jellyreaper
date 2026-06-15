@@ -1007,3 +1007,48 @@ func humanTimeLabel(t time.Time) string {
 	unix := t.UTC().Unix()
 	return fmt.Sprintf("<t:%d:R> (<t:%d:f>)", unix, unix)
 }
+
+// OOBReconciler performs out-of-band deletion reconciliation. The concrete
+// implementation lives in internal/app (Service.ReconcileOOBDeletions) and is
+// injected at wire-up time to avoid a circular import.
+type OOBReconciler interface {
+	ReconcileOOBDeletions(ctx context.Context) (int, error)
+}
+
+// ReconcileOOBHandler handles JobKindReconcileItem jobs by delegating to the
+// OOBReconciler. It is scheduled periodically (e.g. daily) and is safe to
+// run concurrently with normal webhook processing because all mutations happen
+// inside bbolt write transactions.
+type ReconcileOOBHandler struct {
+	reconciler OOBReconciler
+	logger     *slog.Logger
+}
+
+func NewReconcileOOBHandler(reconciler OOBReconciler, logger *slog.Logger) *ReconcileOOBHandler {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &ReconcileOOBHandler{reconciler: reconciler, logger: logger}
+}
+
+// SetReconciler injects the OOBReconciler after construction. This is used
+// when the reconciler (app.Service) must be constructed after the handler list
+// is assembled (to break the initialisation order dependency).
+func (h *ReconcileOOBHandler) SetReconciler(r OOBReconciler) {
+	h.reconciler = r
+}
+
+func (h *ReconcileOOBHandler) Kind() domain.JobKind { return domain.JobKindReconcileItem }
+
+func (h *ReconcileOOBHandler) Handle(ctx context.Context, job domain.JobRecord) error {
+	if h.reconciler == nil {
+		h.logger.InfoContext(ctx, "oob reconcile skipped: no reconciler configured", "lex", "RECONCILE", "job_id", job.JobID)
+		return nil
+	}
+	pruned, err := h.reconciler.ReconcileOOBDeletions(ctx)
+	if err != nil {
+		return fmt.Errorf("oob reconcile job %s: %w", job.JobID, err)
+	}
+	h.logger.InfoContext(ctx, "oob reconcile job complete", "lex", "RECONCILE", "job_id", job.JobID, "pruned", pruned)
+	return nil
+}

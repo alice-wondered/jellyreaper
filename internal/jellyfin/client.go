@@ -16,6 +16,12 @@ import (
 	"jellyreaper/internal/txguard"
 )
 
+// itemExistenceChecker is a narrow interface satisfied by *Client that lets
+// the reconciliation service be tested without a real HTTP connection.
+type ItemExistenceChecker interface {
+	CheckItemsExist(ctx context.Context, itemIDs []string) (map[string]bool, error)
+}
+
 var dashedHexIDPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // ErrIOInTransaction is returned when an outbound Jellyfin HTTP call is
@@ -130,6 +136,86 @@ func (c *Client) FetchProviderIDs(ctx context.Context, itemID string) (map[strin
 		return nil, nil
 	}
 	return domain.NormalizeProviderIDs(payload.Items[0].ProviderIds), nil
+}
+
+// CheckItemsExist queries Jellyfin for a batch of item IDs and returns the
+// subset that are still present in the library. The returned map is keyed by
+// the normalised item ID (lower-case, no dashes). Unknown / deleted items are
+// simply absent from the map. Callers should treat an absent entry as "gone".
+//
+// At most maxBatch IDs are sent per HTTP request; the method fans out
+// automatically when len(itemIDs) > maxBatch. Pass a nil or empty slice to
+// get an empty map with no network I/O.
+func (c *Client) CheckItemsExist(ctx context.Context, itemIDs []string) (map[string]bool, error) {
+	if txguard.InTx(ctx) {
+		return nil, fmt.Errorf("jellyfin check items exist: %w", ErrIOInTransaction)
+	}
+	if c.baseURL == "" {
+		return nil, fmt.Errorf("jellyfin base url is required")
+	}
+	if c.apiKey == "" {
+		return nil, fmt.Errorf("jellyfin api key is required")
+	}
+	if len(itemIDs) == 0 {
+		return map[string]bool{}, nil
+	}
+
+	const maxBatch = 100
+	present := make(map[string]bool, len(itemIDs))
+
+	// fan-out in chunks of maxBatch
+	for start := 0; start < len(itemIDs); start += maxBatch {
+		end := start + maxBatch
+		if end > len(itemIDs) {
+			end = len(itemIDs)
+		}
+		chunk := itemIDs[start:end]
+		candidates := make([]string, 0, len(chunk))
+		for _, id := range chunk {
+			if c := providerIDCandidate(id); c != "" {
+				candidates = append(candidates, c)
+			}
+		}
+		if len(candidates) == 0 {
+			continue
+		}
+
+		endpoint := c.baseURL + "/Items?Ids=" + url.QueryEscape(strings.Join(candidates, ",")) + "&Fields=Id&Limit=" + fmt.Sprintf("%d", maxBatch)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build jellyfin items exist request: %w", err)
+		}
+		req.Header.Set("X-Emby-Token", c.apiKey)
+
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("perform jellyfin items exist request: %w", err)
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("read jellyfin items exist response: %w", readErr)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("jellyfin items exist request failed with status %d", resp.StatusCode)
+		}
+
+		var payload struct {
+			Items []struct {
+				ID string `json:"Id"`
+			} `json:"Items"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			return nil, fmt.Errorf("decode jellyfin items exist response: %w", err)
+		}
+		for _, item := range payload.Items {
+			if norm := domain.NormalizeID(item.ID); norm != "" {
+				present[norm] = true
+			}
+		}
+	}
+
+	return present, nil
 }
 
 func providerIDCandidate(itemID string) string {

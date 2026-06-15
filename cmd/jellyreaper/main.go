@@ -145,13 +145,17 @@ func main() {
 	hitlTimeout := time.Duration(cfg.DefaultHITLTimeoutHours) * time.Hour
 	sendHITLPromptHandler := handlers.NewSendHITLPromptHandler(store, logger, discordService, cfg.DiscordChannelID, hitlTimeout)
 	hitlTimeoutHandler := handlers.NewHITLTimeoutHandler(store, discordService, logger)
+	// reconcileOOBHandler is wired after appService is constructed (below).
+	// We hold a pointer so we can inject the reconciler once the service
+	// is ready (avoids a forward-reference cycle).
+	reconcileOOBHandler := handlers.NewReconcileOOBHandler(nil, logger)
 	handlerList := []jobs.JobHandler{
 		evaluatePolicyHandler,
 		sendHITLPromptHandler,
 		hitlTimeoutHandler,
 		executeDeleteHandler,
 		handlers.NewNoopHandler(domain.JobKindVerifyDelete, logger),
-		handlers.NewNoopHandler(domain.JobKindReconcileItem, logger),
+		reconcileOOBHandler,
 	}
 
 	registry, err := jobs.NewRegistry(handlerList...)
@@ -186,6 +190,8 @@ func main() {
 		assistant.SetDecisionService(appService)
 	}
 	appService.SetBackfillWriteBatching(cfg.BackfillWriteBatchSize, cfg.BackfillWriteBatchTimeout, cfg.BackfillWriteQueueCapacity)
+	// Wire the OOB reconciler now that appService is fully constructed.
+	reconcileOOBHandler.SetReconciler(appService)
 	dispatcher := worker.NewDispatcher(store, registry, logger)
 	if cfg.DiscordChannelID != "" {
 		dispatcher.SetDeleteFailedNotifier(func(ctx context.Context, flow domain.Flow, deleteErr error) {
@@ -265,6 +271,11 @@ func main() {
 				} else {
 					logNextQueuedJob(ctx, logger, store)
 				}
+				// Schedule a reconciliation run after startup backfill so stale
+				// flows are pruned on the first scheduler cycle.
+				if err := appService.ScheduleOOBReconcile(ctx, time.Now()); err != nil {
+					logger.Warn("failed to schedule startup oob reconcile", "error", err)
+				}
 
 				go runBackfillLoop(ctx, logger, store, appService, discordService, cfg, backfillSvc, false)
 			}
@@ -340,6 +351,11 @@ func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.R
 		case <-ticker.C:
 			if err := runBackfillOnce(ctx, logger, repository, appService, discordService, cfg, backfillSvc, false); err != nil {
 				logger.Warn("periodic backfill run failed", "error", err)
+			}
+			// After each backfill cycle, schedule an OOB deletion reconcile job.
+			// The job is idempotent (daily key) so this is safe to call repeatedly.
+			if err := appService.ScheduleOOBReconcile(ctx, time.Now()); err != nil {
+				logger.Warn("failed to schedule oob reconcile", "error", err)
 			}
 		}
 	}
