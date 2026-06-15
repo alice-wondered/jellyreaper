@@ -63,6 +63,25 @@ func main() {
 		return
 	}
 
+	// Dispatch the `purge-progress` subcommand before any server startup. This
+	// is an offline maintenance op that deletes accumulated
+	// jellyfin.PlaybackProgress heartbeat events (the historical cause of DB
+	// bloat) so a subsequent `compact` can reclaim the space. Run with the
+	// service stopped. Usage: jellyreaper purge-progress <db>
+	if len(os.Args) >= 2 && os.Args[1] == "purge-progress" {
+		if len(os.Args) != 3 {
+			fmt.Fprintf(os.Stderr, "usage: jellyreaper purge-progress <db>\n")
+			os.Exit(1)
+		}
+		deleted, err := bboltstore.PurgeEventsByTypePrefix(os.Args[2], "jellyfin.PlaybackProgress")
+		if err != nil {
+			logger.Error("purge-progress failed", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("purge-progress complete", "deleted", deleted, "db", os.Args[2])
+		return
+	}
+
 	cfg, err := config.LoadFromEnv()
 	if err != nil {
 		logger.Error("load config", "error", err)

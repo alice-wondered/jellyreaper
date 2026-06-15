@@ -732,6 +732,54 @@ func (t *txRepo) PruneEvents(ctx context.Context, olderThan time.Time) (int, err
 	return len(toDelete), nil
 }
 
+// PurgeEventsByTypePrefix opens the bbolt database at path (read-write) and
+// deletes every record in the events bucket whose decoded Event.Type begins
+// with typePrefix, returning the number of records deleted. It is an offline
+// maintenance operation meant to be run with the service stopped — e.g. to drop
+// the accumulated "jellyfin.PlaybackProgress" heartbeat events before a compact.
+// It is not part of any request path.
+func PurgeEventsByTypePrefix(path, typePrefix string) (int, error) {
+	db, err := bbolt.Open(path, 0o600, &bbolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		return 0, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer db.Close()
+
+	deleted := 0
+	if err := db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucketEvents)
+		if b == nil {
+			return nil
+		}
+		// Collect keys first; bbolt cursors must not be mutated during iteration.
+		var toDelete [][]byte
+		if err := b.ForEach(func(k, v []byte) error {
+			var evt domain.Event
+			if err := json.Unmarshal(v, &evt); err != nil {
+				return nil // skip entries we cannot decode rather than aborting
+			}
+			if strings.HasPrefix(evt.Type, typePrefix) {
+				key := make([]byte, len(k))
+				copy(key, k)
+				toDelete = append(toDelete, key)
+			}
+			return nil
+		}); err != nil {
+			return fmt.Errorf("scan events: %w", err)
+		}
+		for _, k := range toDelete {
+			if err := b.Delete(k); err != nil {
+				return fmt.Errorf("delete %s: %w", string(k), err)
+			}
+		}
+		deleted = len(toDelete)
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	return deleted, nil
+}
+
 func (t *txRepo) EnqueueJob(ctx context.Context, job domain.JobRecord) error {
 	if err := checkContext(ctx); err != nil {
 		return err
