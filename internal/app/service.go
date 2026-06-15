@@ -786,16 +786,30 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		}
 
 		runAt := now
+		expireDays := flow.PolicySnapshot.ExpireAfterDays
+		if expireDays <= 0 {
+			expireDays = defaultReviewDays
+		}
 		if playAt, known, err := mostRecentPlayForTarget(ctx, tx, flow); err != nil {
 			return err
 		} else if known {
-			expireDays := flow.PolicySnapshot.ExpireAfterDays
-			if expireDays <= 0 {
-				expireDays = defaultReviewDays
-			}
 			dueAt := playAt.Add(time.Duration(expireDays) * 24 * time.Hour)
 			if dueAt.After(runAt) {
 				runAt = dueAt
+			}
+		} else {
+			// Never played: anchor the eval due-date on the item's added (CreatedAt)
+			// date so a brand-new item is not immediately due for review.
+			// dueAt = max(createdAt + expireDays, now). This mirrors the fallback
+			// logic in EvaluatePolicyHandler and prevents repeated backfill calls
+			// from overriding the deferred eval run time back to "now".
+			if addedAt, createdKnown, err := mostRecentCreatedForTarget(ctx, tx, flow); err != nil {
+				return err
+			} else if createdKnown {
+				dueAt := addedAt.Add(time.Duration(expireDays) * 24 * time.Hour)
+				if dueAt.After(runAt) {
+					runAt = dueAt
+				}
 			}
 		}
 
@@ -1613,6 +1627,39 @@ func mostRecentPlayForTarget(ctx context.Context, tx repo.TxRepository, flow dom
 		return time.Time{}, false, nil
 	}
 	return item.LastPlayedAt, true, nil
+}
+
+// mostRecentCreatedForTarget returns the most recent CreatedAt timestamp for the
+// media associated with the given flow's target, mirroring the fallback logic in
+// EvaluatePolicyHandler. Used by the webhook path to anchor the eval due-date on
+// the item's added date for never-played items so they are not immediately due.
+func mostRecentCreatedForTarget(ctx context.Context, tx repo.TxRepository, flow domain.Flow) (time.Time, bool, error) {
+	parts := strings.SplitN(flow.ItemID, ":", 3)
+	if len(parts) == 3 && parts[0] == "target" {
+		items, err := tx.ListMediaBySubject(ctx, parts[1], parts[2])
+		if err != nil {
+			return time.Time{}, false, err
+		}
+		latest := time.Time{}
+		for _, item := range items {
+			if item.CreatedAt.After(latest) {
+				latest = item.CreatedAt
+			}
+		}
+		if latest.IsZero() {
+			return time.Time{}, false, nil
+		}
+		return latest, true, nil
+	}
+
+	item, found, err := tx.GetMedia(ctx, flow.ItemID)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if !found || item.CreatedAt.IsZero() {
+		return time.Time{}, false, nil
+	}
+	return item.CreatedAt, true, nil
 }
 
 func targetKey(targetType, id string) string {

@@ -729,12 +729,21 @@ func TestWebhookIndexesFlowAndJobAndDedupe(t *testing.T) {
 		t.Fatalf("verify dedupe key: %v", err)
 	}
 
-	jobs, err := store.LeaseDueJobs(context.Background(), now, 10, "test", time.Minute)
+	// The eval job is deferred to addedDate + threshold (not due right now for a
+	// newly added item). Use a far-future window to confirm exactly one job
+	// was created and deduplication suppressed the second webhook.
+	jobs, err := store.LeaseDueJobs(context.Background(), now.Add(365*24*time.Hour), 10, "test", time.Minute)
 	if err != nil {
 		t.Fatalf("lease jobs: %v", err)
 	}
-	if len(jobs) != 1 || jobs[0].Kind != domain.JobKindEvaluatePolicy {
-		t.Fatalf("expected single evaluate job after dedupe, got %#v", jobs)
+	evalJobs := 0
+	for _, job := range jobs {
+		if job.Kind == domain.JobKindEvaluatePolicy && job.ItemID == "target:movie:item-webhook" {
+			evalJobs++
+		}
+	}
+	if evalJobs != 1 {
+		t.Fatalf("expected exactly one evaluate job after dedupe, got %d (%#v)", evalJobs, jobs)
 	}
 }
 
@@ -2883,5 +2892,287 @@ func TestRequestImmediateReview(t *testing.T) {
 	}
 	if flow.NextActionAt != now {
 		t.Fatalf("expected next_action_at to be now, got %s", flow.NextActionAt)
+	}
+}
+
+// --- Scheduling-on-add regression tests (task3-scheduling-on-add) ---
+//
+// Prove that a brand-new, never-played item is NOT scheduled for immediate
+// review: the eval job must be deferred to addedDate + thresholdDays.
+// Also prove that a played item still anchors on lastPlayedAt, and that the
+// counterexample (zero-time bug reintroduced) would fail.
+
+// 0-case: newly added item (no plays, DateCreated = today) → eval deferred
+// to today + expireDays, NOT due right now.
+func TestNewItemAddedTodayWithNoPlaysIsNotImmediatelyDueForReview(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+	expireDays := 60
+	svc.defaultExpireDays = expireDays
+
+	// Simulate an ItemAdded webhook for a brand-new movie with DateCreated = now.
+	event := jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:      "movie-brand-new",
+			ItemType:    "Movie",
+			Name:        "Brand New Movie",
+			DateCreated: now,
+		},
+		ItemID:    "movie-brand-new",
+		EventType: "ItemAdded",
+		DedupeKey: "jellyfin:brand-new:0",
+	}
+	if err := svc.HandleJellyfinWebhook(context.Background(), event); err != nil {
+		t.Fatalf("handle webhook: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, "target:movie:movie-brand-new")
+	if flow.State != domain.FlowStateActive {
+		t.Fatalf("expected active flow, got %s", flow.State)
+	}
+
+	wantDueAt := now.Add(time.Duration(expireDays) * 24 * time.Hour)
+
+	// The eval job must NOT be due right now.
+	earlyJobs, err := store.LeaseDueJobs(context.Background(), now.Add(time.Minute), 10, "test-early", time.Minute)
+	if err != nil {
+		t.Fatalf("lease early jobs: %v", err)
+	}
+	for _, job := range earlyJobs {
+		if job.ItemID == "target:movie:movie-brand-new" && job.Kind == domain.JobKindEvaluatePolicy {
+			t.Fatalf("eval job is due immediately for a brand-new item; RunAt=%s now=%s — zero-time anchor bug", job.RunAt, now)
+		}
+	}
+
+	// The eval job MUST be due after the threshold has elapsed.
+	dueJobs, err := store.LeaseDueJobs(context.Background(), wantDueAt.Add(time.Minute), 10, "test-due", time.Minute)
+	if err != nil {
+		t.Fatalf("lease due jobs: %v", err)
+	}
+	found := false
+	for _, job := range dueJobs {
+		if job.ItemID == "target:movie:movie-brand-new" && job.Kind == domain.JobKindEvaluatePolicy {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected eval job to be due at %s (addedDate + %d days), but none found", wantDueAt, expireDays)
+	}
+
+	// NextActionAt on the flow must also reflect the deferred date.
+	if flow.NextActionAt.Before(wantDueAt.Add(-time.Minute)) {
+		t.Fatalf("flow.NextActionAt=%s should be ~%s (addedDate+threshold), got earlier date — item immediately due for review", flow.NextActionAt, wantDueAt)
+	}
+}
+
+// 1-case: single never-played item via backfill with explicit DateCreated →
+// eval must be anchored on DateCreated + expireDays, not now.
+func TestBackfillNeverPlayedItemDeferredByDateCreated(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+	expireDays := 60
+	svc.defaultExpireDays = expireDays
+	dateCreated := now // added today
+
+	err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+		ItemID:      "movie-never-played-backfill",
+		ItemType:    "Movie",
+		Name:        "Never Played Backfill Movie",
+		DateCreated: dateCreated,
+		// LastPlayedAt is zero — never played
+	}})
+	if err != nil {
+		t.Fatalf("ingest backfill items: %v", err)
+	}
+
+	wantDueAt := dateCreated.Add(time.Duration(expireDays) * 24 * time.Hour)
+
+	// Eval must NOT fire right now.
+	earlyJobs, err := store.LeaseDueJobs(context.Background(), now.Add(time.Minute), 10, "test-early", time.Minute)
+	if err != nil {
+		t.Fatalf("lease early jobs: %v", err)
+	}
+	for _, job := range earlyJobs {
+		if job.ItemID == "target:movie:movie-never-played-backfill" && job.Kind == domain.JobKindEvaluatePolicy {
+			t.Fatalf("eval job due immediately for never-played backfill item (zero-time bug); RunAt=%s", job.RunAt)
+		}
+	}
+
+	// Eval must be due after dateCreated + expireDays.
+	dueJobs, err := store.LeaseDueJobs(context.Background(), wantDueAt.Add(time.Minute), 10, "test-due", time.Minute)
+	if err != nil {
+		t.Fatalf("lease due jobs: %v", err)
+	}
+	found := false
+	for _, job := range dueJobs {
+		if job.ItemID == "target:movie:movie-never-played-backfill" && job.Kind == domain.JobKindEvaluatePolicy {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected eval job due at ~%s for never-played item, but none found", wantDueAt)
+	}
+}
+
+// n-case: a repeated backfill run does not override the deferred eval back to
+// "now" for a never-played item.  This is the key regression: the bug caused
+// each backfill cycle to pull the RunAt back to the current time.
+func TestRepeatedBackfillDoesNotOverrideDeferredEvalForNeverPlayedItem(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+	expireDays := 60
+	svc.defaultExpireDays = expireDays
+	dateCreated := now
+
+	item := jellyfin.ItemSnapshot{
+		ItemID:      "movie-repeat-backfill",
+		ItemType:    "Movie",
+		Name:        "Repeated Backfill Movie",
+		DateCreated: dateCreated,
+	}
+
+	// First backfill run.
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{item}); err != nil {
+		t.Fatalf("first backfill: %v", err)
+	}
+
+	// Advance time by 15 minutes (simulating the next backfill cycle).
+	now = now.Add(15 * time.Minute)
+	svc.now = func() time.Time { return now }
+
+	// Second backfill run with a different dedupe key suffix to bypass idempotency.
+	item2 := jellyfin.ItemSnapshot{
+		ItemID:             "movie-repeat-backfill",
+		ItemType:           "Movie",
+		Name:               "Repeated Backfill Movie",
+		DateCreated:        dateCreated,
+		DateLastMediaAdded: dateCreated.Add(time.Second), // nudge to change dedupe key
+	}
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{item2}); err != nil {
+		t.Fatalf("second backfill: %v", err)
+	}
+
+	wantDueAt := dateCreated.Add(time.Duration(expireDays) * 24 * time.Hour)
+
+	// After two backfill runs the eval must still NOT be due right now.
+	earlyJobs, err := store.LeaseDueJobs(context.Background(), now.Add(time.Minute), 10, "test-early", time.Minute)
+	if err != nil {
+		t.Fatalf("lease early jobs: %v", err)
+	}
+	for _, job := range earlyJobs {
+		if job.ItemID == "target:movie:movie-repeat-backfill" && job.Kind == domain.JobKindEvaluatePolicy {
+			t.Fatalf("repeated backfill overrode deferred eval to now (zero-time bug reintroduced); RunAt=%s", job.RunAt)
+		}
+	}
+
+	// Eval must still be anchored around wantDueAt.
+	dueJobs, err := store.LeaseDueJobs(context.Background(), wantDueAt.Add(time.Minute), 10, "test-due", time.Minute)
+	if err != nil {
+		t.Fatalf("lease due jobs: %v", err)
+	}
+	found := false
+	for _, job := range dueJobs {
+		if job.ItemID == "target:movie:movie-repeat-backfill" && job.Kind == domain.JobKindEvaluatePolicy {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected eval deferred to ~%s after repeated backfill, but not found", wantDueAt)
+	}
+}
+
+// n+1-case (and counterexample): item whose anchor is PAST the threshold IS
+// immediately due; a truly old never-played item should trigger review.
+func TestNeverPlayedItemOlderThanThresholdIsImmediatelyDueForReview(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	expireDays := 60
+	svc.defaultExpireDays = expireDays
+	// Item was added 61 days ago — just past the threshold.
+	dateCreated := time.Date(2026, 4, 14, 10, 0, 0, 0, time.UTC)
+	now := dateCreated.Add(time.Duration(expireDays+1) * 24 * time.Hour)
+	svc.now = func() time.Time { return now }
+
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+		ItemID:      "movie-old-never-played",
+		ItemType:    "Movie",
+		Name:        "Old Never Played Movie",
+		DateCreated: dateCreated,
+	}}); err != nil {
+		t.Fatalf("ingest backfill: %v", err)
+	}
+
+	// Eval must be due NOW (or very shortly) since addedDate + threshold is in the past.
+	dueJobs, err := store.LeaseDueJobs(context.Background(), now.Add(time.Minute), 10, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease due jobs: %v", err)
+	}
+	found := false
+	for _, job := range dueJobs {
+		if job.ItemID == "target:movie:movie-old-never-played" && job.Kind == domain.JobKindEvaluatePolicy {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected old never-played item to be due for review (addedDate=%s, expireDays=%d, now=%s), but eval not due", dateCreated, expireDays, now)
+	}
+}
+
+// Counterexample / regression guard: a played item must still be anchored on
+// lastPlayedAt, not on createdAt. A play resets the review clock.
+func TestPlayedItemAnchorsOnLastPlayedAtNotCreatedAt(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	expireDays := 60
+	svc.defaultExpireDays = expireDays
+	// Created 90 days ago, played 5 days ago — played recently.
+	dateCreated := time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC)
+	lastPlayed := time.Date(2026, 6, 9, 10, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+		ItemID:       "movie-played-recently",
+		ItemType:     "Movie",
+		Name:         "Played Recently Movie",
+		DateCreated:  dateCreated,
+		LastPlayedAt: lastPlayed,
+		PlayCount:    1,
+	}}); err != nil {
+		t.Fatalf("ingest backfill: %v", err)
+	}
+
+	wantDueAt := lastPlayed.Add(time.Duration(expireDays) * 24 * time.Hour)
+
+	// Must NOT be due right now (lastPlayed was 5 days ago, threshold is 60 days).
+	earlyJobs, err := store.LeaseDueJobs(context.Background(), now.Add(time.Minute), 10, "test-early", time.Minute)
+	if err != nil {
+		t.Fatalf("lease early jobs: %v", err)
+	}
+	for _, job := range earlyJobs {
+		if job.ItemID == "target:movie:movie-played-recently" && job.Kind == domain.JobKindEvaluatePolicy {
+			t.Fatalf("played item is due immediately; expected anchor on lastPlayedAt, not createdAt")
+		}
+	}
+
+	// Must be due at lastPlayed + expireDays.
+	dueJobs, err := store.LeaseDueJobs(context.Background(), wantDueAt.Add(time.Minute), 10, "test-due", time.Minute)
+	if err != nil {
+		t.Fatalf("lease due jobs: %v", err)
+	}
+	found := false
+	for _, job := range dueJobs {
+		if job.ItemID == "target:movie:movie-played-recently" && job.Kind == domain.JobKindEvaluatePolicy {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected eval due at %s (lastPlayedAt+%d days) for played item, but not found", wantDueAt, expireDays)
 	}
 }

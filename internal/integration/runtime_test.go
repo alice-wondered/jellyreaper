@@ -123,8 +123,20 @@ func TestIntegrationWebhookToSchedulerDispatch(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	body := []byte(`{"ItemId":"item-e2e","ItemType":"Movie","Name":"E2E Movie","EventId":"evt-e2e-1","NotificationType":"ItemAdded"}`)
-	resp, err := http.Post(server.URL+"/webhooks/jellyfin", "application/json", bytes.NewReader(body))
+	// Use a DateCreated well past the default 30-day expiry threshold so the
+	// eval job is scheduled immediately and the scheduler dispatches it within
+	// the test deadline. Without a past DateCreated, the fix for the
+	// scheduling-on-add bug would correctly defer the eval to the future.
+	staleCreated := time.Now().UTC().Add(-60 * 24 * time.Hour).Format(time.RFC3339)
+	bodyJSON, _ := json.Marshal(map[string]any{
+		"ItemId":           "item-e2e",
+		"ItemType":         "Movie",
+		"Name":             "E2E Movie",
+		"EventId":          "evt-e2e-1",
+		"NotificationType": "ItemAdded",
+		"DateCreated":      staleCreated,
+	})
+	resp, err := http.Post(server.URL+"/webhooks/jellyfin", "application/json", bytes.NewReader(bodyJSON))
 	if err != nil {
 		t.Fatalf("post webhook: %v", err)
 	}
