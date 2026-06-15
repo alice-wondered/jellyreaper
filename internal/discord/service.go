@@ -326,11 +326,11 @@ func (s *Service) handleMentionMessage(session *discordgo.Session, msg *discordg
 	}
 
 	// Auto-respond in active threads without requiring @mention.
+	// Check the cheap in-memory map first to avoid Discord API calls
+	// for every message in the guild.
 	inActiveThread := false
-	if !mentioned {
-		if ch, chErr := session.Channel(msg.ChannelID); chErr == nil && ch != nil && isThreadChannel(ch) && s.isActiveThread(msg.ChannelID) {
-			inActiveThread = true
-		}
+	if !mentioned && s.isActiveThread(msg.ChannelID) {
+		inActiveThread = true
 	}
 	if !mentioned && !inActiveThread {
 		return

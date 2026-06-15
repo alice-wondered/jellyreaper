@@ -22,6 +22,12 @@ import (
 	"jellyreaper/internal/scheduler"
 )
 
+// itemExistenceChecker is the narrow read-only Jellyfin interface used for
+// out-of-band deletion reconciliation. *jellyfin.Client satisfies it.
+type itemExistenceChecker interface {
+	CheckItemsExist(ctx context.Context, itemIDs []string) (map[string]bool, error)
+}
+
 const (
 	defaultDelayDuration         = 24 * time.Hour
 	defaultExpireDays            = 30
@@ -56,6 +62,7 @@ type Service struct {
 	discord               *discord.Service
 	wake                  func(time.Time)
 	evalScheduler         scheduler.EvalRequester
+	flowManager           *scheduler.FlowManager
 	now                   func() time.Time
 	defaultDelayWindow    time.Duration
 	defaultExpireDays     int
@@ -75,7 +82,7 @@ func NewService(repository repo.Repository, logger *slog.Logger, wake func(time.
 	if wake == nil {
 		wake = func(time.Time) {}
 	}
-	return &Service{
+	svc := &Service{
 		repository:            repository,
 		logger:                logger,
 		wake:                  wake,
@@ -89,6 +96,8 @@ func NewService(repository repo.Repository, logger *slog.Logger, wake func(time.
 		backfillBatchTimeout:  defaultBackfillBatchTimeout,
 		backfillQueueCapacity: defaultBackfillQueueCapacity,
 	}
+	svc.flowManager = scheduler.NewFlowManager(repository, svc.evalScheduler, logger)
+	return svc
 }
 
 func (s *Service) SetPolicyDefaults(defaultExpireDays int, defaultDelayWindow time.Duration) {
@@ -100,9 +109,35 @@ func (s *Service) SetPolicyDefaults(defaultExpireDays int, defaultDelayWindow ti
 	}
 }
 
+// finalizeAndWake handles the common post-commit pattern: finalize any
+// Discord HITL prompt from the transition result and signal the scheduler.
+func (s *Service) finalizeAndWake(ctx context.Context, result *scheduler.TransitionResult, itemID string) {
+	if result != nil && result.FinalizePrompt != nil && s.discord != nil {
+		fp := result.FinalizePrompt
+		if err := s.discord.FinalizeHITLPrompt(ctx, fp.ChannelID, fp.MessageID, fp.Content); err != nil {
+			s.logger.Warn("failed to finalize HITL prompt", "item_id", itemID, "error", err)
+		}
+	}
+	if result != nil && !result.WakeAt.IsZero() {
+		s.wake(result.WakeAt)
+	} else {
+		s.wake(time.Now().UTC())
+	}
+}
+
 func (s *Service) SetEvalScheduler(es scheduler.EvalRequester) {
 	if es != nil {
 		s.evalScheduler = es
+		s.flowManager = scheduler.NewFlowManager(s.repository, es, s.logger)
+		s.flowManager.SetNowFunc(s.now)
+	}
+}
+
+// SyncFlowManagerClock propagates the service's clock to the flow
+// manager. Call after overriding `svc.now` in tests.
+func (s *Service) SyncFlowManagerClock() {
+	if s.flowManager != nil {
+		s.flowManager.SetNowFunc(s.now)
 	}
 }
 
@@ -116,7 +151,7 @@ func (s *Service) SetGlobalReviewDays(ctx context.Context, days int) error {
 	if days <= 0 || days > 3650 {
 		return fmt.Errorf("review days must be between 1 and 3650")
 	}
-	return s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	return s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.SetMeta(ctx, metaReviewDays, strconv.Itoa(days))
 	})
 }
@@ -125,7 +160,7 @@ func (s *Service) SetGlobalDeferDays(ctx context.Context, days int) error {
 	if days <= 0 || days > 3650 {
 		return fmt.Errorf("defer days must be between 1 and 3650")
 	}
-	return s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	return s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.SetMeta(ctx, metaDeferDays, strconv.Itoa(days))
 	})
 }
@@ -134,7 +169,7 @@ func (s *Service) SetGlobalHITLTimeoutHours(ctx context.Context, hours int) erro
 	if hours <= 0 || hours > 8760 {
 		return fmt.Errorf("hitl timeout hours must be between 1 and 8760")
 	}
-	return s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	return s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.SetMeta(ctx, metaHITLTimeoutHours, strconv.Itoa(hours))
 	})
 }
@@ -201,7 +236,7 @@ func (s *Service) SetJellyfinClient(client *jellyfin.Client) {
 func (s *Service) ReconcileStaleFlows(ctx context.Context) (int, error) {
 	now := s.now().UTC()
 	reconciled := 0
-	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	err := s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flows, err := tx.ListFlows(ctx)
 		if err != nil {
 			return err
@@ -260,6 +295,274 @@ func (s *Service) ReconcileStaleFlows(ctx context.Context) (int, error) {
 	return reconciled, nil
 }
 
+// ReconcileOOBDeletions detects flows whose underlying Jellyfin items have
+// been deleted out-of-band (e.g. via Sonarr/Radarr without jellyreaper
+// receiving a removal webhook) and prunes them idempotently.
+//
+// This is the public entry point called by the scheduler job handler
+// (handlers.ReconcileOOBHandler). It uses the service's configured Jellyfin
+// client. For tests that need to inject a mock checker use
+// ReconcileOOBDeletionsWithChecker.
+//
+// TRANSACTION RULE: all network I/O against Jellyfin happens OUTSIDE any
+// bbolt transaction. We collect the live ID set first, then open write
+// transactions to apply the pruning. This prevents ErrIOInTransaction.
+func (s *Service) ReconcileOOBDeletions(ctx context.Context) (int, error) {
+	return s.ReconcileOOBDeletionsWithChecker(ctx, nil)
+}
+
+// ReconcileOOBDeletionsWithChecker is the testable variant that accepts an
+// explicit checker. Pass nil to fall back to the configured jellyfinClient.
+//
+// All state mutations route through the same repository primitives used by the
+// removal-event webhook path (tx.DeleteFlow, tx.DeleteMedia,
+// tx.DeleteJobsForItem) — no flow or job records are mutated directly from
+// outside the transaction, and no scheduler state is touched outside of those
+// primitives.
+//
+// checker is the Jellyfin client used to probe which items are still alive. Pass
+// nil to use the service's configured jellyfinClient; an explicit checker is
+// accepted here so the method is testable without real HTTP.
+func (s *Service) ReconcileOOBDeletionsWithChecker(ctx context.Context, checker itemExistenceChecker) (int, error) {
+	if checker == nil {
+		if s.jellyfinClient == nil {
+			s.logger.InfoContext(ctx, "oob reconciliation skipped: no jellyfin client configured", "lex", "RECONCILE-OOB")
+			return 0, nil
+		}
+		checker = s.jellyfinClient
+	}
+
+	// ── Step 1: collect all active flows (read-only tx) ──────────────────────
+	var flows []domain.Flow
+	if err := s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
+		var err error
+		flows, err = tx.ListFlows(ctx)
+		return err
+	}); err != nil {
+		return 0, fmt.Errorf("reconcile oob: list flows: %w", err)
+	}
+	if len(flows) == 0 {
+		return 0, nil
+	}
+
+	// ── Step 2: build the set of Jellyfin item IDs to probe ──────────────────
+	// We only probe flows that are still "live" from jellyreaper's perspective
+	// (not already DeleteQueued / DeleteFailed / Deleted / Archived). Those
+	// terminal states are either already being handled or have been explicitly
+	// decided by the user.
+	type flowEntry struct {
+		flow           domain.Flow
+		jellyfinItemID string // the raw Jellyfin ID to probe
+	}
+	candidates := make([]flowEntry, 0, len(flows))
+	jellyfinIDSet := make([]string, 0, len(flows))
+
+	for _, f := range flows {
+		switch f.State {
+		case domain.FlowStateDeleteQueued, domain.FlowStateDeleteFailed,
+			domain.FlowStateDeleted, domain.FlowStateArchived:
+			// Skip – terminal or user-decided.
+			continue
+		}
+
+		// Extract the raw Jellyfin item ID from the canonical target key.
+		// Format: "target:<type>:<jellyfinID>"  OR just a bare item ID (legacy).
+		rawID := extractJellyfinIDFromFlowItemID(f.ItemID)
+		if rawID == "" {
+			continue
+		}
+		candidates = append(candidates, flowEntry{flow: f, jellyfinItemID: rawID})
+		jellyfinIDSet = append(jellyfinIDSet, rawID)
+	}
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+
+	// ── Step 3: probe Jellyfin (OUTSIDE any transaction) ─────────────────────
+	present, err := checker.CheckItemsExist(ctx, jellyfinIDSet)
+	if err != nil {
+		return 0, fmt.Errorf("reconcile oob: jellyfin check: %w", err)
+	}
+
+	// ── Step 4: prune stale entries (write tx per item for isolation) ─────────
+	pruned := 0
+	for _, entry := range candidates {
+		normID := domain.NormalizeID(entry.jellyfinItemID)
+		if present[normID] {
+			// Item still exists in Jellyfin — do not touch it.
+			continue
+		}
+
+		flow := entry.flow
+		now := s.now().UTC()
+		if err := s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
+			return pruneStaleFlow(ctx, tx, flow, now)
+		}); err != nil {
+			s.logger.WarnContext(ctx, "oob reconciliation: prune failed",
+				"lex", "RECONCILE-OOB",
+				"item_id", flow.ItemID,
+				"error", err,
+			)
+			continue
+		}
+		s.logger.InfoContext(ctx, "oob reconciliation: pruned stale flow",
+			"lex", "RECONCILE-OOB",
+			"item_id", flow.ItemID,
+			"subject_type", flow.SubjectType,
+			"display_name", flow.DisplayName,
+			"jellyfin_id", entry.jellyfinItemID,
+		)
+		pruned++
+	}
+
+	s.logger.InfoContext(ctx, "oob reconciliation complete",
+		"lex", "RECONCILE-OOB",
+		"candidates", len(candidates),
+		"pruned", pruned,
+	)
+	return pruned, nil
+}
+
+// pruneStaleFlow removes the flow record, all associated media items, and all
+// pending jobs for the given item from the repository. It is the write half of
+// the out-of-band deletion reconciliation and mirrors the in-transaction
+// cleanup that the removal-event webhook path performs.
+//
+// It is intentionally idempotent: if the flow has already been removed (e.g.
+// by a concurrent deletion or a second reconciliation run) the function
+// returns without error.
+func pruneStaleFlow(ctx context.Context, tx repo.TxRepository, flow domain.Flow, now time.Time) error {
+	// Re-read the flow inside the transaction so we have a fresh snapshot and
+	// to guard against concurrent mutations between the read-only listing pass
+	// (Step 1) and this write pass.
+	current, found, err := tx.GetFlow(ctx, flow.ItemID)
+	if err != nil {
+		return fmt.Errorf("re-read flow %s: %w", flow.ItemID, err)
+	}
+	if !found {
+		// Already gone — idempotent success.
+		return nil
+	}
+	// If the flow moved to a terminal / user-decided state between our listing
+	// and now, leave it alone.
+	switch current.State {
+	case domain.FlowStateDeleteQueued, domain.FlowStateDeleteFailed,
+		domain.FlowStateDeleted, domain.FlowStateArchived:
+		return nil
+	}
+
+	// Delete the flow record.
+	if err := tx.DeleteFlow(ctx, current.ItemID); err != nil {
+		return fmt.Errorf("delete flow %s: %w", current.ItemID, err)
+	}
+
+	// Delete associated media items. For season flows the underlying episodes
+	// are stored as individual MediaItems keyed by their episode Jellyfin ID.
+	parts := strings.SplitN(current.ItemID, ":", 3)
+	if len(parts) == 3 && parts[0] == "target" {
+		subjectType := parts[1]
+		subjectID := parts[2]
+		children, err := tx.ListMediaBySubject(ctx, subjectType, subjectID)
+		if err != nil {
+			return fmt.Errorf("list children for %s: %w", current.ItemID, err)
+		}
+		for _, child := range children {
+			if child.ItemID == "" {
+				continue
+			}
+			if err := tx.DeleteMedia(ctx, child.ItemID); err != nil {
+				return fmt.Errorf("delete child media %s: %w", child.ItemID, err)
+			}
+			// Also delete any child-level flow keys that may exist (mirrors the
+			// removal-event path in applyJellyfinWebhookInTx).
+			if err := tx.DeleteFlow(ctx, "target:item:"+child.ItemID); err != nil {
+				return fmt.Errorf("delete child item flow %s: %w", child.ItemID, err)
+			}
+			if err := tx.DeleteFlow(ctx, "target:movie:"+child.ItemID); err != nil {
+				return fmt.Errorf("delete child movie flow %s: %w", child.ItemID, err)
+			}
+		}
+		// Also delete a bare media record keyed by the subject ID itself (movie
+		// flows use the Jellyfin item ID as both the media key and the target ID).
+		if err := tx.DeleteMedia(ctx, subjectID); err != nil {
+			return fmt.Errorf("delete subject media %s: %w", subjectID, err)
+		}
+	}
+
+	// Cancel all pending/scheduled jobs for this item so no orphan jobs remain
+	// in the due index.
+	if _, err := tx.DeleteJobsForItem(ctx, current.ItemID); err != nil {
+		return fmt.Errorf("delete jobs for %s: %w", current.ItemID, err)
+	}
+
+	// Record a domain event for auditability.
+	_ = tx.AppendEvent(ctx, domain.Event{
+		EventID:        "evt:reconcile:oob:" + shortHash(current.ItemID+":"+strconv.FormatInt(now.UnixNano(), 10)),
+		FlowID:         current.FlowID,
+		ItemID:         current.ItemID,
+		Type:           "jellyreaper.reconcile.oob_deleted",
+		Source:         "reconciler",
+		OccurredAt:     now,
+		IdempotencyKey: "reconcile:oob:" + current.ItemID + ":" + strconv.FormatInt(now.Truncate(24*time.Hour).Unix(), 10),
+		Payload: map[string]any{
+			"display_name": current.DisplayName,
+			"subject_type": current.SubjectType,
+			"flow_state":   string(current.State),
+		},
+	})
+	return nil
+}
+
+// ScheduleOOBReconcile enqueues a JobKindReconcileItem job to run at runAt.
+// The job is a singleton keyed by a daily idempotency key so scheduling it
+// twice in the same calendar day is a no-op.
+//
+// Ownership: this method is intended to be called by the scheduled backfill
+// loop (in main.go) or by any startup path that owns the scheduler lifecycle.
+// It must NOT be called from inside a bbolt write transaction.
+func (s *Service) ScheduleOOBReconcile(ctx context.Context, runAt time.Time) error {
+	now := s.now().UTC()
+	if runAt.IsZero() {
+		runAt = now
+	}
+	dayKey := runAt.UTC().Format("2006-01-02")
+	payload, err := json.Marshal(jobs.ReconcileItemPayload{Source: "scheduled"})
+	if err != nil {
+		return fmt.Errorf("schedule oob reconcile: marshal payload: %w", err)
+	}
+	return s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
+		return tx.EnqueueJob(ctx, domain.JobRecord{
+			JobID:          "job:reconcile:oob:" + dayKey,
+			FlowID:         "",
+			ItemID:         "reconcile:oob",
+			Kind:           domain.JobKindReconcileItem,
+			Status:         domain.JobStatusPending,
+			RunAt:          runAt,
+			MaxAttempts:    3,
+			IdempotencyKey: "reconcile:oob:" + dayKey,
+			PayloadJSON:    payload,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		})
+	})
+}
+
+// extractJellyfinIDFromFlowItemID extracts the raw Jellyfin item ID from a
+// canonical flow ItemID. Supported formats:
+//
+//	"target:movie:<id>"  → "<id>"
+//	"target:item:<id>"   → "<id>"
+//	"target:season:<id>" → "<id>"   (season flow; episodes checked separately)
+//
+// Returns "" if the format is unrecognised or the ID component is blank.
+func extractJellyfinIDFromFlowItemID(itemID string) string {
+	parts := strings.SplitN(itemID, ":", 3)
+	if len(parts) == 3 && parts[0] == "target" && parts[2] != "" {
+		return parts[2]
+	}
+	return ""
+}
+
 func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.WebhookEvent) error {
 	s.enrichProviderIDsFromJellyfin(ctx, &event)
 
@@ -302,6 +605,10 @@ func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.Webh
 	return nil
 }
 
+type pendingPlayedRecovery struct {
+	itemID string
+}
+
 func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.WebhookEvent, now time.Time) (string, []targetRef, []hitlFinalizeRequest, error) {
 	eventAt, _ := sourceTimestampForJellyfinEvent(event)
 	playbackEvent := isPlaybackEvent(event.EventType)
@@ -311,17 +618,41 @@ func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.Web
 	itemID := event.ItemID
 	targets := deriveTargets(event)
 	finalizations := make([]hitlFinalizeRequest, 0)
+	playedRecoveries := make([]pendingPlayedRecovery, 0)
 
-	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
-		return s.applyJellyfinWebhookInTx(ctx, tx, event, now, eventAt, playbackEvent, catalogIndexEvent, removalEvent, dedupeKey, itemID, targets, &finalizations)
+	err := s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
+		return s.applyJellyfinWebhookInTx(ctx, tx, event, now, eventAt, playbackEvent, catalogIndexEvent, removalEvent, dedupeKey, itemID, targets, &finalizations, &playedRecoveries)
 	})
 	if err != nil {
 		return "", nil, nil, err
 	}
+
+	// Execute playback recovery transitions outside the webhook tx.
+	// FlowManager owns its own tx for each transition.
+	for _, pr := range playedRecoveries {
+		result, playErr := s.flowManager.Played(ctx, pr.itemID, scheduler.PlayedRequest{
+			TransitionSource: scheduler.TransitionSource{
+				Source: "jellyfin",
+				Reason: "playback_recovered",
+			},
+		})
+		if playErr != nil {
+			s.logger.Warn("webhook playback recovery failed", "item_id", pr.itemID, "error", playErr)
+			continue
+		}
+		if result.FinalizePrompt != nil {
+			finalizations = append(finalizations, hitlFinalizeRequest{
+				channelID: result.FinalizePrompt.ChannelID,
+				messageID: result.FinalizePrompt.MessageID,
+				content:   result.FinalizePrompt.Content,
+			})
+		}
+	}
+
 	return itemID, targets, finalizations, nil
 }
 
-func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxRepository, event jellyfin.WebhookEvent, now, eventAt time.Time, playbackEvent, catalogIndexEvent, removalEvent bool, dedupeKey, itemID string, targets []targetRef, finalizations *[]hitlFinalizeRequest) error {
+func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxRepository, event jellyfin.WebhookEvent, now, eventAt time.Time, playbackEvent, catalogIndexEvent, removalEvent bool, dedupeKey, itemID string, targets []targetRef, finalizations *[]hitlFinalizeRequest, pendingPlayed *[]pendingPlayedRecovery) error {
 	defaultReviewDays, _, defaultHITLTimeoutHours, err := s.currentDefaultsFromMeta(ctx, tx)
 	if err != nil {
 		return err
@@ -702,57 +1033,11 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		}
 
 		if (playbackEvent || (catalogPlaybackAdvanced && flow.State == domain.FlowStatePendingReview)) && flow.State == domain.FlowStatePendingReview {
-			runAt := now
-			resolvedPlayedAt := time.Time{}
-			if playAt, known, err := mostRecentPlayForTarget(ctx, tx, flow); err != nil {
-				return err
-			} else if known {
-				resolvedPlayedAt = playAt
-				expireDays := flow.PolicySnapshot.ExpireAfterDays
-				if expireDays <= 0 {
-					expireDays = defaultReviewDays
-				}
-				dueAt := playAt.Add(time.Duration(expireDays) * 24 * time.Hour)
-				if dueAt.After(runAt) {
-					runAt = dueAt
-				}
-			}
-
-			expected := flow.Version
-			flow.State = domain.FlowStateActive
-			flow.HITLOutcome = "played"
-			flow.DecisionDeadlineAt = time.Time{}
-			flow.NextActionAt = runAt
-			flow.UpdatedAt = now
-			flow.Version = expected + 1
-			if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
-				return err
-			}
-			// Opportunistic cleanup: a play during PendingReview makes the
-			// prompt/timeout chain stale. Wipe them so they don't fire and
-			// log+bail. This also wipes the eval singleton, which RequestEval
-			// recreates immediately below.
-			purged, err := tx.DeleteJobsForItem(ctx, target.Canonical)
-			if err != nil {
-				return err
-			}
-			s.logger.InfoContext(ctx, "webhook playback recovery purged stale jobs",
-				"lex", "FLOW-LIFECYCLE",
-				"item_id", target.Canonical,
-				"jobs_purged", purged,
-			)
-			if err := s.evalScheduler.RequestEval(ctx, tx, flow, now, runAt, "jellyfin_playback_recovered", dedupeKey+":eval", flow.Version); err != nil {
-				return err
-			}
-			if finalizations != nil && strings.TrimSpace(flow.Discord.ChannelID) != "" && strings.TrimSpace(flow.Discord.MessageID) != "" {
-				display := strings.TrimSpace(flow.DisplayName)
-				if display == "" {
-					display = target.Canonical
-				}
-				*finalizations = append(*finalizations, hitlFinalizeRequest{
-					channelID: flow.Discord.ChannelID,
-					messageID: flow.Discord.MessageID,
-					content:   fmt.Sprintf("Resolved: PLAYED at %s for %s", humanTimeLabel(resolvedPlayedAt), display),
+			// Collect for post-tx playback recovery via FlowManager.
+			// FlowManager computes nextEvalAt from media history internally.
+			if pendingPlayed != nil {
+				*pendingPlayed = append(*pendingPlayed, pendingPlayedRecovery{
+					itemID: target.Canonical,
 				})
 			}
 			continue
@@ -775,16 +1060,30 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		}
 
 		runAt := now
+		expireDays := flow.PolicySnapshot.ExpireAfterDays
+		if expireDays <= 0 {
+			expireDays = defaultReviewDays
+		}
 		if playAt, known, err := mostRecentPlayForTarget(ctx, tx, flow); err != nil {
 			return err
 		} else if known {
-			expireDays := flow.PolicySnapshot.ExpireAfterDays
-			if expireDays <= 0 {
-				expireDays = defaultReviewDays
-			}
 			dueAt := playAt.Add(time.Duration(expireDays) * 24 * time.Hour)
 			if dueAt.After(runAt) {
 				runAt = dueAt
+			}
+		} else {
+			// Never played: anchor the eval due-date on the item's added (CreatedAt)
+			// date so a brand-new item is not immediately due for review.
+			// dueAt = max(createdAt + expireDays, now). This mirrors the fallback
+			// logic in EvaluatePolicyHandler and prevents repeated backfill calls
+			// from overriding the deferred eval run time back to "now".
+			if addedAt, createdKnown, err := mostRecentCreatedForTarget(ctx, tx, flow); err != nil {
+				return err
+			} else if createdKnown {
+				dueAt := addedAt.Add(time.Duration(expireDays) * 24 * time.Hour)
+				if dueAt.After(runAt) {
+					runAt = dueAt
+				}
 			}
 		}
 
@@ -839,10 +1138,16 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 	decisionDisplayName := parsed.ItemID
 	resolvedAction := parsed.Action
 
-	err = s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	// Pre-check: deduplication and stale version detection.
+	defaultDeferDays := 0
+	err = s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		_, defaultDeferWindow, _, err := s.currentDefaultsFromMeta(ctx, tx)
 		if err != nil {
 			return err
+		}
+		defaultDeferDays = int(defaultDeferWindow.Hours() / 24)
+		if defaultDeferDays <= 0 {
+			defaultDeferDays = 15
 		}
 
 		processed, err := tx.IsProcessed(ctx, dedupeKey)
@@ -877,69 +1182,44 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 		if strings.TrimSpace(flow.DisplayName) != "" {
 			decisionDisplayName = strings.TrimSpace(flow.DisplayName)
 		}
-
-		expectedVersion := flow.Version
-		if parsed.Version != expectedVersion {
+		if parsed.Version != flow.Version {
 			staleVersion = true
 			staleMessage = staleDecisionMessage(flow, decisionDisplayName, interaction)
 			return nil
 		}
 
-		flow.UpdatedAt = now
-		effectiveAction := parsed.Action
-		resolvedAction = effectiveAction
-		flow.HITLOutcome = effectiveAction
-
-		switch effectiveAction {
-		case "archive":
-			flow.State = domain.FlowStateArchived
-		case "delay":
-			flow.State = domain.FlowStateActive
-			flow.NextActionAt = now.Add(defaultDeferWindow)
-			flow.DecisionDeadlineAt = time.Time{}
-			clearDiscordPromptLink(&flow.Discord)
-			if err := s.evalScheduler.RequestEval(ctx, tx, flow, now, flow.NextActionAt, "discord_delay", "discord:eval:"+flow.ItemID, flow.Version); err != nil {
-				return err
-			}
-		case "delete":
-			flow.State = domain.FlowStateDeleteQueued
-			flow.NextActionAt = now
-			if err := enqueueExecuteDelete(ctx, tx, flow, now); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("unsupported action %q", parsed.Action)
-		}
-
-		flow.Version = expectedVersion + 1
-		if flow.CreatedAt.IsZero() {
-			flow.CreatedAt = now
-		}
-		if err := tx.UpsertFlowCAS(ctx, flow, expectedVersion); err != nil {
-			return err
-		}
-
-		event := domain.Event{
-			EventID:        "evt:discord:" + shortHash(dedupeKey),
-			FlowID:         flow.FlowID,
-			ItemID:         flow.ItemID,
-			Type:           "discord.interaction." + effectiveAction,
-			Source:         "discord",
-			OccurredAt:     now,
-			IdempotencyKey: dedupeKey,
-			Payload: map[string]any{
-				"interaction_id": interaction.InteractionID,
-				"custom_id":      interaction.CustomID,
-				"action":         effectiveAction,
-				"version":        parsed.Version,
-			},
-		}
-		if err := tx.AppendEvent(ctx, event); err != nil {
-			return err
-		}
-
 		return tx.MarkProcessed(ctx, dedupeKey, now)
 	})
+	if err != nil {
+		return nil, err
+	}
+	if alreadyProcessed || staleVersion {
+		// Early return — handled below.
+	} else {
+		// Transition via FlowManager (owns its own tx).
+		src := scheduler.TransitionSource{
+			Source: "discord",
+			Actor:  discordInteractionActor(interaction),
+			Extra: map[string]any{
+				"interaction_id": interaction.InteractionID,
+				"custom_id":      interaction.CustomID,
+			},
+		}
+		resolvedAction = parsed.Action
+		switch parsed.Action {
+		case "archive":
+			_, err = s.flowManager.Archive(ctx, parsed.ItemID, src)
+		case "delay":
+			_, err = s.flowManager.Delay(ctx, parsed.ItemID, scheduler.DelayRequest{
+				Days:             defaultDeferDays,
+				TransitionSource: src,
+			})
+		case "delete":
+			_, err = s.flowManager.Delete(ctx, parsed.ItemID, src)
+		default:
+			err = fmt.Errorf("unsupported action %q", parsed.Action)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -981,82 +1261,23 @@ func (s *Service) ApplyAIDecision(ctx context.Context, itemID string, action str
 		return fmt.Errorf("action is required")
 	}
 
-	now := s.now().UTC()
-	finalizeChannelID := ""
-	finalizeMessageID := ""
-	finalizeDisplayName := ""
-	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
-		flow, found, err := tx.GetFlow(ctx, itemID)
-		if err != nil {
-			return err
-		}
-		if !found {
-			return fmt.Errorf("flow not found for item %s", itemID)
-		}
-
-		expectedVersion := flow.Version
-		flow.UpdatedAt = now
-		flow.HITLOutcome = action
-		finalizeChannelID = flow.Discord.ChannelID
-		finalizeMessageID = flow.Discord.MessageID
-		finalizeDisplayName = strings.TrimSpace(flow.DisplayName)
-
-		switch action {
-		case "archive":
-			flow.State = domain.FlowStateArchived
-			flow.NextActionAt = time.Time{}
-			flow.DecisionDeadlineAt = time.Time{}
-		case "unarchive":
-			flow.State = domain.FlowStateActive
-			flow.DecisionDeadlineAt = time.Time{}
-			clearDiscordPromptLink(&flow.Discord)
-			if err := s.evalScheduler.RequestEval(ctx, tx, flow, now, now, "ai_unarchive", "ai:eval:"+flow.ItemID, flow.Version); err != nil {
-				return err
-			}
-		case "delete":
-			flow.State = domain.FlowStateDeleteQueued
-			flow.NextActionAt = now
-			flow.DecisionDeadlineAt = time.Time{}
-			if err := enqueueExecuteDelete(ctx, tx, flow, now); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("unsupported ai action %q", action)
-		}
-
-		flow.Version = expectedVersion + 1
-		if err := tx.UpsertFlowCAS(ctx, flow, expectedVersion); err != nil {
-			return err
-		}
-
-		event := domain.Event{
-			EventID:        "evt:ai:" + shortHash(itemID+":"+action+":"+strconv.FormatInt(now.UnixNano(), 10)),
-			FlowID:         flow.FlowID,
-			ItemID:         flow.ItemID,
-			Type:           "ai.decision." + action,
-			Source:         "ai",
-			OccurredAt:     now,
-			IdempotencyKey: "ai:" + action + ":" + itemID + ":" + strconv.FormatInt(expectedVersion+1, 10),
-			Payload: map[string]any{
-				"action": action,
-			},
-		}
-		return tx.AppendEvent(ctx, event)
-	})
+	src := scheduler.TransitionSource{Source: "ai", Reason: "ai_" + action}
+	var result *scheduler.TransitionResult
+	var err error
+	switch action {
+	case "archive":
+		result, err = s.flowManager.Archive(ctx, itemID, src)
+	case "unarchive":
+		result, err = s.flowManager.Unarchive(ctx, itemID, src)
+	case "delete":
+		result, err = s.flowManager.Delete(ctx, itemID, src)
+	default:
+		return fmt.Errorf("unsupported ai action %q", action)
+	}
 	if err != nil {
 		return err
 	}
-	if s.discord != nil && finalizeChannelID != "" && finalizeMessageID != "" {
-		display := finalizeDisplayName
-		if display == "" {
-			display = "item"
-		}
-		content := fmt.Sprintf("Resolved: %s for %s (AI).", interactionDecisionLabel(action), display)
-		if err := s.discord.FinalizeHITLPrompt(ctx, finalizeChannelID, finalizeMessageID, content); err != nil {
-			s.logger.Warn("failed to finalize ai decision HITL message", "item_id", itemID, "error", err)
-		}
-	}
-	s.wake(now)
+	s.finalizeAndWake(ctx, result, itemID)
 	return nil
 }
 
@@ -1089,71 +1310,18 @@ func (s *Service) ApplyAIDelayDays(ctx context.Context, itemID string, days int)
 	if itemID == "" {
 		return fmt.Errorf("item id is required")
 	}
-	if days <= 0 {
-		return fmt.Errorf("days must be > 0")
-	}
-	now := s.now().UTC()
-	delayUntil := now.Add(time.Duration(days) * 24 * time.Hour)
-	finalizeChannelID := ""
-	finalizeMessageID := ""
-	finalizeDisplayName := ""
-	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
-		flow, found, err := tx.GetFlow(ctx, itemID)
-		if err != nil {
-			return err
-		}
-		if !found {
-			return fmt.Errorf("flow not found for item %s", itemID)
-		}
-		expectedVersion := flow.Version
-		finalizeChannelID = flow.Discord.ChannelID
-		finalizeMessageID = flow.Discord.MessageID
-		finalizeDisplayName = strings.TrimSpace(flow.DisplayName)
-		flow.State = domain.FlowStateActive
-		flow.HITLOutcome = "delay"
-		flow.NextActionAt = delayUntil
-		flow.DecisionDeadlineAt = time.Time{}
-		if flow.PolicySnapshot.ExpireAfterDays <= 0 {
-			flow.PolicySnapshot.ExpireAfterDays = s.defaultExpireDays
-		}
-		flow.PolicySnapshot.ExpireAfterDays = days
-		clearDiscordPromptLink(&flow.Discord)
-		flow.UpdatedAt = now
-		flow.Version = expectedVersion + 1
-		if err := tx.UpsertFlowCAS(ctx, flow, expectedVersion); err != nil {
-			return err
-		}
-		if err := s.evalScheduler.RequestEval(ctx, tx, flow, now, delayUntil, "ai_delay", "ai:eval:"+flow.ItemID, flow.Version); err != nil {
-			return err
-		}
-		return tx.AppendEvent(ctx, domain.Event{
-			EventID:        "evt:ai:delay:" + shortHash(itemID+":"+strconv.FormatInt(now.UnixNano(), 10)),
-			FlowID:         flow.FlowID,
-			ItemID:         flow.ItemID,
-			Type:           "ai.decision.delay",
-			Source:         "ai",
-			OccurredAt:     now,
-			IdempotencyKey: "ai:delay:" + itemID + ":" + strconv.Itoa(days) + ":" + strconv.FormatInt(flow.Version, 10),
-			Payload: map[string]any{
-				"days":        days,
-				"delay_until": delayUntil.Format(time.RFC3339),
-			},
-		})
+	result, err := s.flowManager.Delay(ctx, itemID, scheduler.DelayRequest{
+		Days:            days,
+		ExpireAfterDays: days,
+		TransitionSource: scheduler.TransitionSource{
+			Source: "ai",
+			Reason: "ai_delay",
+		},
 	})
 	if err != nil {
 		return err
 	}
-	if s.discord != nil && finalizeChannelID != "" && finalizeMessageID != "" {
-		display := finalizeDisplayName
-		if display == "" {
-			display = "item"
-		}
-		content := fmt.Sprintf("Resolved: DELAYED %d days for %s (AI).", days, display)
-		if err := s.discord.FinalizeHITLPrompt(ctx, finalizeChannelID, finalizeMessageID, content); err != nil {
-			s.logger.Warn("failed to finalize ai delay HITL message", "item_id", itemID, "error", err)
-		}
-	}
-	s.wake(now)
+	s.finalizeAndWake(ctx, result, itemID)
 	return nil
 }
 
@@ -1164,84 +1332,14 @@ func (s *Service) RequestImmediateReview(ctx context.Context, itemID string) err
 	if itemID == "" {
 		return fmt.Errorf("item id is required")
 	}
-	now := s.now().UTC()
-	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
-		flow, found, err := tx.GetFlow(ctx, itemID)
-		if err != nil {
-			return err
-		}
-		if !found {
-			return fmt.Errorf("flow not found for item %s", itemID)
-		}
-		if flow.State == domain.FlowStatePendingReview {
-			// Already pending — just ensure a prompt job exists.
-			promptPayload, err := json.Marshal(jobs.SendHITLPromptPayload{
-				ChannelID:   flow.Discord.ChannelID,
-				FlowVersion: flow.Version,
-			})
-			if err != nil {
-				return err
-			}
-			return tx.EnqueueJob(ctx, domain.JobRecord{
-				JobID:          "job:prompt:" + itemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
-				FlowID:         flow.FlowID,
-				ItemID:         flow.ItemID,
-				Kind:           domain.JobKindSendHITLPrompt,
-				Status:         domain.JobStatusPending,
-				RunAt:          now,
-				MaxAttempts:    5,
-				IdempotencyKey: "job:prompt:review:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version, 10),
-				PayloadJSON:    promptPayload,
-				CreatedAt:      now,
-				UpdatedAt:      now,
-			})
-		}
-		expected := flow.Version
-		flow.State = domain.FlowStatePendingReview
-		flow.HITLOutcome = ""
-		flow.DecisionDeadlineAt = time.Time{}
-		flow.NextActionAt = now
-		flow.UpdatedAt = now
-		flow.Version = expected + 1
-		if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
-			return err
-		}
-		promptPayload, err := json.Marshal(jobs.SendHITLPromptPayload{
-			ChannelID:   flow.Discord.ChannelID,
-			FlowVersion: flow.Version,
-		})
-		if err != nil {
-			return err
-		}
-		if err := tx.EnqueueJob(ctx, domain.JobRecord{
-			JobID:          "job:prompt:" + itemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
-			FlowID:         flow.FlowID,
-			ItemID:         flow.ItemID,
-			Kind:           domain.JobKindSendHITLPrompt,
-			Status:         domain.JobStatusPending,
-			RunAt:          now,
-			MaxAttempts:    5,
-			IdempotencyKey: "job:prompt:review:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version, 10),
-			PayloadJSON:    promptPayload,
-			CreatedAt:      now,
-			UpdatedAt:      now,
-		}); err != nil {
-			return err
-		}
-		return tx.AppendEvent(ctx, domain.Event{
-			EventID:        "evt:ai:review:" + shortHash(itemID+":"+strconv.FormatInt(now.UnixNano(), 10)),
-			FlowID:         flow.FlowID,
-			ItemID:         flow.ItemID,
-			Type:           "ai.request_review",
-			Source:         "ai",
-			OccurredAt:     now,
-			IdempotencyKey: "ai:review:" + itemID + ":" + strconv.FormatInt(flow.Version, 10),
-		})
+	result, err := s.flowManager.RequestReview(ctx, itemID, scheduler.TransitionSource{
+		Source: "ai",
+		Reason: "ai_request_review",
 	})
 	if err != nil {
 		return err
 	}
-	s.wake(now)
+	s.finalizeAndWake(ctx, result, itemID)
 	return nil
 }
 
@@ -1376,6 +1474,7 @@ func (s *Service) processWebhookBatches(ctx context.Context, ops <-chan backfill
 	}
 
 	batch := make([]backfillWriteOp, 0, batchSize)
+	playedRecoveries := make([]pendingPlayedRecovery, 0)
 	timer := time.NewTimer(flushTimeout)
 	defer timer.Stop()
 
@@ -1383,7 +1482,20 @@ func (s *Service) processWebhookBatches(ctx context.Context, ops <-chan backfill
 		if len(batch) == 0 {
 			return nil
 		}
-		if err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		// Enrich provider IDs BEFORE opening the write transaction. Enrichment
+		// makes synchronous HTTP calls back to Jellyfin; doing it inside WithTx
+		// would hold the single global bbolt write lock across N network
+		// round-trips and stall every live playback webhook. This mirrors the
+		// live path (HandleJellyfinWebhook enriches before applyJellyfinWebhookTx).
+		// The outbound Jellyfin client now also rejects calls made inside a tx
+		// (txguard), so this ordering is enforced, not merely conventional.
+		for _, op := range batch {
+			if op.event == nil {
+				continue
+			}
+			s.enrichProviderIDsFromJellyfin(ctx, op.event)
+		}
+		if err := s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 			for _, op := range batch {
 				if op.event == nil {
 					if op.cursorKey != "" {
@@ -1394,7 +1506,6 @@ func (s *Service) processWebhookBatches(ctx context.Context, ops <-chan backfill
 					continue
 				}
 				event := *op.event
-				s.enrichProviderIDsFromJellyfin(ctx, &event)
 				now := s.now().UTC()
 				if sourceNow, ok := sourceTimestampForJellyfinEvent(event); ok {
 					now = sourceNow
@@ -1413,6 +1524,7 @@ func (s *Service) processWebhookBatches(ctx context.Context, ops <-chan backfill
 					event.ItemID,
 					deriveTargets(event),
 					nil,
+					&playedRecoveries,
 				); err != nil {
 					return err
 				}
@@ -1421,6 +1533,15 @@ func (s *Service) processWebhookBatches(ctx context.Context, ops <-chan backfill
 		}); err != nil {
 			return err
 		}
+		// Execute pending playback recoveries outside the backfill tx.
+		for _, pr := range playedRecoveries {
+			if _, playErr := s.flowManager.Played(ctx, pr.itemID, scheduler.PlayedRequest{
+				TransitionSource: scheduler.TransitionSource{Source: "jellyfin", Reason: "backfill_playback_recovered"},
+			}); playErr != nil {
+				s.logger.Warn("backfill playback recovery failed", "item_id", pr.itemID, "error", playErr)
+			}
+		}
+		playedRecoveries = playedRecoveries[:0]
 		s.logger.InfoContext(ctx, "flushed backfill write batch", "lex", "BACKFILL-WRITE", "source", source, "batch_size", len(batch))
 		batch = batch[:0]
 		return nil
@@ -1559,27 +1680,6 @@ func parseCustomID(value string) (customID, error) {
 	return customID{Action: action, ItemID: itemID, Version: version}, nil
 }
 
-func enqueueExecuteDelete(ctx context.Context, tx repo.TxRepository, flow domain.Flow, now time.Time) error {
-	payload, err := json.Marshal(jobs.ExecuteDeletePayload{RequestedBy: "discord"})
-	if err != nil {
-		return err
-	}
-
-	return tx.EnqueueJob(ctx, domain.JobRecord{
-		JobID:          "job:delete:" + flow.ItemID + ":" + strconv.FormatInt(now.UnixNano(), 10),
-		FlowID:         flow.FlowID,
-		ItemID:         flow.ItemID,
-		Kind:           domain.JobKindExecuteDelete,
-		Status:         domain.JobStatusPending,
-		RunAt:          now,
-		MaxAttempts:    5,
-		IdempotencyKey: "discord:delete:" + flow.ItemID + ":" + strconv.FormatInt(flow.Version+1, 10),
-		PayloadJSON:    payload,
-		CreatedAt:      now,
-		UpdatedAt:      now,
-	})
-}
-
 func interactionResponse(content string) *discordgo.InteractionResponse {
 	return &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
@@ -1672,18 +1772,6 @@ func latestPromptReference(flow domain.Flow, interaction discord.IncomingInterac
 		return fmt.Sprintf("This prompt is stale. Use the latest one: https://discord.com/channels/%s/%s/%s", guildID, targetChannelID, targetMessageID)
 	}
 	return fmt.Sprintf("This prompt is stale. Use the latest one in channel %s (message %s).", targetChannelID, targetMessageID)
-}
-
-func clearDiscordPromptLink(ctx *domain.DiscordContext) {
-	if ctx == nil {
-		return
-	}
-	msg := strings.TrimSpace(ctx.MessageID)
-	if msg != "" {
-		ctx.PreviousChannelID = strings.TrimSpace(ctx.ChannelID)
-		ctx.PreviousMessageID = msg
-	}
-	ctx.MessageID = ""
 }
 
 func interactionDecisionLabel(action string) string {
@@ -1813,6 +1901,39 @@ func mostRecentPlayForTarget(ctx context.Context, tx repo.TxRepository, flow dom
 		return time.Time{}, false, nil
 	}
 	return item.LastPlayedAt, true, nil
+}
+
+// mostRecentCreatedForTarget returns the most recent CreatedAt timestamp for the
+// media associated with the given flow's target, mirroring the fallback logic in
+// EvaluatePolicyHandler. Used by the webhook path to anchor the eval due-date on
+// the item's added date for never-played items so they are not immediately due.
+func mostRecentCreatedForTarget(ctx context.Context, tx repo.TxRepository, flow domain.Flow) (time.Time, bool, error) {
+	parts := strings.SplitN(flow.ItemID, ":", 3)
+	if len(parts) == 3 && parts[0] == "target" {
+		items, err := tx.ListMediaBySubject(ctx, parts[1], parts[2])
+		if err != nil {
+			return time.Time{}, false, err
+		}
+		latest := time.Time{}
+		for _, item := range items {
+			if item.CreatedAt.After(latest) {
+				latest = item.CreatedAt
+			}
+		}
+		if latest.IsZero() {
+			return time.Time{}, false, nil
+		}
+		return latest, true, nil
+	}
+
+	item, found, err := tx.GetMedia(ctx, flow.ItemID)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if !found || item.CreatedAt.IsZero() {
+		return time.Time{}, false, nil
+	}
+	return item.CreatedAt, true, nil
 }
 
 func targetKey(targetType, id string) string {

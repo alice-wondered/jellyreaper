@@ -2,9 +2,12 @@ package jellyfin
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"jellyreaper/internal/txguard"
 )
 
 func TestFetchProviderIDsPrefersNoDashUUIDForm(t *testing.T) {
@@ -81,5 +84,61 @@ func TestDeleteItemReturnsErrorOnServerError(t *testing.T) {
 	client := NewClient(server.URL, "api-key", server.Client())
 	if err := client.DeleteItem(context.Background(), "boom"); err == nil {
 		t.Fatal("expected error on 500, got nil")
+	}
+}
+
+func TestFetchProviderIDsRejectedInsideTransaction(t *testing.T) {
+	hit := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"Items":[{"ProviderIds":{"Tvdb":"1"}}]}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "api-key", server.Client())
+	ctx := txguard.MarkInTx(context.Background())
+	_, err := client.FetchProviderIDs(ctx, "item-1")
+	if !errors.Is(err, ErrIOInTransaction) {
+		t.Fatalf("expected ErrIOInTransaction inside tx, got %v", err)
+	}
+	if hit {
+		t.Fatal("network call must not be performed when inside a transaction")
+	}
+}
+
+func TestDeleteItemRejectedInsideTransaction(t *testing.T) {
+	hit := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "api-key", server.Client())
+	ctx := txguard.MarkInTx(context.Background())
+	err := client.DeleteItem(ctx, "item-1")
+	if !errors.Is(err, ErrIOInTransaction) {
+		t.Fatalf("expected ErrIOInTransaction inside tx, got %v", err)
+	}
+	if hit {
+		t.Fatal("network call must not be performed when inside a transaction")
+	}
+}
+
+func TestFetchProviderIDsAllowedOutsideTransaction(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"Items":[{"ProviderIds":{"Tvdb":"42"}}]}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "api-key", server.Client())
+	ids, err := client.FetchProviderIDs(context.Background(), "item-1")
+	if err != nil {
+		t.Fatalf("expected success outside tx, got %v", err)
+	}
+	if ids["tvdb"] != "42" {
+		t.Fatalf("expected tvdb=42, got %q", ids["tvdb"])
 	}
 }

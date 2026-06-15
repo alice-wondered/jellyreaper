@@ -30,13 +30,14 @@ type Harness struct {
 	logger     *slog.Logger
 	decision   DecisionService
 
-	mu              sync.Mutex
-	history         map[string]*ringBuffer
-	state           map[string]threadState
-	historyRestorer func(context.Context, string, int) ([]string, error)
-	maxThreads      int
-	threadLRU       *list.List
-	threadIndex     map[string]*list.Element
+	mu                sync.Mutex
+	history           map[string]*ringBuffer
+	state             map[string]threadState
+	historyRestorer   func(context.Context, string, int) ([]string, error)
+	maxThreads        int
+	threadLRU         *list.List
+	threadIndex       map[string]*list.Element
+	lastToolSummaries []string // populated during respondBestEffort
 }
 
 type DecisionService interface {
@@ -163,6 +164,9 @@ func (h *Harness) HandleMention(ctx context.Context, threadID string, userName s
 	}
 
 	h.appendHistory(threadID, userName+": "+input)
+	// Store tool call summaries so the AI retains knowledge of what it
+	// looked up in previous turns without re-calling tools.
+	h.appendToolSummaries(threadID, h.lastToolSummaries)
 	h.appendHistory(threadID, "assistant: "+out)
 	return out, nil
 }
@@ -241,6 +245,7 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 	}
 
 	messages := []ChatMessage{{Role: "system", Content: system}, {Role: "user", Content: userPrompt}}
+	h.lastToolSummaries = nil
 
 	for i := 0; i < 6; i++ {
 		// Re-trigger the typing indicator before each API round-trip so
@@ -278,6 +283,9 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 				result = "tool error: " + err.Error()
 			}
 			messages = append(messages, ChatMessage{Role: "tool", Content: result, ToolCallID: tc.ID})
+			if tc.Name != "response" {
+				h.lastToolSummaries = append(h.lastToolSummaries, summarizeToolResult(tc.Name, result))
+			}
 			if strings.TrimSpace(out) != "" && finalResponse == "" {
 				finalResponse = out
 			}
@@ -541,7 +549,7 @@ func (h *Harness) listReady(ctx context.Context, limit int) (string, string, err
 	}
 	rows := make([]row, 0)
 	now := time.Now().UTC()
-	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	err := h.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flows, err := tx.ListFlows(ctx)
 		if err != nil {
 			return err
@@ -615,7 +623,7 @@ func (h *Harness) queryLibrary(ctx context.Context, query string, scope string, 
 	matchedSeasonFlowCount := 0
 	matchedShowNames := map[string]struct{}{}
 
-	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	err := h.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flows, err := tx.ListFlows(ctx)
 		if err != nil {
 			return err
@@ -1225,7 +1233,7 @@ func (h *Harness) handleFollowUp(ctx context.Context, threadID string, input str
 }
 
 func (h *Harness) applyArchiveToID(ctx context.Context, itemID string, archived bool) (string, error) {
-	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	err := h.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, itemID)
 		if err != nil {
 			return err
@@ -1421,7 +1429,7 @@ func (h *Harness) findFlowMatchesFiltered(ctx context.Context, query string, sub
 		return []domain.Flow{}, nil
 	}
 	matches := make([]domain.Flow, 0)
-	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	err := h.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flows, err := tx.SearchFlows(ctx, query, subjectType, 50)
 		if err != nil {
 			return err
@@ -1449,7 +1457,7 @@ func (h *Harness) findFlowMatchesFiltered(ctx context.Context, query string, sub
 func (h *Harness) getFlowByID(ctx context.Context, itemID string) (domain.Flow, bool, error) {
 	var out domain.Flow
 	var found bool
-	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	err := h.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		f, ok, err := tx.GetFlow(ctx, itemID)
 		if err != nil {
 			return err
@@ -1532,7 +1540,7 @@ func (h *Harness) humanizeWhen(at time.Time) string {
 func (h *Harness) getMediaByID(ctx context.Context, itemID string) (domain.MediaItem, bool, error) {
 	var media domain.MediaItem
 	var found bool
-	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	err := h.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		m, ok, err := tx.GetMedia(ctx, itemID)
 		if err != nil {
 			return err
@@ -1774,6 +1782,21 @@ func (h *Harness) getHistory(threadID string) []string {
 	copyOut := make([]string, len(history))
 	copy(copyOut, history)
 	return copyOut
+}
+
+func (h *Harness) appendToolSummaries(threadID string, summaries []string) {
+	for _, s := range summaries {
+		h.appendHistory(threadID, "[tool] "+s)
+	}
+}
+
+func summarizeToolResult(toolName string, result string) string {
+	// Keep it compact — max 200 chars per tool result.
+	trimmed := strings.TrimSpace(result)
+	if len(trimmed) > 200 {
+		trimmed = trimmed[:200] + "..."
+	}
+	return toolName + ": " + trimmed
 }
 
 func (h *Harness) appendHistory(threadID string, line string) {

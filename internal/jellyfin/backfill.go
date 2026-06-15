@@ -16,6 +16,7 @@ import (
 
 	"jellyreaper/internal/domain"
 	gen "jellyreaper/internal/jellyfin/gen"
+	"jellyreaper/internal/txguard"
 )
 
 type BackfillClient interface {
@@ -659,6 +660,9 @@ func (s *BackfillService) fetchUserRecentlyPlayedPage(ctx context.Context, userI
 }
 
 func (s *BackfillService) getJSONWithRetry(ctx context.Context, endpoint string, op string, maxRead int64, out any) error {
+	if txguard.InTx(ctx) {
+		return fmt.Errorf("%s: %w", op, ErrIOInTransaction)
+	}
 	var lastErr error
 	for attempt := 1; attempt <= enrichmentRetryMaxAttempts; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)

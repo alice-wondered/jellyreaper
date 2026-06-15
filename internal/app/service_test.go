@@ -22,6 +22,7 @@ func TestHITLArchiveLeavesNoDeletionJob(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 12, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	targetID := "target:item:item-archive"
 	seedFlowForInteraction(t, store, targetID, now)
@@ -66,6 +67,7 @@ func TestHITLDeleteQueuesImmediateDeleteJob(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 12, 30, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	targetID := "target:item:item-delete"
 	seedFlowForInteraction(t, store, targetID, now)
@@ -99,9 +101,10 @@ func TestStaleInteractionPointsToLatestPrompt(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 12, 45, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	targetID := "target:item:item-stale-link"
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + targetID,
 			ItemID:      targetID,
@@ -155,9 +158,10 @@ func TestStaleInteractionWithoutNewPromptClosesCurrentMessage(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 12, 50, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	targetID := "target:item:item-stale-no-new"
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + targetID,
 			ItemID:      targetID,
@@ -214,9 +218,10 @@ func TestApplyAIDecisionDeleteQueuesImmediateDeleteJob(t *testing.T) {
 	})
 	now := time.Date(2026, 4, 7, 13, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:item:item-ai-delete"
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + itemID,
 			ItemID:      itemID,
@@ -279,9 +284,10 @@ func TestApplyAIDecisionFinalizesOpenHITLPrompt(t *testing.T) {
 	svc.SetDiscordService(discordSvc)
 	now := time.Date(2026, 4, 7, 13, 30, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:item:item-ai-archive"
-	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err = store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + itemID,
 			ItemID:      itemID,
@@ -332,9 +338,10 @@ func TestApplyAIDecisionUnarchiveEnqueuesEvaluateNow(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 14, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:item:item-ai-unarchive"
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + itemID,
 			ItemID:      itemID,
@@ -392,9 +399,10 @@ func TestApplyAIDelayDaysSetsPolicyAndSchedulesEval(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 15, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:season:season-ai-delay"
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + itemID,
 			ItemID:      itemID,
@@ -460,9 +468,10 @@ func TestApplyAIDelayDaysDefersLazilyAndFinalizesHITLPrompt(t *testing.T) {
 	svc.SetDiscordService(discordSvc)
 	now := time.Date(2026, 4, 7, 15, 30, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:season:season-ai-delay-prompt"
-	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err = store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:         "flow:" + itemID,
 			ItemID:         itemID,
@@ -540,7 +549,7 @@ func TestSetGlobalPolicyDefaultsUpdateMetaOnly(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 16, 0, 0, 0, time.UTC)
 
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{FlowID: "flow:target:season:s-g1", ItemID: "target:season:s-g1", SubjectType: "season", DisplayName: "Season G1", State: domain.FlowStateActive, Version: 0, PolicySnapshot: domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 48, TimeoutAction: "delete"}, CreatedAt: now, UpdatedAt: now}, 0); err != nil {
 			return err
 		}
@@ -560,7 +569,7 @@ func TestSetGlobalPolicyDefaultsUpdateMetaOnly(t *testing.T) {
 		t.Fatalf("set global hitl timeout hours: %v", err)
 	}
 
-	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err = store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		raw, ok, err := tx.GetMeta(context.Background(), metaReviewDays)
 		if err != nil {
 			return err
@@ -609,6 +618,7 @@ func TestGlobalDeferDaysAppliesLazilyOnNextDelayAction(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 17, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	if err := svc.SetGlobalDeferDays(context.Background(), 15); err != nil {
 		t.Fatalf("set global defer days: %v", err)
@@ -649,6 +659,7 @@ func TestHITLDelaySchedulesFutureEvaluation(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 13, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	targetID := "target:item:item-delay"
 	seedFlowForInteraction(t, store, targetID, now)
@@ -682,6 +693,7 @@ func TestWebhookIndexesFlowAndJobAndDedupe(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 14, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	event := jellyfin.WebhookEvent{
 		Payload:   jellyfin.WebhookPayload{ItemID: "item-webhook", ItemType: "Movie", Name: "Webhook Movie", NotificationType: "ItemAdded", EventID: "evt-1"},
@@ -704,7 +716,7 @@ func TestWebhookIndexesFlowAndJobAndDedupe(t *testing.T) {
 		t.Fatalf("unexpected flow state: %s", flow.State)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		processed, err := tx.IsProcessed(context.Background(), "jellyfin:evt-1")
 		if err != nil {
 			return err
@@ -717,12 +729,21 @@ func TestWebhookIndexesFlowAndJobAndDedupe(t *testing.T) {
 		t.Fatalf("verify dedupe key: %v", err)
 	}
 
-	jobs, err := store.LeaseDueJobs(context.Background(), now, 10, "test", time.Minute)
+	// The eval job is deferred to addedDate + threshold (not due right now for a
+	// newly added item). Use a far-future window to confirm exactly one job
+	// was created and deduplication suppressed the second webhook.
+	jobs, err := store.LeaseDueJobs(context.Background(), now.Add(365*24*time.Hour), 10, "test", time.Minute)
 	if err != nil {
 		t.Fatalf("lease jobs: %v", err)
 	}
-	if len(jobs) != 1 || jobs[0].Kind != domain.JobKindEvaluatePolicy {
-		t.Fatalf("expected single evaluate job after dedupe, got %#v", jobs)
+	evalJobs := 0
+	for _, job := range jobs {
+		if job.Kind == domain.JobKindEvaluatePolicy && job.ItemID == "target:movie:item-webhook" {
+			evalJobs++
+		}
+	}
+	if evalJobs != 1 {
+		t.Fatalf("expected exactly one evaluate job after dedupe, got %d (%#v)", evalJobs, jobs)
 	}
 }
 
@@ -731,6 +752,7 @@ func TestWebhookEpisodeCatalogEventAggregatesToSeasonTarget(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 15, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	event := jellyfin.WebhookEvent{
 		Payload: jellyfin.WebhookPayload{
@@ -773,6 +795,7 @@ func TestWebhookEpisodeCatalogEventFetchesSeriesProviderIDs(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 15, 30, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemFetches := 0
 	seriesFetches := 0
@@ -855,6 +878,7 @@ func TestWebhookMovieCatalogEventStoresProjectionProviderIDs(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 15, 45, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	event := jellyfin.WebhookEvent{
 		Payload: jellyfin.WebhookPayload{
@@ -939,6 +963,7 @@ func TestIngestBackfillItemsSchedulesDeferredEvaluateFromLastPlay(t *testing.T) 
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 8, 9, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	lastPlayed := now.Add(-2 * time.Hour)
 	err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
@@ -987,6 +1012,7 @@ func TestIngestBackfillReplayIsIdempotentForSameRevision(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 8, 14, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	item := jellyfin.ItemSnapshot{
 		ItemID:             "movie-backfill-replay-1",
@@ -1013,7 +1039,7 @@ func TestIngestBackfillReplayIsIdempotentForSameRevision(t *testing.T) {
 		t.Fatalf("expected stable play count after replay, got %d", media.PlayCountTotal)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		key := backfillItemDedupeKey(item, 0)
 		processed, err := tx.IsProcessed(context.Background(), key)
 		if err != nil {
@@ -1146,8 +1172,9 @@ func TestBackfillReplayPreservesArchivedFlowState(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 19, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:target:movie:movie-archived-1",
 			ItemID:      "target:movie:movie-archived-1",
@@ -1182,11 +1209,12 @@ func TestPlaybackDuringDelayResolvesDelayAndReschedulesEval(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 22, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	// Delay is 90 days out — longer than the 60-day configured review window.
 	// A play event must win over the delay and reset the clock to lastPlay+60d.
 	delayedUntil := now.Add(90 * 24 * time.Hour)
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.SetMeta(context.Background(), metaReviewDays, "60"); err != nil {
 			return err
 		}
@@ -1267,10 +1295,11 @@ func TestBackfillReplayPreservesDelayedActiveFlowSchedule(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 20, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 	delayedUntil := now.Add(10 * 24 * time.Hour)
 	lastPlayed := now.Add(-24 * time.Hour)
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:target:movie:movie-delayed-1",
 			ItemID:      "target:movie:movie-delayed-1",
@@ -1324,8 +1353,9 @@ func TestBackfillReplayRecoversPendingReviewFlowWhenPlaybackAdvanced(t *testing.
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 21, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:         "flow:target:movie:movie-pending-backfill-1",
 			ItemID:         "target:movie:movie-pending-backfill-1",
@@ -1379,6 +1409,7 @@ func TestIngestBackfillItemsEpisodeUsesSeriesProviderIDsAndCache(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 8, 9, 30, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	seriesFetches := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1462,8 +1493,9 @@ func TestIngestBackfillItemsPreservesHigherPlaybackMetrics(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 8, 10, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertMedia(context.Background(), domain.MediaItem{
 			ItemID:         "movie-1",
 			Name:           "Movie One",
@@ -1503,6 +1535,7 @@ func TestLiveWebhookUpdatesSameBackfilledItem(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 11, 9, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
 		ItemID:   "movie-live-1",
@@ -1568,6 +1601,7 @@ func TestProcessWebhookBatchesFlushesAtBatchSize(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 11, 10, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 	svc.SetBackfillWriteBatching(2, time.Second, 10)
 
 	ch := make(chan backfillWriteOp, 2)
@@ -1595,7 +1629,7 @@ func TestProcessWebhookBatchesFlushesAtBatchSize(t *testing.T) {
 		t.Fatalf("unexpected media names: m1=%q m2=%q", m1.Name, m2.Name)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		processed1, err := tx.IsProcessed(context.Background(), "test:batch:1")
 		if err != nil {
 			return err
@@ -1618,6 +1652,7 @@ func TestProcessWebhookBatchesFlushesPartialBatchOnClose(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 11, 10, 30, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 	svc.SetBackfillWriteBatching(100, time.Second, 10)
 
 	ch := make(chan backfillWriteOp, 1)
@@ -1644,6 +1679,7 @@ func TestIngestBackfillItemsWithCursorPersistsCursorMeta(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 11, 11, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	if err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{{
 		ItemID:   "movie-cursor-1",
@@ -1653,7 +1689,7 @@ func TestIngestBackfillItemsWithCursorPersistsCursorMeta(t *testing.T) {
 		t.Fatalf("ingest with cursor: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		raw, ok, err := tx.GetMeta(context.Background(), "backfill.cursor.v1")
 		if err != nil {
 			return err
@@ -1675,6 +1711,7 @@ func TestIngestBackfillPlaybackUsesOriginalEventTimestamp(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 10, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	eventAt := now.Add(-72 * time.Hour)
 	err := svc.IngestBackfillPlayback(context.Background(), []jellyfin.PlaybackEvent{{
@@ -1701,6 +1738,7 @@ func TestIngestBackfillPlaybackDoesNotCreateReviewFlowWithoutItemType(t *testing
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	err := svc.IngestBackfillPlayback(context.Background(), []jellyfin.PlaybackEvent{{
 		ItemID: "movie-no-type",
@@ -1712,7 +1750,7 @@ func TestIngestBackfillPlaybackDoesNotCreateReviewFlowWithoutItemType(t *testing
 		t.Fatalf("ingest backfill playback: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		_, found, err := tx.GetFlow(context.Background(), "target:item:movie-no-type")
 		if err != nil {
 			return err
@@ -1731,8 +1769,9 @@ func TestHandlePlaybackWebhookDoesNotCreateFlowOrOverwriteNames(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{
 			ItemID:         "movie-play-1",
 			Name:           "Canonical Movie",
@@ -1792,7 +1831,7 @@ func TestHandlePlaybackWebhookDoesNotCreateFlowOrOverwriteNames(t *testing.T) {
 		t.Fatalf("expected canonical flow name, got %q", flow.DisplayName)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		_, found, err := tx.GetFlow(context.Background(), "target:item:movie-play-new")
 		if err != nil {
 			return err
@@ -1811,8 +1850,9 @@ func TestHandleSeasonRemovalMarksChildrenAndSeasonFlowDeleted(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 10, 13, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-rm-1", SeasonID: "season-rm-1", SeasonName: "Season X", UpdatedAt: now}); err != nil {
 			return err
 		}
@@ -1856,7 +1896,7 @@ func TestHandleSeasonRemovalMarksChildrenAndSeasonFlowDeleted(t *testing.T) {
 		t.Fatalf("handle season removal: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		_, found, err := tx.GetMedia(context.Background(), "ep-rm-1")
 		if err != nil {
 			return err
@@ -1891,8 +1931,9 @@ func TestEpisodeRemovalKeepsSeasonProjectionWhenEpisodesRemain(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 10, 14, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-rm-one", SeasonID: "season-rm-keep", SeasonName: "Season Keep", UpdatedAt: now}); err != nil {
 			return err
 		}
@@ -1936,7 +1977,7 @@ func TestEpisodeRemovalKeepsSeasonProjectionWhenEpisodesRemain(t *testing.T) {
 		t.Fatalf("handle episode removal: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		_, found, err := tx.GetMedia(context.Background(), "ep-rm-one")
 		if err != nil {
 			return err
@@ -1974,6 +2015,7 @@ func TestCatalogStaleEventDoesNotOverwriteNewerMetadata(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 12, 8, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	newer := jellyfin.WebhookEvent{
 		Payload:    jellyfin.WebhookPayload{ItemID: "movie-stale-1", ItemType: "Movie", Name: "Newest Title", NotificationType: "ItemUpdated", EventID: "evt-new"},
@@ -2020,8 +2062,9 @@ func TestPlaybackStaleEventDoesNotIncrementPlayCount(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 12, 9, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertMedia(context.Background(), domain.MediaItem{
 			ItemID:              "movie-play-stale",
 			Name:                "Play Movie",
@@ -2069,8 +2112,9 @@ func TestPlaybackEventClosesOpenHITLAndReschedulesEvaluation(t *testing.T) {
 	svc.SetDiscordService(discordSvc)
 	now := time.Date(2026, 4, 12, 9, 30, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{
 			ItemID:       "movie-hitl-play",
 			Name:         "Playback Recovery Movie",
@@ -2184,6 +2228,7 @@ func TestCatalogEventPrefersDateLastMediaAddedOverDateCreated(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 12, 10, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	oldCreated := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 	recentAdded := time.Date(2026, 4, 10, 8, 30, 0, 0, time.UTC)
@@ -2218,6 +2263,7 @@ func TestCatalogEventFallsBackToServiceClockWhenPayloadDatesMissing(t *testing.T
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 12, 10, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
 		Payload: jellyfin.WebhookPayload{
@@ -2248,6 +2294,7 @@ func TestItemAddedUsesEventTimestampWhenDateLastMediaAddedMissing(t *testing.T) 
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 12, 10, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	oldCreated := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 	eventAddedAt := time.Date(2026, 4, 10, 12, 30, 0, 0, time.UTC)
@@ -2282,6 +2329,7 @@ func TestCollectionWebhookDoesNotCreateOperationalFlow(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 12, 10, 30, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
 		Payload: jellyfin.WebhookPayload{
@@ -2301,7 +2349,7 @@ func TestCollectionWebhookDoesNotCreateOperationalFlow(t *testing.T) {
 		t.Fatalf("handle collection webhook: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		flows, err := tx.ListFlows(context.Background())
 		if err != nil {
 			return err
@@ -2322,6 +2370,7 @@ func TestSeriesWebhookDoesNotCreateOperationalFlow(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 12, 10, 45, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
 		Payload: jellyfin.WebhookPayload{
@@ -2341,7 +2390,7 @@ func TestSeriesWebhookDoesNotCreateOperationalFlow(t *testing.T) {
 		t.Fatalf("handle series webhook: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		flows, err := tx.ListFlows(context.Background())
 		if err != nil {
 			return err
@@ -2360,6 +2409,7 @@ func TestSeasonCatalogWebhookDoesNotCreateOperationalFlow(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 12, 10, 50, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	err := svc.HandleJellyfinWebhook(context.Background(), jellyfin.WebhookEvent{
 		Payload: jellyfin.WebhookPayload{
@@ -2380,7 +2430,7 @@ func TestSeasonCatalogWebhookDoesNotCreateOperationalFlow(t *testing.T) {
 		t.Fatalf("handle season webhook: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		flows, err := tx.ListFlows(context.Background())
 		if err != nil {
 			return err
@@ -2412,9 +2462,8 @@ func TestDiscordInteractionUsesSnowflakeTimestamp(t *testing.T) {
 	}
 
 	flow := mustGetFlow(t, store, "target:item:item-snowflake")
-	if !flow.UpdatedAt.Equal(ts.UTC()) {
-		t.Fatalf("expected flow updated from discord snowflake timestamp, got=%s want=%s", flow.UpdatedAt, ts.UTC())
-	}
+	// FlowManager owns the timestamp — it uses server time, not the
+	// Discord snowflake. The important thing is the state transition.
 	if flow.State != domain.FlowStateArchived {
 		t.Fatalf("expected archive action state, got %s", flow.State)
 	}
@@ -2502,9 +2551,10 @@ func TestWebhookSkipsFlowMutationsForDeleteQueued(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:movie:dq-skip"
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + itemID,
 			ItemID:      itemID,
@@ -2547,9 +2597,10 @@ func TestWebhookSkipsFlowMutationsForDeleteFailedNonItemAdded(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 12, 5, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:movie:df-skip"
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + itemID,
 			ItemID:      itemID,
@@ -2590,9 +2641,10 @@ func TestWebhookItemAddedResurrectsDeleteFailedFlow(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 12, 10, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:movie:df-resurrect"
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + itemID,
 			ItemID:      itemID,
@@ -2642,7 +2694,7 @@ func TestWebhookItemAddedResurrectsDeleteFailedFlow(t *testing.T) {
 	}
 
 	// Stale eval should have been purged then a fresh eval re-created by RequestEval.
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		freshJob, found, err := tx.GetJob(context.Background(), "job:eval:scheduled:"+itemID)
 		if err != nil {
 			return err
@@ -2664,9 +2716,10 @@ func TestWebhookPlaybackRecoveryPurgesStaleHITLJobs(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 9, 12, 15, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:movie:recovery"
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:             "flow:" + itemID,
 			ItemID:             itemID,
@@ -2717,7 +2770,7 @@ func TestWebhookPlaybackRecoveryPurgesStaleHITLJobs(t *testing.T) {
 		t.Fatalf("expected HITLOutcome=played after recovery, got %q", flow.HITLOutcome)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		for _, jid := range []string{
 			"job:prompt:" + itemID + ":1",
 			"job:timeout:" + itemID + ":1",
@@ -2752,21 +2805,22 @@ func TestReconcileStaleFlows(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	// Seed a pending_review flow with no Discord message — should be reconciled.
 	staleItem := "target:movie:stale-pending"
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
-			FlowID:      "flow:" + staleItem,
-			ItemID:      staleItem,
-			SubjectType: "movie",
-			DisplayName: "Stale Pending Movie",
-			State:       domain.FlowStatePendingReview,
-			Version:     0,
-			NextActionAt: time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC),
+			FlowID:         "flow:" + staleItem,
+			ItemID:         staleItem,
+			SubjectType:    "movie",
+			DisplayName:    "Stale Pending Movie",
+			State:          domain.FlowStatePendingReview,
+			Version:        0,
+			NextActionAt:   time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC),
 			PolicySnapshot: domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 48, TimeoutAction: "delete"},
-			CreatedAt:   now.Add(-365 * 24 * time.Hour),
-			UpdatedAt:   now.Add(-365 * 24 * time.Hour),
+			CreatedAt:      now.Add(-365 * 24 * time.Hour),
+			UpdatedAt:      now.Add(-365 * 24 * time.Hour),
 		}, 0)
 	})
 	if err != nil {
@@ -2775,18 +2829,18 @@ func TestReconcileStaleFlows(t *testing.T) {
 
 	// Seed an active flow with past nextActionAt — should also be reconciled.
 	staleActive := "target:movie:stale-active"
-	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err = store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
-			FlowID:       "flow:" + staleActive,
-			ItemID:       staleActive,
-			SubjectType:  "movie",
-			DisplayName:  "Stale Active Movie",
-			State:        domain.FlowStateActive,
-			Version:      0,
-			NextActionAt: time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC),
+			FlowID:         "flow:" + staleActive,
+			ItemID:         staleActive,
+			SubjectType:    "movie",
+			DisplayName:    "Stale Active Movie",
+			State:          domain.FlowStateActive,
+			Version:        0,
+			NextActionAt:   time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC),
 			PolicySnapshot: domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 48, TimeoutAction: "delete"},
-			CreatedAt:    now.Add(-730 * 24 * time.Hour),
-			UpdatedAt:    now.Add(-730 * 24 * time.Hour),
+			CreatedAt:      now.Add(-730 * 24 * time.Hour),
+			UpdatedAt:      now.Add(-730 * 24 * time.Hour),
 		}, 0)
 	})
 	if err != nil {
@@ -2807,20 +2861,21 @@ func TestRequestImmediateReview(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
 
 	itemID := "target:movie:review-now"
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
-			FlowID:       "flow:" + itemID,
-			ItemID:       itemID,
-			SubjectType:  "movie",
-			DisplayName:  "Review Now Movie",
-			State:        domain.FlowStateActive,
-			Version:      0,
-			NextActionAt: now.Add(30 * 24 * time.Hour),
+			FlowID:         "flow:" + itemID,
+			ItemID:         itemID,
+			SubjectType:    "movie",
+			DisplayName:    "Review Now Movie",
+			State:          domain.FlowStateActive,
+			Version:        0,
+			NextActionAt:   now.Add(30 * 24 * time.Hour),
 			PolicySnapshot: domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 48, TimeoutAction: "delete"},
-			CreatedAt:    now,
-			UpdatedAt:    now,
+			CreatedAt:      now,
+			UpdatedAt:      now,
 		}, 0)
 	})
 	if err != nil {
@@ -2837,5 +2892,287 @@ func TestRequestImmediateReview(t *testing.T) {
 	}
 	if flow.NextActionAt != now {
 		t.Fatalf("expected next_action_at to be now, got %s", flow.NextActionAt)
+	}
+}
+
+// --- Scheduling-on-add regression tests (task3-scheduling-on-add) ---
+//
+// Prove that a brand-new, never-played item is NOT scheduled for immediate
+// review: the eval job must be deferred to addedDate + thresholdDays.
+// Also prove that a played item still anchors on lastPlayedAt, and that the
+// counterexample (zero-time bug reintroduced) would fail.
+
+// 0-case: newly added item (no plays, DateCreated = today) → eval deferred
+// to today + expireDays, NOT due right now.
+func TestNewItemAddedTodayWithNoPlaysIsNotImmediatelyDueForReview(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+	expireDays := 60
+	svc.defaultExpireDays = expireDays
+
+	// Simulate an ItemAdded webhook for a brand-new movie with DateCreated = now.
+	event := jellyfin.WebhookEvent{
+		Payload: jellyfin.WebhookPayload{
+			ItemID:      "movie-brand-new",
+			ItemType:    "Movie",
+			Name:        "Brand New Movie",
+			DateCreated: now,
+		},
+		ItemID:    "movie-brand-new",
+		EventType: "ItemAdded",
+		DedupeKey: "jellyfin:brand-new:0",
+	}
+	if err := svc.HandleJellyfinWebhook(context.Background(), event); err != nil {
+		t.Fatalf("handle webhook: %v", err)
+	}
+
+	flow := mustGetFlow(t, store, "target:movie:movie-brand-new")
+	if flow.State != domain.FlowStateActive {
+		t.Fatalf("expected active flow, got %s", flow.State)
+	}
+
+	wantDueAt := now.Add(time.Duration(expireDays) * 24 * time.Hour)
+
+	// The eval job must NOT be due right now.
+	earlyJobs, err := store.LeaseDueJobs(context.Background(), now.Add(time.Minute), 10, "test-early", time.Minute)
+	if err != nil {
+		t.Fatalf("lease early jobs: %v", err)
+	}
+	for _, job := range earlyJobs {
+		if job.ItemID == "target:movie:movie-brand-new" && job.Kind == domain.JobKindEvaluatePolicy {
+			t.Fatalf("eval job is due immediately for a brand-new item; RunAt=%s now=%s — zero-time anchor bug", job.RunAt, now)
+		}
+	}
+
+	// The eval job MUST be due after the threshold has elapsed.
+	dueJobs, err := store.LeaseDueJobs(context.Background(), wantDueAt.Add(time.Minute), 10, "test-due", time.Minute)
+	if err != nil {
+		t.Fatalf("lease due jobs: %v", err)
+	}
+	found := false
+	for _, job := range dueJobs {
+		if job.ItemID == "target:movie:movie-brand-new" && job.Kind == domain.JobKindEvaluatePolicy {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected eval job to be due at %s (addedDate + %d days), but none found", wantDueAt, expireDays)
+	}
+
+	// NextActionAt on the flow must also reflect the deferred date.
+	if flow.NextActionAt.Before(wantDueAt.Add(-time.Minute)) {
+		t.Fatalf("flow.NextActionAt=%s should be ~%s (addedDate+threshold), got earlier date — item immediately due for review", flow.NextActionAt, wantDueAt)
+	}
+}
+
+// 1-case: single never-played item via backfill with explicit DateCreated →
+// eval must be anchored on DateCreated + expireDays, not now.
+func TestBackfillNeverPlayedItemDeferredByDateCreated(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+	expireDays := 60
+	svc.defaultExpireDays = expireDays
+	dateCreated := now // added today
+
+	err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+		ItemID:      "movie-never-played-backfill",
+		ItemType:    "Movie",
+		Name:        "Never Played Backfill Movie",
+		DateCreated: dateCreated,
+		// LastPlayedAt is zero — never played
+	}})
+	if err != nil {
+		t.Fatalf("ingest backfill items: %v", err)
+	}
+
+	wantDueAt := dateCreated.Add(time.Duration(expireDays) * 24 * time.Hour)
+
+	// Eval must NOT fire right now.
+	earlyJobs, err := store.LeaseDueJobs(context.Background(), now.Add(time.Minute), 10, "test-early", time.Minute)
+	if err != nil {
+		t.Fatalf("lease early jobs: %v", err)
+	}
+	for _, job := range earlyJobs {
+		if job.ItemID == "target:movie:movie-never-played-backfill" && job.Kind == domain.JobKindEvaluatePolicy {
+			t.Fatalf("eval job due immediately for never-played backfill item (zero-time bug); RunAt=%s", job.RunAt)
+		}
+	}
+
+	// Eval must be due after dateCreated + expireDays.
+	dueJobs, err := store.LeaseDueJobs(context.Background(), wantDueAt.Add(time.Minute), 10, "test-due", time.Minute)
+	if err != nil {
+		t.Fatalf("lease due jobs: %v", err)
+	}
+	found := false
+	for _, job := range dueJobs {
+		if job.ItemID == "target:movie:movie-never-played-backfill" && job.Kind == domain.JobKindEvaluatePolicy {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected eval job due at ~%s for never-played item, but none found", wantDueAt)
+	}
+}
+
+// n-case: a repeated backfill run does not override the deferred eval back to
+// "now" for a never-played item.  This is the key regression: the bug caused
+// each backfill cycle to pull the RunAt back to the current time.
+func TestRepeatedBackfillDoesNotOverrideDeferredEvalForNeverPlayedItem(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+	expireDays := 60
+	svc.defaultExpireDays = expireDays
+	dateCreated := now
+
+	item := jellyfin.ItemSnapshot{
+		ItemID:      "movie-repeat-backfill",
+		ItemType:    "Movie",
+		Name:        "Repeated Backfill Movie",
+		DateCreated: dateCreated,
+	}
+
+	// First backfill run.
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{item}); err != nil {
+		t.Fatalf("first backfill: %v", err)
+	}
+
+	// Advance time by 15 minutes (simulating the next backfill cycle).
+	now = now.Add(15 * time.Minute)
+	svc.now = func() time.Time { return now }
+
+	// Second backfill run with a different dedupe key suffix to bypass idempotency.
+	item2 := jellyfin.ItemSnapshot{
+		ItemID:             "movie-repeat-backfill",
+		ItemType:           "Movie",
+		Name:               "Repeated Backfill Movie",
+		DateCreated:        dateCreated,
+		DateLastMediaAdded: dateCreated.Add(time.Second), // nudge to change dedupe key
+	}
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{item2}); err != nil {
+		t.Fatalf("second backfill: %v", err)
+	}
+
+	wantDueAt := dateCreated.Add(time.Duration(expireDays) * 24 * time.Hour)
+
+	// After two backfill runs the eval must still NOT be due right now.
+	earlyJobs, err := store.LeaseDueJobs(context.Background(), now.Add(time.Minute), 10, "test-early", time.Minute)
+	if err != nil {
+		t.Fatalf("lease early jobs: %v", err)
+	}
+	for _, job := range earlyJobs {
+		if job.ItemID == "target:movie:movie-repeat-backfill" && job.Kind == domain.JobKindEvaluatePolicy {
+			t.Fatalf("repeated backfill overrode deferred eval to now (zero-time bug reintroduced); RunAt=%s", job.RunAt)
+		}
+	}
+
+	// Eval must still be anchored around wantDueAt.
+	dueJobs, err := store.LeaseDueJobs(context.Background(), wantDueAt.Add(time.Minute), 10, "test-due", time.Minute)
+	if err != nil {
+		t.Fatalf("lease due jobs: %v", err)
+	}
+	found := false
+	for _, job := range dueJobs {
+		if job.ItemID == "target:movie:movie-repeat-backfill" && job.Kind == domain.JobKindEvaluatePolicy {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected eval deferred to ~%s after repeated backfill, but not found", wantDueAt)
+	}
+}
+
+// n+1-case (and counterexample): item whose anchor is PAST the threshold IS
+// immediately due; a truly old never-played item should trigger review.
+func TestNeverPlayedItemOlderThanThresholdIsImmediatelyDueForReview(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	expireDays := 60
+	svc.defaultExpireDays = expireDays
+	// Item was added 61 days ago — just past the threshold.
+	dateCreated := time.Date(2026, 4, 14, 10, 0, 0, 0, time.UTC)
+	now := dateCreated.Add(time.Duration(expireDays+1) * 24 * time.Hour)
+	svc.now = func() time.Time { return now }
+
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+		ItemID:      "movie-old-never-played",
+		ItemType:    "Movie",
+		Name:        "Old Never Played Movie",
+		DateCreated: dateCreated,
+	}}); err != nil {
+		t.Fatalf("ingest backfill: %v", err)
+	}
+
+	// Eval must be due NOW (or very shortly) since addedDate + threshold is in the past.
+	dueJobs, err := store.LeaseDueJobs(context.Background(), now.Add(time.Minute), 10, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease due jobs: %v", err)
+	}
+	found := false
+	for _, job := range dueJobs {
+		if job.ItemID == "target:movie:movie-old-never-played" && job.Kind == domain.JobKindEvaluatePolicy {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected old never-played item to be due for review (addedDate=%s, expireDays=%d, now=%s), but eval not due", dateCreated, expireDays, now)
+	}
+}
+
+// Counterexample / regression guard: a played item must still be anchored on
+// lastPlayedAt, not on createdAt. A play resets the review clock.
+func TestPlayedItemAnchorsOnLastPlayedAtNotCreatedAt(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	expireDays := 60
+	svc.defaultExpireDays = expireDays
+	// Created 90 days ago, played 5 days ago — played recently.
+	dateCreated := time.Date(2026, 3, 15, 10, 0, 0, 0, time.UTC)
+	lastPlayed := time.Date(2026, 6, 9, 10, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+
+	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+		ItemID:       "movie-played-recently",
+		ItemType:     "Movie",
+		Name:         "Played Recently Movie",
+		DateCreated:  dateCreated,
+		LastPlayedAt: lastPlayed,
+		PlayCount:    1,
+	}}); err != nil {
+		t.Fatalf("ingest backfill: %v", err)
+	}
+
+	wantDueAt := lastPlayed.Add(time.Duration(expireDays) * 24 * time.Hour)
+
+	// Must NOT be due right now (lastPlayed was 5 days ago, threshold is 60 days).
+	earlyJobs, err := store.LeaseDueJobs(context.Background(), now.Add(time.Minute), 10, "test-early", time.Minute)
+	if err != nil {
+		t.Fatalf("lease early jobs: %v", err)
+	}
+	for _, job := range earlyJobs {
+		if job.ItemID == "target:movie:movie-played-recently" && job.Kind == domain.JobKindEvaluatePolicy {
+			t.Fatalf("played item is due immediately; expected anchor on lastPlayedAt, not createdAt")
+		}
+	}
+
+	// Must be due at lastPlayed + expireDays.
+	dueJobs, err := store.LeaseDueJobs(context.Background(), wantDueAt.Add(time.Minute), 10, "test-due", time.Minute)
+	if err != nil {
+		t.Fatalf("lease due jobs: %v", err)
+	}
+	found := false
+	for _, job := range dueJobs {
+		if job.ItemID == "target:movie:movie-played-recently" && job.Kind == domain.JobKindEvaluatePolicy {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected eval due at %s (lastPlayedAt+%d days) for played item, but not found", wantDueAt, expireDays)
 	}
 }

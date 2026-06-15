@@ -29,7 +29,7 @@ func TestLeaseDueJobsOnlyLeasesPendingDue(t *testing.T) {
 	store := testStore(t)
 	now := time.Date(2026, 4, 7, 12, 0, 0, 0, time.UTC)
 
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.EnqueueJob(context.Background(), domain.JobRecord{JobID: "due", ItemID: "i1", Kind: domain.JobKindEvaluatePolicy, Status: domain.JobStatusPending, RunAt: now.Add(-time.Minute)}); err != nil {
 			return err
 		}
@@ -55,7 +55,7 @@ func TestFailJobRequeuesPending(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.EnqueueJob(context.Background(), domain.JobRecord{JobID: "job1", ItemID: "i1", Kind: domain.JobKindEvaluatePolicy, Status: domain.JobStatusPending, RunAt: now})
 	}); err != nil {
 		t.Fatalf("seed job: %v", err)
@@ -70,7 +70,7 @@ func TestFailJobRequeuesPending(t *testing.T) {
 	if err := store.FailJob(context.Background(), "job1", "boom", retryAt, false); err != nil {
 		t.Fatalf("fail job: %v", err)
 	}
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		job, found, err := tx.GetJob(context.Background(), "job1")
 		if err != nil {
 			return err
@@ -99,7 +99,7 @@ func TestGetNextQueuedJobReturnsEarliestPendingJob(t *testing.T) {
 	store := testStore(t)
 	now := time.Date(2026, 4, 8, 12, 0, 0, 0, time.UTC)
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.EnqueueJob(context.Background(), domain.JobRecord{JobID: "job-late", ItemID: "i-late", Kind: domain.JobKindEvaluatePolicy, Status: domain.JobStatusPending, RunAt: now.Add(2 * time.Hour)}); err != nil {
 			return err
 		}
@@ -127,7 +127,7 @@ func TestLeaseDueJobsReclaimsExpiredLeases(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.EnqueueJob(context.Background(), domain.JobRecord{JobID: "job-expired", ItemID: "i1", Kind: domain.JobKindEvaluatePolicy, Status: domain.JobStatusPending, RunAt: now})
 	}); err != nil {
 		t.Fatalf("seed job: %v", err)
@@ -161,7 +161,7 @@ func TestOpenReconcilesPersistedQueueAfterRestart(t *testing.T) {
 	}
 
 	now := time.Now().UTC()
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.EnqueueJob(context.Background(), domain.JobRecord{JobID: "job-restart", ItemID: "i-restart", Kind: domain.JobKindEvaluatePolicy, Status: domain.JobStatusPending, RunAt: now}); err != nil {
 			return err
 		}
@@ -200,7 +200,7 @@ func TestLeaseDueJobsCleansStaleDueIndexEntries(t *testing.T) {
 	store := testStore(t)
 	now := time.Date(2026, 4, 8, 12, 0, 0, 0, time.UTC)
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.EnqueueJob(context.Background(), domain.JobRecord{
 			JobID:     "job-real",
 			ItemID:    "item-real",
@@ -253,7 +253,7 @@ func TestSearchFlowsUsesTrigramIndex(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 
-	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+	if err := store.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(ctx, domain.Flow{FlowID: "flow:target:series:office", ItemID: "target:series:office", SubjectType: "series", DisplayName: "The Office", Version: 0, CreatedAt: now, UpdatedAt: now}, 0); err != nil {
 			return err
 		}
@@ -266,7 +266,7 @@ func TestSearchFlowsUsesTrigramIndex(t *testing.T) {
 	}
 
 	var series []domain.Flow
-	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+	if err := store.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		var err error
 		series, err = tx.SearchFlows(ctx, "office", "series", 10)
 		return err
@@ -278,7 +278,7 @@ func TestSearchFlowsUsesTrigramIndex(t *testing.T) {
 	}
 
 	var all []domain.Flow
-	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+	if err := store.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		var err error
 		all, err = tx.SearchFlows(ctx, "off", "", 10)
 		return err
@@ -295,13 +295,13 @@ func TestSearchFlowsIndexUpdatesOnRenameAndDelete(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 
-	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+	if err := store.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(ctx, domain.Flow{FlowID: "flow:target:series:office", ItemID: "target:series:office", SubjectType: "series", DisplayName: "Parks and Recreation", Version: 0, CreatedAt: now, UpdatedAt: now}, 0)
 	}); err != nil {
 		t.Fatalf("seed flow: %v", err)
 	}
 
-	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+	if err := store.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, "target:series:office")
 		if err != nil || !found {
 			return fmt.Errorf("get flow before rename: found=%v err=%w", found, err)
@@ -314,7 +314,7 @@ func TestSearchFlowsIndexUpdatesOnRenameAndDelete(t *testing.T) {
 		t.Fatalf("rename flow: %v", err)
 	}
 
-	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+	if err := store.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		results, err := tx.SearchFlows(ctx, "parks", "", 10)
 		if err != nil {
 			return err
@@ -334,13 +334,13 @@ func TestSearchFlowsIndexUpdatesOnRenameAndDelete(t *testing.T) {
 		t.Fatalf("verify search after rename: %v", err)
 	}
 
-	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+	if err := store.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.DeleteFlow(ctx, "target:series:office")
 	}); err != nil {
 		t.Fatalf("delete flow: %v", err)
 	}
 
-	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+	if err := store.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		results, err := tx.SearchFlows(ctx, "workspace", "", 10)
 		if err != nil {
 			return err
@@ -359,7 +359,7 @@ func TestSearchFlowsIndexReflectsNewAdditions(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 
-	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+	if err := store.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		results, err := tx.SearchFlows(ctx, "severance", "series", 10)
 		if err != nil {
 			return err
@@ -372,7 +372,7 @@ func TestSearchFlowsIndexReflectsNewAdditions(t *testing.T) {
 		t.Fatalf("verify initial empty search: %v", err)
 	}
 
-	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+	if err := store.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(ctx, domain.Flow{
 			FlowID:      "flow:target:series:severance",
 			ItemID:      "target:series:severance",
@@ -386,7 +386,7 @@ func TestSearchFlowsIndexReflectsNewAdditions(t *testing.T) {
 		t.Fatalf("insert new flow: %v", err)
 	}
 
-	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+	if err := store.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		results, err := tx.SearchFlows(ctx, "severance", "series", 10)
 		if err != nil {
 			return err
@@ -405,7 +405,7 @@ func TestSearchFlowsIndexDeletionKeepsRemainingMatches(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 
-	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+	if err := store.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(ctx, domain.Flow{FlowID: "flow:target:series:star-trek", ItemID: "target:series:star-trek", SubjectType: "series", DisplayName: "Star Trek", Version: 0, CreatedAt: now, UpdatedAt: now}, 0); err != nil {
 			return err
 		}
@@ -414,13 +414,13 @@ func TestSearchFlowsIndexDeletionKeepsRemainingMatches(t *testing.T) {
 		t.Fatalf("seed star flows: %v", err)
 	}
 
-	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+	if err := store.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.DeleteFlow(ctx, "target:series:star-trek")
 	}); err != nil {
 		t.Fatalf("delete one star flow: %v", err)
 	}
 
-	if err := store.WithTx(ctx, func(tx repo.TxRepository) error {
+	if err := store.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		results, err := tx.SearchFlows(ctx, "star", "series", 10)
 		if err != nil {
 			return err

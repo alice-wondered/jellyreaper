@@ -144,13 +144,18 @@ func main() {
 	executeDeleteHandler.SetDiscordService(discordService)
 	hitlTimeout := time.Duration(cfg.DefaultHITLTimeoutHours) * time.Hour
 	sendHITLPromptHandler := handlers.NewSendHITLPromptHandler(store, logger, discordService, cfg.DiscordChannelID, hitlTimeout)
+	hitlTimeoutHandler := handlers.NewHITLTimeoutHandler(store, discordService, logger)
+	// reconcileOOBHandler is wired after appService is constructed (below).
+	// We hold a pointer so we can inject the reconciler once the service
+	// is ready (avoids a forward-reference cycle).
+	reconcileOOBHandler := handlers.NewReconcileOOBHandler(nil, logger)
 	handlerList := []jobs.JobHandler{
 		evaluatePolicyHandler,
 		sendHITLPromptHandler,
-		handlers.NewHITLTimeoutHandler(store, discordService, logger),
+		hitlTimeoutHandler,
 		executeDeleteHandler,
 		handlers.NewNoopHandler(domain.JobKindVerifyDelete, logger),
-		handlers.NewNoopHandler(domain.JobKindReconcileItem, logger),
+		reconcileOOBHandler,
 	}
 
 	registry, err := jobs.NewRegistry(handlerList...)
@@ -185,6 +190,8 @@ func main() {
 		assistant.SetDecisionService(appService)
 	}
 	appService.SetBackfillWriteBatching(cfg.BackfillWriteBatchSize, cfg.BackfillWriteBatchTimeout, cfg.BackfillWriteQueueCapacity)
+	// Wire the OOB reconciler now that appService is fully constructed.
+	reconcileOOBHandler.SetReconciler(appService)
 	dispatcher := worker.NewDispatcher(store, registry, logger)
 	if cfg.DiscordChannelID != "" {
 		dispatcher.SetDeleteFailedNotifier(func(ctx context.Context, flow domain.Flow, deleteErr error) {
@@ -209,6 +216,7 @@ func main() {
 	schedulerObj := scheduler.NewScheduler(schedulerLoop, wake)
 	evaluatePolicyHandler.SetEvalScheduler(schedulerObj)
 	sendHITLPromptHandler.SetEvalScheduler(schedulerObj)
+	hitlTimeoutHandler.SetFlowManager(scheduler.NewFlowManager(store, schedulerObj, logger))
 	appService.SetEvalScheduler(schedulerObj)
 
 	if len(cfg.DiscordPublicKey) == 0 {
@@ -262,6 +270,11 @@ func main() {
 					logger.Warn("startup backfill run failed", "error", err)
 				} else {
 					logNextQueuedJob(ctx, logger, store)
+				}
+				// Schedule a reconciliation run after startup backfill so stale
+				// flows are pruned on the first scheduler cycle.
+				if err := appService.ScheduleOOBReconcile(ctx, time.Now()); err != nil {
+					logger.Warn("failed to schedule startup oob reconcile", "error", err)
 				}
 
 				go runBackfillLoop(ctx, logger, store, appService, discordService, cfg, backfillSvc, false)
@@ -338,6 +351,11 @@ func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.R
 		case <-ticker.C:
 			if err := runBackfillOnce(ctx, logger, repository, appService, discordService, cfg, backfillSvc, false); err != nil {
 				logger.Warn("periodic backfill run failed", "error", err)
+			}
+			// After each backfill cycle, schedule an OOB deletion reconcile job.
+			// The job is idempotent (daily key) so this is safe to call repeatedly.
+			if err := appService.ScheduleOOBReconcile(ctx, time.Now()); err != nil {
+				logger.Warn("failed to schedule oob reconcile", "error", err)
 			}
 		}
 	}
@@ -494,7 +512,7 @@ func resolveBackfillStart(ctx context.Context, repository repo.Repository, cfg c
 	now := time.Now().UTC()
 	var raw string
 	var exists bool
-	if err := repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	if err := repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		value, ok, err := tx.GetMeta(ctx, backfillCheckpointKey)
 		if err != nil {
 			return err
@@ -539,7 +557,7 @@ func computeBackfillCheckpoint(startedAt time.Time, plays []jellyfin.PlaybackEve
 }
 
 func saveBackfillCheckpoint(ctx context.Context, repository repo.Repository, at time.Time) error {
-	return repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	return repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.SetMeta(ctx, backfillCheckpointKey, at.UTC().Format(time.RFC3339Nano))
 	})
 }
@@ -618,7 +636,7 @@ func isRateLimitErr(err error) bool {
 
 func loadBackfillCursor(ctx context.Context, repository repo.Repository) (backfillCursorState, error) {
 	var cursor backfillCursorState
-	if err := repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	if err := repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		raw, ok, err := tx.GetMeta(ctx, backfillCursorKey)
 		if err != nil {
 			return err
@@ -638,7 +656,7 @@ func saveBackfillCursor(ctx context.Context, repository repo.Repository, cursor 
 	if err != nil {
 		return fmt.Errorf("marshal backfill cursor: %w", err)
 	}
-	return repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	return repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.SetMeta(ctx, backfillCursorKey, string(payload))
 	})
 }

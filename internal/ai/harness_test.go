@@ -37,7 +37,7 @@ func seedFlow(t *testing.T, store *bboltrepo.Store, itemID string, title string,
 	if len(parts) == 3 && parts[0] == "target" && strings.TrimSpace(parts[1]) != "" {
 		subjectType = strings.TrimSpace(parts[1])
 	}
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		flow := domain.Flow{
 			FlowID:         "flow:" + itemID,
 			ItemID:         itemID,
@@ -62,7 +62,7 @@ func seedFlow(t *testing.T, store *bboltrepo.Store, itemID string, title string,
 func seedMedia(t *testing.T, store *bboltrepo.Store, itemID string, seasonID string, seriesID string, seriesName string) {
 	t.Helper()
 	now := time.Date(2026, 4, 8, 10, 0, 0, 0, time.UTC)
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertMedia(context.Background(), domain.MediaItem{
 			ItemID:     itemID,
 			ItemType:   "Episode",
@@ -82,7 +82,7 @@ func mustGetFlow(t *testing.T, store *bboltrepo.Store, itemID string) domain.Flo
 	t.Helper()
 	var flow domain.Flow
 	var found bool
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		f, ok, err := tx.GetFlow(context.Background(), itemID)
 		if err != nil {
 			return err
