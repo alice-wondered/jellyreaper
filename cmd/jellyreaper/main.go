@@ -496,7 +496,7 @@ func resolveBackfillStart(ctx context.Context, repository repo.Repository, cfg c
 	now := time.Now().UTC()
 	var raw string
 	var exists bool
-	if err := repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	if err := repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		value, ok, err := tx.GetMeta(ctx, backfillCheckpointKey)
 		if err != nil {
 			return err
@@ -541,7 +541,7 @@ func computeBackfillCheckpoint(startedAt time.Time, plays []jellyfin.PlaybackEve
 }
 
 func saveBackfillCheckpoint(ctx context.Context, repository repo.Repository, at time.Time) error {
-	return repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	return repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.SetMeta(ctx, backfillCheckpointKey, at.UTC().Format(time.RFC3339Nano))
 	})
 }
@@ -620,7 +620,7 @@ func isRateLimitErr(err error) bool {
 
 func loadBackfillCursor(ctx context.Context, repository repo.Repository) (backfillCursorState, error) {
 	var cursor backfillCursorState
-	if err := repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	if err := repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		raw, ok, err := tx.GetMeta(ctx, backfillCursorKey)
 		if err != nil {
 			return err
@@ -640,7 +640,7 @@ func saveBackfillCursor(ctx context.Context, repository repo.Repository, cursor 
 	if err != nil {
 		return fmt.Errorf("marshal backfill cursor: %w", err)
 	}
-	return repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	return repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.SetMeta(ctx, backfillCursorKey, string(payload))
 	})
 }

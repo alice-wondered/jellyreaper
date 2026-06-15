@@ -64,7 +64,7 @@ type PromptFinalization struct {
 // TransitionSource identifies who/what triggered the transition, used
 // for event recording.
 type TransitionSource struct {
-	Source  string         // "ai", "discord", "jellyfin", "scheduler", "system"
+	Source string         // "ai", "discord", "jellyfin", "scheduler", "system"
 	Actor  string         // username, interaction ID, etc. (optional)
 	Reason string         // human-readable reason (optional)
 	Extra  map[string]any // additional event payload fields (optional)
@@ -74,7 +74,7 @@ type TransitionSource struct {
 func (m *FlowManager) Archive(ctx context.Context, itemID string, src TransitionSource) (*TransitionResult, error) {
 	now := m.now()
 	var result TransitionResult
-	err := m.repo.WithTx(ctx, func(tx repo.TxRepository) error {
+	err := m.repo.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, itemID)
 		if err != nil {
 			return err
@@ -113,7 +113,7 @@ func (m *FlowManager) Archive(ctx context.Context, itemID string, src Transition
 func (m *FlowManager) Unarchive(ctx context.Context, itemID string, src TransitionSource) (*TransitionResult, error) {
 	now := m.now()
 	var result TransitionResult
-	err := m.repo.WithTx(ctx, func(tx repo.TxRepository) error {
+	err := m.repo.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, itemID)
 		if err != nil {
 			return err
@@ -160,7 +160,7 @@ func (m *FlowManager) Delay(ctx context.Context, itemID string, req DelayRequest
 	now := m.now()
 	delayUntil := now.Add(time.Duration(req.Days) * 24 * time.Hour)
 	var result TransitionResult
-	err := m.repo.WithTx(ctx, func(tx repo.TxRepository) error {
+	err := m.repo.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, itemID)
 		if err != nil {
 			return err
@@ -221,7 +221,7 @@ func (m *FlowManager) Delay(ctx context.Context, itemID string, req DelayRequest
 func (m *FlowManager) Delete(ctx context.Context, itemID string, src TransitionSource) (*TransitionResult, error) {
 	now := m.now()
 	var result TransitionResult
-	err := m.repo.WithTx(ctx, func(tx repo.TxRepository) error {
+	err := m.repo.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, itemID)
 		if err != nil {
 			return err
@@ -291,7 +291,7 @@ type PlayedRequest struct {
 func (m *FlowManager) Played(ctx context.Context, itemID string, req PlayedRequest) (*TransitionResult, error) {
 	now := m.now()
 	var result TransitionResult
-	err := m.repo.WithTx(ctx, func(tx repo.TxRepository) error {
+	err := m.repo.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, itemID)
 		if err != nil {
 			return err
@@ -381,7 +381,7 @@ func (m *FlowManager) computeNextEval(ctx context.Context, tx repo.TxRepository,
 func (m *FlowManager) RequestReview(ctx context.Context, itemID string, src TransitionSource) (*TransitionResult, error) {
 	now := m.now()
 	var result TransitionResult
-	err := m.repo.WithTx(ctx, func(tx repo.TxRepository) error {
+	err := m.repo.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, itemID)
 		if err != nil {
 			return err
@@ -444,7 +444,7 @@ func (m *FlowManager) RollbackToActive(ctx context.Context, itemID string, retry
 	now := m.now()
 	retryAt := now.Add(retryAfter)
 	var result TransitionResult
-	err := m.repo.WithTx(ctx, func(tx repo.TxRepository) error {
+	err := m.repo.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, itemID)
 		if err != nil {
 			return err

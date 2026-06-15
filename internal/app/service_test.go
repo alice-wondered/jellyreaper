@@ -104,7 +104,7 @@ func TestStaleInteractionPointsToLatestPrompt(t *testing.T) {
 	svc.SyncFlowManagerClock()
 
 	targetID := "target:item:item-stale-link"
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + targetID,
 			ItemID:      targetID,
@@ -161,7 +161,7 @@ func TestStaleInteractionWithoutNewPromptClosesCurrentMessage(t *testing.T) {
 	svc.SyncFlowManagerClock()
 
 	targetID := "target:item:item-stale-no-new"
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + targetID,
 			ItemID:      targetID,
@@ -221,7 +221,7 @@ func TestApplyAIDecisionDeleteQueuesImmediateDeleteJob(t *testing.T) {
 	svc.SyncFlowManagerClock()
 
 	itemID := "target:item:item-ai-delete"
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + itemID,
 			ItemID:      itemID,
@@ -287,7 +287,7 @@ func TestApplyAIDecisionFinalizesOpenHITLPrompt(t *testing.T) {
 	svc.SyncFlowManagerClock()
 
 	itemID := "target:item:item-ai-archive"
-	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err = store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + itemID,
 			ItemID:      itemID,
@@ -341,7 +341,7 @@ func TestApplyAIDecisionUnarchiveEnqueuesEvaluateNow(t *testing.T) {
 	svc.SyncFlowManagerClock()
 
 	itemID := "target:item:item-ai-unarchive"
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + itemID,
 			ItemID:      itemID,
@@ -402,7 +402,7 @@ func TestApplyAIDelayDaysSetsPolicyAndSchedulesEval(t *testing.T) {
 	svc.SyncFlowManagerClock()
 
 	itemID := "target:season:season-ai-delay"
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + itemID,
 			ItemID:      itemID,
@@ -471,7 +471,7 @@ func TestApplyAIDelayDaysDefersLazilyAndFinalizesHITLPrompt(t *testing.T) {
 	svc.SyncFlowManagerClock()
 
 	itemID := "target:season:season-ai-delay-prompt"
-	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err = store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:         "flow:" + itemID,
 			ItemID:         itemID,
@@ -549,7 +549,7 @@ func TestSetGlobalPolicyDefaultsUpdateMetaOnly(t *testing.T) {
 	svc := NewService(store, nil, nil)
 	now := time.Date(2026, 4, 7, 16, 0, 0, 0, time.UTC)
 
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{FlowID: "flow:target:season:s-g1", ItemID: "target:season:s-g1", SubjectType: "season", DisplayName: "Season G1", State: domain.FlowStateActive, Version: 0, PolicySnapshot: domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 48, TimeoutAction: "delete"}, CreatedAt: now, UpdatedAt: now}, 0); err != nil {
 			return err
 		}
@@ -569,7 +569,7 @@ func TestSetGlobalPolicyDefaultsUpdateMetaOnly(t *testing.T) {
 		t.Fatalf("set global hitl timeout hours: %v", err)
 	}
 
-	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err = store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		raw, ok, err := tx.GetMeta(context.Background(), metaReviewDays)
 		if err != nil {
 			return err
@@ -716,7 +716,7 @@ func TestWebhookIndexesFlowAndJobAndDedupe(t *testing.T) {
 		t.Fatalf("unexpected flow state: %s", flow.State)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		processed, err := tx.IsProcessed(context.Background(), "jellyfin:evt-1")
 		if err != nil {
 			return err
@@ -1030,7 +1030,7 @@ func TestIngestBackfillReplayIsIdempotentForSameRevision(t *testing.T) {
 		t.Fatalf("expected stable play count after replay, got %d", media.PlayCountTotal)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		key := backfillItemDedupeKey(item, 0)
 		processed, err := tx.IsProcessed(context.Background(), key)
 		if err != nil {
@@ -1165,7 +1165,7 @@ func TestBackfillReplayPreservesArchivedFlowState(t *testing.T) {
 	svc.now = func() time.Time { return now }
 	svc.SyncFlowManagerClock()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:target:movie:movie-archived-1",
 			ItemID:      "target:movie:movie-archived-1",
@@ -1205,7 +1205,7 @@ func TestPlaybackDuringDelayResolvesDelayAndReschedulesEval(t *testing.T) {
 	// Delay is 90 days out — longer than the 60-day configured review window.
 	// A play event must win over the delay and reset the clock to lastPlay+60d.
 	delayedUntil := now.Add(90 * 24 * time.Hour)
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.SetMeta(context.Background(), metaReviewDays, "60"); err != nil {
 			return err
 		}
@@ -1290,7 +1290,7 @@ func TestBackfillReplayPreservesDelayedActiveFlowSchedule(t *testing.T) {
 	delayedUntil := now.Add(10 * 24 * time.Hour)
 	lastPlayed := now.Add(-24 * time.Hour)
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:target:movie:movie-delayed-1",
 			ItemID:      "target:movie:movie-delayed-1",
@@ -1346,7 +1346,7 @@ func TestBackfillReplayRecoversPendingReviewFlowWhenPlaybackAdvanced(t *testing.
 	svc.now = func() time.Time { return now }
 	svc.SyncFlowManagerClock()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:         "flow:target:movie:movie-pending-backfill-1",
 			ItemID:         "target:movie:movie-pending-backfill-1",
@@ -1486,7 +1486,7 @@ func TestIngestBackfillItemsPreservesHigherPlaybackMetrics(t *testing.T) {
 	svc.now = func() time.Time { return now }
 	svc.SyncFlowManagerClock()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertMedia(context.Background(), domain.MediaItem{
 			ItemID:         "movie-1",
 			Name:           "Movie One",
@@ -1620,7 +1620,7 @@ func TestProcessWebhookBatchesFlushesAtBatchSize(t *testing.T) {
 		t.Fatalf("unexpected media names: m1=%q m2=%q", m1.Name, m2.Name)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		processed1, err := tx.IsProcessed(context.Background(), "test:batch:1")
 		if err != nil {
 			return err
@@ -1680,7 +1680,7 @@ func TestIngestBackfillItemsWithCursorPersistsCursorMeta(t *testing.T) {
 		t.Fatalf("ingest with cursor: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		raw, ok, err := tx.GetMeta(context.Background(), "backfill.cursor.v1")
 		if err != nil {
 			return err
@@ -1741,7 +1741,7 @@ func TestIngestBackfillPlaybackDoesNotCreateReviewFlowWithoutItemType(t *testing
 		t.Fatalf("ingest backfill playback: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		_, found, err := tx.GetFlow(context.Background(), "target:item:movie-no-type")
 		if err != nil {
 			return err
@@ -1762,7 +1762,7 @@ func TestHandlePlaybackWebhookDoesNotCreateFlowOrOverwriteNames(t *testing.T) {
 	svc.now = func() time.Time { return now }
 	svc.SyncFlowManagerClock()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{
 			ItemID:         "movie-play-1",
 			Name:           "Canonical Movie",
@@ -1822,7 +1822,7 @@ func TestHandlePlaybackWebhookDoesNotCreateFlowOrOverwriteNames(t *testing.T) {
 		t.Fatalf("expected canonical flow name, got %q", flow.DisplayName)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		_, found, err := tx.GetFlow(context.Background(), "target:item:movie-play-new")
 		if err != nil {
 			return err
@@ -1843,7 +1843,7 @@ func TestHandleSeasonRemovalMarksChildrenAndSeasonFlowDeleted(t *testing.T) {
 	svc.now = func() time.Time { return now }
 	svc.SyncFlowManagerClock()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-rm-1", SeasonID: "season-rm-1", SeasonName: "Season X", UpdatedAt: now}); err != nil {
 			return err
 		}
@@ -1887,7 +1887,7 @@ func TestHandleSeasonRemovalMarksChildrenAndSeasonFlowDeleted(t *testing.T) {
 		t.Fatalf("handle season removal: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		_, found, err := tx.GetMedia(context.Background(), "ep-rm-1")
 		if err != nil {
 			return err
@@ -1924,7 +1924,7 @@ func TestEpisodeRemovalKeepsSeasonProjectionWhenEpisodesRemain(t *testing.T) {
 	svc.now = func() time.Time { return now }
 	svc.SyncFlowManagerClock()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-rm-one", SeasonID: "season-rm-keep", SeasonName: "Season Keep", UpdatedAt: now}); err != nil {
 			return err
 		}
@@ -1968,7 +1968,7 @@ func TestEpisodeRemovalKeepsSeasonProjectionWhenEpisodesRemain(t *testing.T) {
 		t.Fatalf("handle episode removal: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		_, found, err := tx.GetMedia(context.Background(), "ep-rm-one")
 		if err != nil {
 			return err
@@ -2055,7 +2055,7 @@ func TestPlaybackStaleEventDoesNotIncrementPlayCount(t *testing.T) {
 	svc.now = func() time.Time { return now }
 	svc.SyncFlowManagerClock()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertMedia(context.Background(), domain.MediaItem{
 			ItemID:              "movie-play-stale",
 			Name:                "Play Movie",
@@ -2105,7 +2105,7 @@ func TestPlaybackEventClosesOpenHITLAndReschedulesEvaluation(t *testing.T) {
 	svc.now = func() time.Time { return now }
 	svc.SyncFlowManagerClock()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{
 			ItemID:       "movie-hitl-play",
 			Name:         "Playback Recovery Movie",
@@ -2340,7 +2340,7 @@ func TestCollectionWebhookDoesNotCreateOperationalFlow(t *testing.T) {
 		t.Fatalf("handle collection webhook: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		flows, err := tx.ListFlows(context.Background())
 		if err != nil {
 			return err
@@ -2381,7 +2381,7 @@ func TestSeriesWebhookDoesNotCreateOperationalFlow(t *testing.T) {
 		t.Fatalf("handle series webhook: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		flows, err := tx.ListFlows(context.Background())
 		if err != nil {
 			return err
@@ -2421,7 +2421,7 @@ func TestSeasonCatalogWebhookDoesNotCreateOperationalFlow(t *testing.T) {
 		t.Fatalf("handle season webhook: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		flows, err := tx.ListFlows(context.Background())
 		if err != nil {
 			return err
@@ -2545,7 +2545,7 @@ func TestWebhookSkipsFlowMutationsForDeleteQueued(t *testing.T) {
 	svc.SyncFlowManagerClock()
 
 	itemID := "target:movie:dq-skip"
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + itemID,
 			ItemID:      itemID,
@@ -2591,7 +2591,7 @@ func TestWebhookSkipsFlowMutationsForDeleteFailedNonItemAdded(t *testing.T) {
 	svc.SyncFlowManagerClock()
 
 	itemID := "target:movie:df-skip"
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + itemID,
 			ItemID:      itemID,
@@ -2635,7 +2635,7 @@ func TestWebhookItemAddedResurrectsDeleteFailedFlow(t *testing.T) {
 	svc.SyncFlowManagerClock()
 
 	itemID := "target:movie:df-resurrect"
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + itemID,
 			ItemID:      itemID,
@@ -2685,7 +2685,7 @@ func TestWebhookItemAddedResurrectsDeleteFailedFlow(t *testing.T) {
 	}
 
 	// Stale eval should have been purged then a fresh eval re-created by RequestEval.
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		freshJob, found, err := tx.GetJob(context.Background(), "job:eval:scheduled:"+itemID)
 		if err != nil {
 			return err
@@ -2710,7 +2710,7 @@ func TestWebhookPlaybackRecoveryPurgesStaleHITLJobs(t *testing.T) {
 	svc.SyncFlowManagerClock()
 
 	itemID := "target:movie:recovery"
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:             "flow:" + itemID,
 			ItemID:             itemID,
@@ -2761,7 +2761,7 @@ func TestWebhookPlaybackRecoveryPurgesStaleHITLJobs(t *testing.T) {
 		t.Fatalf("expected HITLOutcome=played after recovery, got %q", flow.HITLOutcome)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		for _, jid := range []string{
 			"job:prompt:" + itemID + ":1",
 			"job:timeout:" + itemID + ":1",
@@ -2800,18 +2800,18 @@ func TestReconcileStaleFlows(t *testing.T) {
 
 	// Seed a pending_review flow with no Discord message — should be reconciled.
 	staleItem := "target:movie:stale-pending"
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
-			FlowID:      "flow:" + staleItem,
-			ItemID:      staleItem,
-			SubjectType: "movie",
-			DisplayName: "Stale Pending Movie",
-			State:       domain.FlowStatePendingReview,
-			Version:     0,
-			NextActionAt: time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC),
+			FlowID:         "flow:" + staleItem,
+			ItemID:         staleItem,
+			SubjectType:    "movie",
+			DisplayName:    "Stale Pending Movie",
+			State:          domain.FlowStatePendingReview,
+			Version:        0,
+			NextActionAt:   time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC),
 			PolicySnapshot: domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 48, TimeoutAction: "delete"},
-			CreatedAt:   now.Add(-365 * 24 * time.Hour),
-			UpdatedAt:   now.Add(-365 * 24 * time.Hour),
+			CreatedAt:      now.Add(-365 * 24 * time.Hour),
+			UpdatedAt:      now.Add(-365 * 24 * time.Hour),
 		}, 0)
 	})
 	if err != nil {
@@ -2820,18 +2820,18 @@ func TestReconcileStaleFlows(t *testing.T) {
 
 	// Seed an active flow with past nextActionAt — should also be reconciled.
 	staleActive := "target:movie:stale-active"
-	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err = store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
-			FlowID:       "flow:" + staleActive,
-			ItemID:       staleActive,
-			SubjectType:  "movie",
-			DisplayName:  "Stale Active Movie",
-			State:        domain.FlowStateActive,
-			Version:      0,
-			NextActionAt: time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC),
+			FlowID:         "flow:" + staleActive,
+			ItemID:         staleActive,
+			SubjectType:    "movie",
+			DisplayName:    "Stale Active Movie",
+			State:          domain.FlowStateActive,
+			Version:        0,
+			NextActionAt:   time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC),
 			PolicySnapshot: domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 48, TimeoutAction: "delete"},
-			CreatedAt:    now.Add(-730 * 24 * time.Hour),
-			UpdatedAt:    now.Add(-730 * 24 * time.Hour),
+			CreatedAt:      now.Add(-730 * 24 * time.Hour),
+			UpdatedAt:      now.Add(-730 * 24 * time.Hour),
 		}, 0)
 	})
 	if err != nil {
@@ -2855,18 +2855,18 @@ func TestRequestImmediateReview(t *testing.T) {
 	svc.SyncFlowManagerClock()
 
 	itemID := "target:movie:review-now"
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
-			FlowID:       "flow:" + itemID,
-			ItemID:       itemID,
-			SubjectType:  "movie",
-			DisplayName:  "Review Now Movie",
-			State:        domain.FlowStateActive,
-			Version:      0,
-			NextActionAt: now.Add(30 * 24 * time.Hour),
+			FlowID:         "flow:" + itemID,
+			ItemID:         itemID,
+			SubjectType:    "movie",
+			DisplayName:    "Review Now Movie",
+			State:          domain.FlowStateActive,
+			Version:        0,
+			NextActionAt:   now.Add(30 * 24 * time.Hour),
 			PolicySnapshot: domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 48, TimeoutAction: "delete"},
-			CreatedAt:    now,
-			UpdatedAt:    now,
+			CreatedAt:      now,
+			UpdatedAt:      now,
 		}, 0)
 	})
 	if err != nil {

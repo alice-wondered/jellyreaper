@@ -17,8 +17,10 @@ type fakeRepo struct {
 	hasDue  bool
 }
 
-func (f *fakeRepo) WithTx(context.Context, func(repo.TxRepository) error) error { return nil }
-func (f *fakeRepo) CompleteJob(context.Context, string, time.Time) error        { return nil }
+func (f *fakeRepo) WithTx(context.Context, func(context.Context, repo.TxRepository) error) error {
+	return nil
+}
+func (f *fakeRepo) CompleteJob(context.Context, string, time.Time) error { return nil }
 func (f *fakeRepo) FailJob(context.Context, string, string, time.Time, bool) error {
 	return nil
 }

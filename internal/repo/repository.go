@@ -45,7 +45,12 @@ type TxRepository interface {
 }
 
 type Repository interface {
-	WithTx(ctx context.Context, fn func(tx TxRepository) error) error
+	// WithTx runs fn inside a single write transaction. The context passed to
+	// fn is marked (see internal/txguard) so that outbound I/O boundaries can
+	// detect — and reject — network calls attempted while the global bbolt
+	// write lock is held. Callers MUST use the tx-scoped ctx, not the outer
+	// one, for any work inside fn.
+	WithTx(ctx context.Context, fn func(ctx context.Context, tx TxRepository) error) error
 
 	LeaseDueJobs(ctx context.Context, now time.Time, limit int, leaseOwner string, leaseTTL time.Duration) ([]domain.JobRecord, error)
 	GetNextDueAt(ctx context.Context) (time.Time, bool, error)

@@ -23,7 +23,9 @@ type fakeRepo struct {
 	lastTerminal  bool
 }
 
-func (f *fakeRepo) WithTx(context.Context, func(repo.TxRepository) error) error { return nil }
+func (f *fakeRepo) WithTx(context.Context, func(context.Context, repo.TxRepository) error) error {
+	return nil
+}
 func (f *fakeRepo) LeaseDueJobs(context.Context, time.Time, int, string, time.Duration) ([]domain.JobRecord, error) {
 	return nil, nil
 }
@@ -105,7 +107,7 @@ func TestDispatcher_MarksDeleteFlowFailedOnTerminalDeleteError(t *testing.T) {
 	t.Cleanup(func() { _ = store.Close(); _ = os.Remove(path) })
 
 	now := time.Now().UTC()
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:target:movie:delete-fail",
 			ItemID:      "target:movie:delete-fail",
@@ -131,7 +133,7 @@ func TestDispatcher_MarksDeleteFlowFailedOnTerminalDeleteError(t *testing.T) {
 		t.Fatalf("dispatch terminal delete failure: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(context.Background(), "target:movie:delete-fail")
 		if err != nil {
 			return err
@@ -167,7 +169,7 @@ func TestDispatcher_NotifierFiresOnTerminalDeleteFailure(t *testing.T) {
 	t.Cleanup(func() { _ = store.Close(); _ = os.Remove(path) })
 
 	now := time.Now().UTC()
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:target:movie:notify-fail",
 			ItemID:      "target:movie:notify-fail",

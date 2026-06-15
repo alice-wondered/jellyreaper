@@ -74,7 +74,7 @@ func (h *EvaluatePolicyHandler) Kind() domain.JobKind { return domain.JobKindEva
 func (h *EvaluatePolicyHandler) OnTerminalFailure(ctx context.Context, job domain.JobRecord) error {
 	now := time.Now().UTC()
 	retryAfter := now.Add(10 * time.Minute)
-	return h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	return h.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, job.ItemID)
 		if err != nil {
 			return err
@@ -96,7 +96,7 @@ func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord
 	}
 
 	shouldReview := false
-	err = h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	err = h.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, job.ItemID)
 		if err != nil {
 			return err
@@ -319,7 +319,7 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 	statusLine := ""
 	staleMessageID := ""
 	staleChannelID := ""
-	err = h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	err = h.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		current, found, err := tx.GetFlow(ctx, job.ItemID)
 		if err != nil {
 			return err
@@ -367,7 +367,7 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 		}
 		clearNow := time.Now().UTC()
 		cleared := false
-		err = h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		err = h.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 			current, found, err := tx.GetFlow(ctx, job.ItemID)
 			if err != nil {
 				return err
@@ -433,7 +433,7 @@ func (h *SendHITLPromptHandler) Handle(ctx context.Context, job domain.JobRecord
 
 	bailReason := ""
 	bailDetails := []any{}
-	err = h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	err = h.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		current, found, err := tx.GetFlow(ctx, job.ItemID)
 		if err != nil {
 			return err
@@ -568,7 +568,7 @@ func (h *HITLTimeoutHandler) Kind() domain.JobKind { return domain.JobKindHITLTi
 func (h *HITLTimeoutHandler) OnTerminalFailure(ctx context.Context, job domain.JobRecord) error {
 	now := time.Now().UTC()
 	retryAfter := now.Add(10 * time.Minute)
-	return h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	return h.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, job.ItemID)
 		if err != nil {
 			return err
@@ -613,7 +613,7 @@ func (h *HITLTimeoutHandler) Handle(ctx context.Context, job domain.JobRecord) e
 	}
 
 	shouldDelete := false
-	err = h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	err = h.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, job.ItemID)
 		if err != nil {
 			return err
@@ -836,7 +836,7 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 
 	now := time.Now().UTC()
 	purged := 0
-	err = h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	err = h.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		// Force-delete: no version check, no state check. The I/O has
 		// already happened externally; the local state must catch up
 		// regardless of what concurrent writers may have done.
@@ -919,7 +919,7 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 func (h *ExecuteDeleteHandler) getFlow(ctx context.Context, itemID string) (domain.Flow, bool, error) {
 	var out domain.Flow
 	var found bool
-	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	err := h.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		var err error
 		out, found, err = tx.GetFlow(ctx, itemID)
 		return err
@@ -933,7 +933,7 @@ func (h *ExecuteDeleteHandler) getFlow(ctx context.Context, itemID string) (doma
 func (h *ExecuteDeleteHandler) getMedia(ctx context.Context, itemID string) (domain.MediaItem, bool, error) {
 	var media domain.MediaItem
 	var found bool
-	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	err := h.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		var err error
 		media, found, err = tx.GetMedia(ctx, itemID)
 		return err
@@ -989,7 +989,7 @@ func (h *ExecuteDeleteHandler) deleteAggregateChildren(ctx context.Context, flow
 
 func (h *ExecuteDeleteHandler) listChildren(ctx context.Context, subjectType, subjectID string) ([]domain.MediaItem, error) {
 	var out []domain.MediaItem
-	err := h.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	err := h.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		var err error
 		out, err = tx.ListMediaBySubject(ctx, subjectType, subjectID)
 		return err

@@ -50,7 +50,7 @@ func snowflakeIDFor(t time.Time) string {
 
 func seedFlowForInteraction(t *testing.T, store *bboltrepo.Store, itemID string, now time.Time) {
 	t.Helper()
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:         "flow:" + itemID,
 			ItemID:         itemID,
@@ -71,7 +71,7 @@ func seedFlowForInteraction(t *testing.T, store *bboltrepo.Store, itemID string,
 func mustGetFlow(t *testing.T, store *bboltrepo.Store, itemID string) domain.Flow {
 	t.Helper()
 	var flow domain.Flow
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		var found bool
 		var err error
 		flow, found, err = tx.GetFlow(context.Background(), itemID)
@@ -92,7 +92,7 @@ func mustGetFlow(t *testing.T, store *bboltrepo.Store, itemID string) domain.Flo
 func mustGetMedia(t *testing.T, store *bboltrepo.Store, itemID string) domain.MediaItem {
 	t.Helper()
 	var media domain.MediaItem
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		item, found, err := tx.GetMedia(context.Background(), itemID)
 		if err != nil {
 			return err

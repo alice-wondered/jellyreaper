@@ -145,7 +145,7 @@ func (s *Service) SetGlobalReviewDays(ctx context.Context, days int) error {
 	if days <= 0 || days > 3650 {
 		return fmt.Errorf("review days must be between 1 and 3650")
 	}
-	return s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	return s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.SetMeta(ctx, metaReviewDays, strconv.Itoa(days))
 	})
 }
@@ -154,7 +154,7 @@ func (s *Service) SetGlobalDeferDays(ctx context.Context, days int) error {
 	if days <= 0 || days > 3650 {
 		return fmt.Errorf("defer days must be between 1 and 3650")
 	}
-	return s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	return s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.SetMeta(ctx, metaDeferDays, strconv.Itoa(days))
 	})
 }
@@ -163,7 +163,7 @@ func (s *Service) SetGlobalHITLTimeoutHours(ctx context.Context, hours int) erro
 	if hours <= 0 || hours > 8760 {
 		return fmt.Errorf("hitl timeout hours must be between 1 and 8760")
 	}
-	return s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	return s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.SetMeta(ctx, metaHITLTimeoutHours, strconv.Itoa(hours))
 	})
 }
@@ -230,7 +230,7 @@ func (s *Service) SetJellyfinClient(client *jellyfin.Client) {
 func (s *Service) ReconcileStaleFlows(ctx context.Context) (int, error) {
 	now := s.now().UTC()
 	reconciled := 0
-	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	err := s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flows, err := tx.ListFlows(ctx)
 		if err != nil {
 			return err
@@ -346,7 +346,7 @@ func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.Web
 	finalizations := make([]hitlFinalizeRequest, 0)
 	playedRecoveries := make([]pendingPlayedRecovery, 0)
 
-	err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	err := s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		return s.applyJellyfinWebhookInTx(ctx, tx, event, now, eventAt, playbackEvent, catalogIndexEvent, removalEvent, dedupeKey, itemID, targets, &finalizations, &playedRecoveries)
 	})
 	if err != nil {
@@ -852,7 +852,7 @@ func (s *Service) HandleDiscordComponentInteraction(ctx context.Context, interac
 
 	// Pre-check: deduplication and stale version detection.
 	defaultDeferDays := 0
-	err = s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	err = s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		_, defaultDeferWindow, _, err := s.currentDefaultsFromMeta(ctx, tx)
 		if err != nil {
 			return err
@@ -1194,7 +1194,20 @@ func (s *Service) processWebhookBatches(ctx context.Context, ops <-chan backfill
 		if len(batch) == 0 {
 			return nil
 		}
-		if err := s.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+		// Enrich provider IDs BEFORE opening the write transaction. Enrichment
+		// makes synchronous HTTP calls back to Jellyfin; doing it inside WithTx
+		// would hold the single global bbolt write lock across N network
+		// round-trips and stall every live playback webhook. This mirrors the
+		// live path (HandleJellyfinWebhook enriches before applyJellyfinWebhookTx).
+		// The outbound Jellyfin client now also rejects calls made inside a tx
+		// (txguard), so this ordering is enforced, not merely conventional.
+		for _, op := range batch {
+			if op.event == nil {
+				continue
+			}
+			s.enrichProviderIDsFromJellyfin(ctx, op.event)
+		}
+		if err := s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 			for _, op := range batch {
 				if op.event == nil {
 					if op.cursorKey != "" {
@@ -1205,7 +1218,6 @@ func (s *Service) processWebhookBatches(ctx context.Context, ops <-chan backfill
 					continue
 				}
 				event := *op.event
-				s.enrichProviderIDsFromJellyfin(ctx, &event)
 				now := s.now().UTC()
 				if sourceNow, ok := sourceTimestampForJellyfinEvent(event); ok {
 					now = sourceNow
@@ -1380,7 +1392,6 @@ func parseCustomID(value string) (customID, error) {
 	return customID{Action: action, ItemID: itemID, Version: version}, nil
 }
 
-
 func interactionResponse(content string) *discordgo.InteractionResponse {
 	return &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
@@ -1474,7 +1485,6 @@ func latestPromptReference(flow domain.Flow, interaction discord.IncomingInterac
 	}
 	return fmt.Sprintf("This prompt is stale. Use the latest one in channel %s (message %s).", targetChannelID, targetMessageID)
 }
-
 
 func interactionDecisionLabel(action string) string {
 	switch strings.ToLower(strings.TrimSpace(action)) {

@@ -98,7 +98,7 @@ func TestIntegrationWebhookToSchedulerDispatch(t *testing.T) {
 	defer cancel()
 	go func() { _ = loop.Run(ctx) }()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertMedia(context.Background(), domain.MediaItem{
 			ItemID:       "item-timeout",
 			Name:         "Timeout Movie",
@@ -151,7 +151,7 @@ func TestIntegrationDiscordArchiveNoDeleteJob(t *testing.T) {
 	}
 
 	appSvc := app.NewService(store, nil, nil)
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:         "flow:target:item:item-arc",
 			ItemID:         "target:item:item-arc",
@@ -193,7 +193,7 @@ func TestIntegrationDiscordArchiveNoDeleteJob(t *testing.T) {
 	}
 
 	var flow domain.Flow
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		var found bool
 		var err error
 		flow, found, err = tx.GetFlow(context.Background(), "target:item:item-arc")
@@ -354,7 +354,7 @@ func TestIntegrationBackfillIndexesStateFromGeneratedTypes(t *testing.T) {
 		t.Fatalf("unexpected changed items: %#v", items)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: items[0].ItemID, Title: items[0].Name, LastPlayedAt: plays[0].Date, UpdatedAt: time.Now().UTC()}); err != nil {
 			return err
 		}
@@ -432,7 +432,7 @@ func TestIntegrationBackfillUsesUserPlaybackToDeferReviewScheduling(t *testing.T
 		t.Fatalf("ingest backfill items: %v", err)
 	}
 
-	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err = store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		media, found, err := tx.GetMedia(context.Background(), movieID)
 		if err != nil {
 			return err
@@ -550,7 +550,7 @@ func TestIntegrationCanonicalizesIDsAcrossBackfillAndWebhookSources(t *testing.T
 		t.Fatalf("unexpected status: %d", resp.StatusCode)
 	}
 
-	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err = store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		media, found, err := tx.GetMedia(context.Background(), dashedID)
 		if err != nil {
 			return err
@@ -669,7 +669,7 @@ func TestIntegrationWebhookDeleteDoesNotTriggerARRRemovalPath(t *testing.T) {
 		t.Fatalf("unexpected status: %d", resp.StatusCode)
 	}
 
-	err = store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err = store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if _, found, err := tx.GetMedia(context.Background(), movieID); err != nil {
 			return err
 		} else if found {
@@ -690,7 +690,7 @@ func TestIntegrationWebhookDeleteDoesNotTriggerARRRemovalPath(t *testing.T) {
 func getFlow(store *bboltrepo.Store, itemID string) (domain.Flow, bool, error) {
 	var flow domain.Flow
 	var found bool
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		var err error
 		flow, found, err = tx.GetFlow(context.Background(), itemID)
 		return err

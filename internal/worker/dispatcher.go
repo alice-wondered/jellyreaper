@@ -116,7 +116,7 @@ func (d *Dispatcher) markDeleteFlowFailed(ctx context.Context, job domain.JobRec
 	now := d.now().UTC()
 	notifyFlow := domain.Flow{}
 	notify := false
-	if err := d.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	if err := d.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, job.ItemID)
 		if err != nil {
 			return err
@@ -174,7 +174,7 @@ func (d *Dispatcher) jobOutcomeFields(ctx context.Context, job domain.JobRecord)
 		}
 	}
 
-	_ = d.repository.WithTx(ctx, func(tx repo.TxRepository) error {
+	_ = d.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(ctx, job.ItemID)
 		if err != nil {
 			return nil

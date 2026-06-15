@@ -28,7 +28,7 @@ func newTestStore(t *testing.T) *bboltrepo.Store {
 
 func seedFlow(t *testing.T, store *bboltrepo.Store, flow domain.Flow) {
 	t.Helper()
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), flow, 0)
 	})
 	if err != nil {
@@ -38,7 +38,7 @@ func seedFlow(t *testing.T, store *bboltrepo.Store, flow domain.Flow) {
 
 func seedMedia(t *testing.T, store *bboltrepo.Store, item domain.MediaItem) {
 	t.Helper()
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertMedia(context.Background(), item)
 	})
 	if err != nil {
@@ -49,7 +49,7 @@ func seedMedia(t *testing.T, store *bboltrepo.Store, item domain.MediaItem) {
 func getFlow(t *testing.T, store *bboltrepo.Store, itemID string) domain.Flow {
 	t.Helper()
 	var flow domain.Flow
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		f, ok, err := tx.GetFlow(context.Background(), itemID)
 		if err != nil {
 			return err
@@ -377,7 +377,7 @@ func TestPlayed_PurgesJobsAndReschedulesEval(t *testing.T) {
 	seedFlow(t, store, f)
 
 	// Seed a stale HITL timeout job that should be purged.
-	err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.EnqueueJob(context.Background(), domain.JobRecord{
 			JobID:  "job:timeout:stale",
 			ItemID: f.ItemID,

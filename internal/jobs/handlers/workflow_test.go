@@ -65,7 +65,7 @@ func TestExecuteDeleteHandlerTransitionsToDeleted(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:item1",
 			ItemID:      "item1",
@@ -101,7 +101,7 @@ func TestExecuteDeleteHandlerTransitionsToDeleted(t *testing.T) {
 		t.Fatal("expected jellyfin delete call")
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		_, found, err := tx.GetFlow(context.Background(), "item1")
 		if err != nil {
 			return err
@@ -119,7 +119,7 @@ func TestExecuteDeleteHandlerMovieProjectionTriggersRadarrRemoval(t *testing.T) 
 	store := testStore(t)
 	now := time.Now().UTC()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:target:movie:mv-arr",
 			ItemID:      "target:movie:mv-arr",
@@ -178,7 +178,7 @@ func TestExecuteDeleteHandlerSeasonProjectionTriggersSonarrSeasonRemoval(t *test
 	store := testStore(t)
 	now := time.Now().UTC()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:target:season:season-arr",
 			ItemID:      "target:season:season-arr",
@@ -238,7 +238,7 @@ func TestExecuteDeleteHandlerMovieProjectionFallsBackToJellyfinWhenRadarrUnmanag
 	store := testStore(t)
 	now := time.Now().UTC()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:target:movie:mv-unmanaged",
 			ItemID:      "target:movie:mv-unmanaged",
@@ -286,7 +286,7 @@ func TestExecuteDeleteHandlerSeasonProjectionFallsBackToJellyfinWhenSonarrUnmana
 	store := testStore(t)
 	now := time.Now().UTC()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:target:season:season-unmanaged",
 			ItemID:      "target:season:season-unmanaged",
@@ -337,7 +337,7 @@ func TestExecuteDeleteHandlerMovieProjectionFallsBackToJellyfinWhenProviderIDsMi
 	store := testStore(t)
 	now := time.Now().UTC()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:target:movie:mv-noids",
 			ItemID:      "target:movie:mv-noids",
@@ -384,7 +384,7 @@ func TestExecuteDeleteHandlerRejectsSeriesProjectionDelete(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:target:series:series-arr",
 			ItemID:      "target:series:series-arr",
@@ -409,7 +409,7 @@ func TestEvaluatePolicyAssumesNeverPlayedWhenMetricsMissing(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:target:item:item-never-played",
 			ItemID:      "target:item:item-never-played",
@@ -434,7 +434,7 @@ func TestEvaluatePolicyAssumesNeverPlayedWhenMetricsMissing(t *testing.T) {
 		t.Fatalf("evaluate policy: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(context.Background(), "target:item:item-never-played")
 		if err != nil {
 			return err
@@ -471,7 +471,7 @@ func TestMostRecentPlayForFlowFallsBackAcrossDashedAndNonDashedIDs(t *testing.T)
 	nonDashed := "1bb7dcaf2c6e04a75d91c4f0ee6b3cfd"
 	dashed := "1bb7dcaf-2c6e-04a7-5d91-c4f0ee6b3cfd"
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertMedia(context.Background(), domain.MediaItem{
 			ItemID:       nonDashed,
 			ItemType:     "Movie",
@@ -483,7 +483,7 @@ func TestMostRecentPlayForFlowFallsBackAcrossDashedAndNonDashedIDs(t *testing.T)
 		t.Fatalf("seed media: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		played, known, err := mostRecentPlayForFlow(context.Background(), tx, domain.Flow{ItemID: "target:movie:" + dashed})
 		if err != nil {
 			return err
@@ -505,7 +505,7 @@ func TestEvaluatePolicyFallsBackToCreatedAtWhenNeverPlayed(t *testing.T) {
 	now := time.Now().UTC()
 	createdAt := now.Add(-10 * 24 * time.Hour)
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{
 			ItemID:    "movie-created-only",
 			Name:      "Created Only",
@@ -540,7 +540,7 @@ func TestEvaluatePolicyFallsBackToCreatedAtWhenNeverPlayed(t *testing.T) {
 		t.Fatalf("evaluate policy: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(context.Background(), "target:item:movie-created-only")
 		if err != nil {
 			return err
@@ -565,7 +565,7 @@ func TestEvaluatePolicyUsesGlobalReviewDaysMetaLazily(t *testing.T) {
 	now := time.Now().UTC()
 	lastPlayed := now.Add(-2 * time.Hour)
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.SetMeta(context.Background(), "settings.review_days", "60"); err != nil {
 			return err
 		}
@@ -602,7 +602,7 @@ func TestEvaluatePolicyUsesGlobalReviewDaysMetaLazily(t *testing.T) {
 		t.Fatalf("evaluate policy: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(context.Background(), "target:item:item-global-review")
 		if err != nil {
 			return err
@@ -627,7 +627,7 @@ func TestHITLTimeoutHandlerQueuesDeleteWhenPendingReview(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:             "flow:item2",
 			ItemID:             "item2",
@@ -665,7 +665,7 @@ func TestHITLTimeoutHandlerDefersDeleteUntilDeadline(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:             "flow:item3",
 			ItemID:             "item3",
@@ -684,7 +684,7 @@ func TestHITLTimeoutHandlerDefersDeleteUntilDeadline(t *testing.T) {
 		t.Fatalf("timeout handle: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(context.Background(), "item3")
 		if err != nil {
 			return err
@@ -718,7 +718,7 @@ func TestHITLTimeoutHandlerFinalizesPromptMessage(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:             "flow:item4",
 			ItemID:             "item4",
@@ -764,7 +764,7 @@ func TestExecuteDeleteHandlerDeletesChildrenForSeasonTarget(t *testing.T) {
 		t.Fatalf("discord service: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:target:season:season-9",
 			ItemID:      "target:season:season-9",
@@ -820,7 +820,7 @@ func TestExecuteDeleteHandlerDeletesChildrenForSeasonTarget(t *testing.T) {
 		t.Fatal("expected season delete completion to finalize discord message")
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		_, found, err := tx.GetFlow(context.Background(), "target:season:season-9")
 		if err != nil {
 			return err
@@ -857,7 +857,7 @@ func TestExecuteDeleteHandlerDeletesMovieProjectionAndSiblingFlows(t *testing.T)
 		t.Fatalf("discord service: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{FlowID: "flow:target:movie:mv-1", ItemID: "target:movie:mv-1", SubjectType: "movie", DisplayName: "Movie One", Discord: domain.DiscordContext{ChannelID: "ch-del", MessageID: "msg-del"}, State: domain.FlowStateDeleteQueued, Version: 0, CreatedAt: now, UpdatedAt: now}, 0); err != nil {
 			return err
 		}
@@ -900,7 +900,7 @@ func TestExecuteDeleteHandlerDeletesMovieProjectionAndSiblingFlows(t *testing.T)
 		t.Fatal("expected delete completion to finalize discord message")
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		_, found, err := tx.GetFlow(context.Background(), "target:movie:mv-1")
 		if err != nil {
 			return err
@@ -932,7 +932,7 @@ func TestExecuteDeleteHandlerRetriesDeleteInProgressFlow(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:target:movie:mv-retry",
 			ItemID:      "target:movie:mv-retry",
@@ -968,7 +968,7 @@ func TestExecuteDeleteHandlerRetriesDeleteInProgressFlow(t *testing.T) {
 	if deleteCalls != 1 {
 		t.Fatalf("expected one jellyfin delete call on retry, got %d", deleteCalls)
 	}
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if _, found, err := tx.GetFlow(context.Background(), "target:movie:mv-retry"); err != nil {
 			return err
 		} else if found {
@@ -984,7 +984,7 @@ func TestSendHITLPromptHandlerAppliesMinimumResponseWindow(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:    "flow:item-min-window",
 			ItemID:    "item-min-window",
@@ -1011,7 +1011,7 @@ func TestSendHITLPromptHandlerAppliesMinimumResponseWindow(t *testing.T) {
 		t.Fatalf("handle prompt: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(context.Background(), "item-min-window")
 		if err != nil {
 			return err
@@ -1042,7 +1042,7 @@ func TestSendHITLPromptHandlerUsesPolicyTimeoutHoursForDeadline(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID: "flow:item-timeout-hours",
 			ItemID: "item-timeout-hours",
@@ -1074,7 +1074,7 @@ func TestSendHITLPromptHandlerUsesPolicyTimeoutHoursForDeadline(t *testing.T) {
 		t.Fatalf("handle prompt: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(context.Background(), "item-timeout-hours")
 		if err != nil {
 			return err
@@ -1095,7 +1095,7 @@ func TestSendHITLPromptHandlerIncludesLastPlayedStatusLine(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:    "flow:item-last-played",
 			ItemID:    "item-last-played",
@@ -1136,7 +1136,7 @@ func TestSendHITLPromptHandlerFallsBackToCreatedTimestampWhenNeverPlayed(t *test
 	now := time.Now().UTC()
 	createdAt := now.Add(-48 * time.Hour)
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:    "flow:item-never-played",
 			ItemID:    "item-never-played",
@@ -1176,7 +1176,7 @@ func TestSendHITLPromptHandlerUsesCurrentFlowVersionInCustomID(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:    "flow:item-version-match",
 			ItemID:    "item-version-match",
@@ -1205,7 +1205,7 @@ func TestSendHITLPromptHandlerUsesCurrentFlowVersionInCustomID(t *testing.T) {
 		t.Fatalf("handle prompt: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(context.Background(), "item-version-match")
 		if err != nil {
 			return err
@@ -1226,7 +1226,7 @@ func TestSendHITLPromptHandlerSendsNewMessageWhenStoredMessageMissing(t *testing
 	store := testStore(t)
 	now := time.Now().UTC()
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:item-stale-msg",
 			ItemID:      "item-stale-msg",
@@ -1261,7 +1261,7 @@ func TestSendHITLPromptHandlerSendsNewMessageWhenStoredMessageMissing(t *testing
 		t.Fatalf("expected one prompt send, got %d", sendCount)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(context.Background(), "item-stale-msg")
 		if err != nil {
 			return err
@@ -1293,7 +1293,7 @@ func TestEvaluatePolicyHandlerBailsOnStaleVersion(t *testing.T) {
 	now := time.Now().UTC()
 	itemID := "target:movie:eval-stale"
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + itemID,
 			ItemID:      itemID,
@@ -1338,7 +1338,7 @@ func TestSendHITLPromptHandlerBailsOnStaleVersion(t *testing.T) {
 	now := time.Now().UTC()
 	itemID := "target:movie:prompt-stale"
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + itemID,
 			ItemID:      itemID,
@@ -1379,7 +1379,7 @@ func TestHITLTimeoutHandlerBailsOnStaleVersion(t *testing.T) {
 	now := time.Now().UTC()
 	itemID := "target:movie:timeout-stale"
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:             "flow:" + itemID,
 			ItemID:             itemID,
@@ -1421,7 +1421,7 @@ func TestHITLTimeoutHandlerBailsOnOutcomeResolved(t *testing.T) {
 	now := time.Now().UTC()
 	itemID := "target:movie:timeout-outcome"
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:             "flow:" + itemID,
 			ItemID:             itemID,
@@ -1463,7 +1463,7 @@ func TestExecuteDeleteHandlerForceDeletesDespiteVersionDrift(t *testing.T) {
 	now := time.Now().UTC()
 	itemID := "target:movie:force-delete"
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + itemID,
 			ItemID:      itemID,
@@ -1494,7 +1494,7 @@ func TestExecuteDeleteHandlerForceDeletesDespiteVersionDrift(t *testing.T) {
 		t.Fatalf("handle: %v", err)
 	}
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		_, found, err := tx.GetFlow(context.Background(), itemID)
 		if err != nil {
 			return err
@@ -1513,7 +1513,7 @@ func TestExecuteDeleteHandlerPurgesSiblingJobs(t *testing.T) {
 	now := time.Now().UTC()
 	itemID := "target:movie:purge-jobs"
 
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
 			FlowID:      "flow:" + itemID,
 			ItemID:      itemID,
@@ -1559,7 +1559,7 @@ func TestExecuteDeleteHandlerPurgesSiblingJobs(t *testing.T) {
 	}
 
 	// All jobs (including the executing delete) should be gone.
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		for _, jid := range []string{
 			"job:eval:scheduled:" + itemID,
 			"job:prompt:" + itemID + ":1",
@@ -1594,7 +1594,7 @@ func mustMarshalJSON(t *testing.T, v any) []byte {
 func mustGetFlowFromHandlerStore(t *testing.T, store *bboltrepo.Store, itemID string) domain.Flow {
 	t.Helper()
 	var out domain.Flow
-	if err := store.WithTx(context.Background(), func(tx repo.TxRepository) error {
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 		flow, found, err := tx.GetFlow(context.Background(), itemID)
 		if err != nil {
 			return err

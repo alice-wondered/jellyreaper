@@ -15,6 +15,7 @@ import (
 
 	"jellyreaper/internal/domain"
 	"jellyreaper/internal/repo"
+	"jellyreaper/internal/txguard"
 )
 
 var _ repo.Repository = (*Store)(nil)
@@ -82,15 +83,19 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func (s *Store) WithTx(ctx context.Context, fn func(tx repo.TxRepository) error) error {
+func (s *Store) WithTx(ctx context.Context, fn func(ctx context.Context, tx repo.TxRepository) error) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
+	// Mark the tx-scoped context so outbound I/O boundaries can fail fast if
+	// anyone attempts a blocking network call while the global bbolt write
+	// lock is held. The callback receives this marked context and must use it.
+	txCtx := txguard.MarkInTx(ctx)
 	return s.db.Update(func(tx *bbolt.Tx) error {
-		if err := checkContext(ctx); err != nil {
+		if err := checkContext(txCtx); err != nil {
 			return err
 		}
-		return fn(&txRepo{tx: tx})
+		return fn(txCtx, &txRepo{tx: tx})
 	})
 }
 

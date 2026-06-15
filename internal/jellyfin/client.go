@@ -3,6 +3,7 @@ package jellyfin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,9 +13,17 @@ import (
 	"time"
 
 	"jellyreaper/internal/domain"
+	"jellyreaper/internal/txguard"
 )
 
 var dashedHexIDPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// ErrIOInTransaction is returned when an outbound Jellyfin HTTP call is
+// attempted while the caller is inside a bbolt write transaction. Holding the
+// single global write lock across a network round-trip stalls every other
+// writer until the remote call times out; this guard makes that mistake fail
+// loudly and immediately rather than silently degrading the service.
+var ErrIOInTransaction = errors.New("network I/O attempted inside bbolt write transaction")
 
 type Client struct {
 	baseURL string
@@ -37,6 +46,9 @@ func NewClient(baseURL, apiKey string, httpClient *http.Client) *Client {
 }
 
 func (c *Client) DeleteItem(ctx context.Context, itemID string) error {
+	if txguard.InTx(ctx) {
+		return fmt.Errorf("jellyfin delete item %q: %w", itemID, ErrIOInTransaction)
+	}
 	if c.baseURL == "" {
 		return fmt.Errorf("jellyfin base url is required")
 	}
@@ -72,6 +84,9 @@ func (c *Client) DeleteItem(ctx context.Context, itemID string) error {
 }
 
 func (c *Client) FetchProviderIDs(ctx context.Context, itemID string) (map[string]string, error) {
+	if txguard.InTx(ctx) {
+		return nil, fmt.Errorf("jellyfin fetch provider ids %q: %w", itemID, ErrIOInTransaction)
+	}
 	if c.baseURL == "" {
 		return nil, fmt.Errorf("jellyfin base url is required")
 	}
