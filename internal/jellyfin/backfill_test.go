@@ -351,7 +351,10 @@ func TestBackfillFetchChangedItemsSinceCachesUsersList(t *testing.T) {
 
 func TestBackfillFetchChangedItemsPageIncludesRecentUserPlaysWhenCatalogPageEmpty(t *testing.T) {
 	itemID := uuid.New()
-	recentPlay := time.Date(2026, 4, 5, 0, 29, 37, 0, time.UTC)
+	// Anchor the play relative to now so it stays inside the `since` window
+	// below. fetchRecentlyPlayedAcrossUsersSince filters out plays older than
+	// `since`, so a hardcoded date rots once wall-clock passes since+window.
+	recentPlay := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Second)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/Items":
