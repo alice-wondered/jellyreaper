@@ -37,5 +37,6 @@ func DefaultHandlers(logger *slog.Logger) []jobs.JobHandler {
 		NewNoopHandler(domain.JobKindExecuteDelete, logger),
 		NewNoopHandler(domain.JobKindVerifyDelete, logger),
 		NewNoopHandler(domain.JobKindReconcileItem, logger),
+		NewNoopHandler(domain.JobKindPruneEvents, logger),
 	}
 }

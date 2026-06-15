@@ -547,6 +547,65 @@ func (s *Service) ScheduleOOBReconcile(ctx context.Context, runAt time.Time) err
 	})
 }
 
+// PruneOldEvents deletes event records older than the given retention window.
+// It computes cutoff = now - retention and calls PruneEvents inside a single
+// write transaction. All I/O is transactional; no network calls are made.
+//
+// This is the entry point called by PruneEventsHandler. The retention window
+// is passed in rather than derived from config so callers stay in control.
+func (s *Service) PruneOldEvents(ctx context.Context, retention time.Duration) (int, error) {
+	if retention <= 0 {
+		return 0, fmt.Errorf("prune old events: retention must be > 0")
+	}
+	cutoff := s.now().UTC().Add(-retention)
+	var pruned int
+	if err := s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
+		var err error
+		pruned, err = tx.PruneEvents(ctx, cutoff)
+		return err
+	}); err != nil {
+		return 0, fmt.Errorf("prune old events: %w", err)
+	}
+	if pruned > 0 {
+		s.logger.InfoContext(ctx, "pruned old events",
+			"lex", "PRUNE-EVENTS",
+			"pruned", pruned,
+			"cutoff", cutoff.Format(time.RFC3339),
+		)
+	}
+	return pruned, nil
+}
+
+// SchedulePruneEvents enqueues a JobKindPruneEvents job to run at runAt.
+// The job is a singleton keyed by a daily idempotency key so scheduling it
+// twice in the same calendar day is a no-op (mirrors ScheduleOOBReconcile).
+func (s *Service) SchedulePruneEvents(ctx context.Context, runAt time.Time) error {
+	now := s.now().UTC()
+	if runAt.IsZero() {
+		runAt = now
+	}
+	dayKey := runAt.UTC().Format("2006-01-02")
+	payload, err := json.Marshal(jobs.PruneEventsPayload{Source: "scheduled"})
+	if err != nil {
+		return fmt.Errorf("schedule prune events: marshal payload: %w", err)
+	}
+	return s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
+		return tx.EnqueueJob(ctx, domain.JobRecord{
+			JobID:          "job:prune:events:" + dayKey,
+			FlowID:         "",
+			ItemID:         "prune:events",
+			Kind:           domain.JobKindPruneEvents,
+			Status:         domain.JobStatusPending,
+			RunAt:          runAt,
+			MaxAttempts:    3,
+			IdempotencyKey: "prune:events:" + dayKey,
+			PayloadJSON:    payload,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		})
+	})
+}
+
 // extractJellyfinIDFromFlowItemID extracts the raw Jellyfin item ID from a
 // canonical flow ItemID. Supported formats:
 //
@@ -665,18 +724,24 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		return nil
 	}
 
-	recordedEvent := domain.Event{
-		EventID:        "evt:jellyfin:" + shortHash(dedupeKey),
-		FlowID:         flowIDFromItem(itemID),
-		ItemID:         itemID,
-		Type:           jellyfinEventType(event.EventType),
-		Source:         "jellyfin",
-		OccurredAt:     eventAt,
-		IdempotencyKey: dedupeKey,
-		Payload:        event.Raw,
-	}
-	if err := tx.AppendEvent(ctx, recordedEvent); err != nil {
-		return err
+	// PlaybackProgress position-tick heartbeats are high-frequency events whose
+	// raw JSON payload is never read back. Persisting them to the events bucket
+	// is the root cause of multi-GB database bloat. Skip AppendEvent for these;
+	// all other business logic (media updates, dedupe, eval scheduling) still runs.
+	if !isPlaybackProgressEvent(event.EventType) {
+		recordedEvent := domain.Event{
+			EventID:        "evt:jellyfin:" + shortHash(dedupeKey),
+			FlowID:         flowIDFromItem(itemID),
+			ItemID:         itemID,
+			Type:           jellyfinEventType(event.EventType),
+			Source:         "jellyfin",
+			OccurredAt:     eventAt,
+			IdempotencyKey: dedupeKey,
+			Payload:        event.Raw,
+		}
+		if err := tx.AppendEvent(ctx, recordedEvent); err != nil {
+			return err
+		}
 	}
 
 	seasonChildIDs := make([]string, 0)
@@ -2000,6 +2065,14 @@ func chooseName(values ...string) string {
 func isPlaybackEvent(eventType string) bool {
 	t := strings.ToLower(strings.TrimSpace(eventType))
 	return strings.Contains(t, "playback") || strings.Contains(t, "played")
+}
+
+// isPlaybackProgressEvent returns true for PlaybackProgress position-tick
+// heartbeat events. These are high-frequency webhooks whose raw JSON body
+// is never read back; persisting them to the events bucket is the primary
+// cause of database bloat (~7.4 KB each at ~785 k rows = 7 GB).
+func isPlaybackProgressEvent(eventType string) bool {
+	return strings.EqualFold(strings.TrimSpace(eventType), "playbackprogress")
 }
 
 func isCatalogIndexEvent(eventType string) bool {

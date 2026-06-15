@@ -26,6 +26,10 @@ type TxRepository interface {
 	ListMediaBySubject(ctx context.Context, subjectType string, subjectID string) ([]domain.MediaItem, error)
 
 	AppendEvent(ctx context.Context, event domain.Event) error
+	// PruneEvents deletes all event records whose OccurredAt is strictly before
+	// olderThan. Returns the number of records deleted. Intended for periodic
+	// maintenance via the PruneEvents scheduled job.
+	PruneEvents(ctx context.Context, olderThan time.Time) (int, error)
 
 	EnqueueJob(ctx context.Context, job domain.JobRecord) error
 	GetJob(ctx context.Context, jobID string) (domain.JobRecord, bool, error)

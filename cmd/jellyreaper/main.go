@@ -49,6 +49,20 @@ const (
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
+	// Dispatch the `compact` subcommand before any server startup.
+	// Usage: jellyreaper compact <src.db> <dst.db>
+	if len(os.Args) >= 2 && os.Args[1] == "compact" {
+		if len(os.Args) != 4 {
+			fmt.Fprintf(os.Stderr, "usage: jellyreaper compact <src.db> <dst.db>\n")
+			os.Exit(1)
+		}
+		if err := runCompact(os.Args[2], os.Args[3]); err != nil {
+			logger.Error("compact failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	cfg, err := config.LoadFromEnv()
 	if err != nil {
 		logger.Error("load config", "error", err)
@@ -145,10 +159,10 @@ func main() {
 	hitlTimeout := time.Duration(cfg.DefaultHITLTimeoutHours) * time.Hour
 	sendHITLPromptHandler := handlers.NewSendHITLPromptHandler(store, logger, discordService, cfg.DiscordChannelID, hitlTimeout)
 	hitlTimeoutHandler := handlers.NewHITLTimeoutHandler(store, discordService, logger)
-	// reconcileOOBHandler is wired after appService is constructed (below).
-	// We hold a pointer so we can inject the reconciler once the service
-	// is ready (avoids a forward-reference cycle).
+	// reconcileOOBHandler and pruneEventsHandler are wired after appService is
+	// constructed (below) to avoid a forward-reference cycle.
 	reconcileOOBHandler := handlers.NewReconcileOOBHandler(nil, logger)
+	pruneEventsHandler := handlers.NewPruneEventsHandler(nil, cfg.EventRetention, logger)
 	handlerList := []jobs.JobHandler{
 		evaluatePolicyHandler,
 		sendHITLPromptHandler,
@@ -156,6 +170,7 @@ func main() {
 		executeDeleteHandler,
 		handlers.NewNoopHandler(domain.JobKindVerifyDelete, logger),
 		reconcileOOBHandler,
+		pruneEventsHandler,
 	}
 
 	registry, err := jobs.NewRegistry(handlerList...)
@@ -190,8 +205,10 @@ func main() {
 		assistant.SetDecisionService(appService)
 	}
 	appService.SetBackfillWriteBatching(cfg.BackfillWriteBatchSize, cfg.BackfillWriteBatchTimeout, cfg.BackfillWriteQueueCapacity)
-	// Wire the OOB reconciler now that appService is fully constructed.
+	// Wire the OOB reconciler and event pruner now that appService is fully
+	// constructed.
 	reconcileOOBHandler.SetReconciler(appService)
+	pruneEventsHandler.SetPruner(appService)
 	dispatcher := worker.NewDispatcher(store, registry, logger)
 	if cfg.DiscordChannelID != "" {
 		dispatcher.SetDeleteFailedNotifier(func(ctx context.Context, flow domain.Flow, deleteErr error) {
@@ -276,6 +293,10 @@ func main() {
 				if err := appService.ScheduleOOBReconcile(ctx, time.Now()); err != nil {
 					logger.Warn("failed to schedule startup oob reconcile", "error", err)
 				}
+				// Schedule a daily event-pruning run at startup as well.
+				if err := appService.SchedulePruneEvents(ctx, time.Now()); err != nil {
+					logger.Warn("failed to schedule startup prune events", "error", err)
+				}
 
 				go runBackfillLoop(ctx, logger, store, appService, discordService, cfg, backfillSvc, false)
 			}
@@ -356,6 +377,10 @@ func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.R
 			// The job is idempotent (daily key) so this is safe to call repeatedly.
 			if err := appService.ScheduleOOBReconcile(ctx, time.Now()); err != nil {
 				logger.Warn("failed to schedule oob reconcile", "error", err)
+			}
+			// Also schedule the daily event-prune job (idempotent daily key).
+			if err := appService.SchedulePruneEvents(ctx, time.Now()); err != nil {
+				logger.Warn("failed to schedule prune events", "error", err)
 			}
 		}
 	}
@@ -678,4 +703,55 @@ func maxBackfillTimestamp(a time.Time, b time.Time) time.Time {
 		return b
 	}
 	return a
+}
+
+// runCompact opens the bbolt database at srcPath (read-only) and compacts it
+// into a fresh database at dstPath using bbolt.Compact. It prints the before
+// and after sizes to stdout so the operator can confirm free-space reclamation.
+// The source database is never modified.
+func runCompact(srcPath, dstPath string) error {
+	srcInfo, err := os.Stat(srcPath)
+	if err != nil {
+		return fmt.Errorf("stat src %s: %w", srcPath, err)
+	}
+	srcSize := srcInfo.Size()
+
+	src, err := bbolt.Open(srcPath, 0o600, &bbolt.Options{
+		Timeout:  1 * time.Second,
+		ReadOnly: true,
+	})
+	if err != nil {
+		return fmt.Errorf("open src %s: %w", srcPath, err)
+	}
+	defer src.Close()
+
+	dst, err := bbolt.Open(dstPath, 0o600, &bbolt.Options{Timeout: 1 * time.Second})
+	if err != nil {
+		return fmt.Errorf("open dst %s: %w", dstPath, err)
+	}
+	defer dst.Close()
+
+	if err := bbolt.Compact(dst, src, 0); err != nil {
+		return fmt.Errorf("compact: %w", err)
+	}
+	if err := dst.Close(); err != nil {
+		return fmt.Errorf("close dst: %w", err)
+	}
+
+	dstInfo, err := os.Stat(dstPath)
+	if err != nil {
+		return fmt.Errorf("stat dst %s: %w", dstPath, err)
+	}
+	dstSize := dstInfo.Size()
+
+	saved := srcSize - dstSize
+	pct := 0.0
+	if srcSize > 0 {
+		pct = float64(saved) / float64(srcSize) * 100
+	}
+	fmt.Printf("compact: %s → %s\n", srcPath, dstPath)
+	fmt.Printf("  before: %d bytes (%.2f MB)\n", srcSize, float64(srcSize)/(1024*1024))
+	fmt.Printf("  after:  %d bytes (%.2f MB)\n", dstSize, float64(dstSize)/(1024*1024))
+	fmt.Printf("  saved:  %d bytes (%.1f%%)\n", saved, pct)
+	return nil
 }

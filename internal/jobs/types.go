@@ -42,6 +42,11 @@ type ReconcileItemPayload struct {
 	Source string `json:"source"`
 }
 
+// PruneEventsPayload carries metadata for the scheduled prune_events job.
+type PruneEventsPayload struct {
+	Source string `json:"source"`
+}
+
 func DecodePayload[T any](job domain.JobRecord) (T, error) {
 	var out T
 	if len(job.PayloadJSON) == 0 {
