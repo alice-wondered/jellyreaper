@@ -1290,6 +1290,159 @@ func TestPlaybackDuringDelayResolvesDelayAndReschedulesEval(t *testing.T) {
 	}
 }
 
+// TestTimestamplessPlaybackRegistersAsNow reproduces the production bug where a
+// live playback webhook carrying no embedded timestamp (no OccurredAt, no
+// LastPlayedAt, no date key in Raw — exactly what BuildWebhookEvent produces for
+// a bare PlaybackStart) failed to advance media.LastPlayedAt, leaving the review
+// clock stale so an actively-watched item stayed due for review.
+func TestTimestamplessPlaybackRegistersAsNow(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+	svc.SyncFlowManagerClock()
+
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:      "flow:target:movie:movie-tsless-1",
+			ItemID:      "target:movie:movie-tsless-1",
+			SubjectType: "movie",
+			DisplayName: "Timestampless",
+			State:       domain.FlowStateActive,
+			Version:     0,
+			PolicySnapshot: domain.PolicySnapshot{
+				ExpireAfterDays: 30,
+				HITLTimeoutHrs:  24,
+				TimeoutAction:   "delete",
+			},
+			NextActionAt: now, // imminently due for review
+			CreatedAt:    now.Add(-48 * time.Hour),
+			UpdatedAt:    now.Add(-48 * time.Hour),
+		}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID:    "movie-tsless-1",
+			ItemType:  "Movie",
+			Name:      "Timestampless",
+			UpdatedAt: now.Add(-48 * time.Hour),
+		})
+	}); err != nil {
+		t.Fatalf("seed flow/media: %v", err)
+	}
+
+	// Build via BuildWebhookEvent so the event mirrors the real HTTP ingestion
+	// path: OccurredAt unset, payload has no LastPlayedAt, raw has no date key.
+	event := jellyfin.BuildWebhookEvent(
+		jellyfin.WebhookPayload{ItemID: "movie-tsless-1", ItemType: "Movie", NotificationType: "PlaybackStart", EventID: "evt-tsless-1"},
+		map[string]any{"ItemId": "movie-tsless-1", "NotificationType": "PlaybackStart", "EventId": "evt-tsless-1"},
+	)
+	if err := svc.HandleJellyfinWebhook(context.Background(), event); err != nil {
+		t.Fatalf("playback webhook: %v", err)
+	}
+
+	var media domain.MediaItem
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
+		m, found, err := tx.GetMedia(context.Background(), "movie-tsless-1")
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatal("media not found after webhook")
+		}
+		media = m
+		return nil
+	}); err != nil {
+		t.Fatalf("read media: %v", err)
+	}
+	if !media.LastPlayedAt.Equal(now) {
+		t.Fatalf("timestampless play must register at now: got LastPlayedAt=%s want=%s", media.LastPlayedAt, now)
+	}
+	if media.PlayCountTotal != 1 {
+		t.Fatalf("PlaybackStart must count once: got PlayCountTotal=%d want=1", media.PlayCountTotal)
+	}
+
+	flow := mustGetFlow(t, store, "target:movie:movie-tsless-1")
+	wantNextAction := now.Add(30 * 24 * time.Hour)
+	if !flow.NextActionAt.Equal(wantNextAction) {
+		t.Fatalf("play must defer review by reviewDays: got NextActionAt=%s want=%s", flow.NextActionAt, wantNextAction)
+	}
+}
+
+// TestPlaybackProgressDoesNotInflatePlayCount verifies that repeated
+// PlaybackProgress heartbeats advance LastPlayedAt but do not increment
+// PlayCountTotal (only discrete start/stop events count as a play).
+func TestPlaybackProgressDoesNotInflatePlayCount(t *testing.T) {
+	store := newTestStore(t)
+	svc := NewService(store, nil, nil)
+	base := time.Date(2026, 5, 2, 9, 0, 0, 0, time.UTC)
+	cur := base
+	svc.now = func() time.Time { return cur }
+	svc.SyncFlowManagerClock()
+
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
+		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{
+			FlowID:         "flow:target:movie:movie-prog-1",
+			ItemID:         "target:movie:movie-prog-1",
+			SubjectType:    "movie",
+			DisplayName:    "Progress",
+			State:          domain.FlowStateActive,
+			Version:        0,
+			PolicySnapshot: domain.PolicySnapshot{ExpireAfterDays: 30, HITLTimeoutHrs: 24, TimeoutAction: "delete"},
+			NextActionAt:   base,
+			CreatedAt:      base.Add(-48 * time.Hour),
+			UpdatedAt:      base.Add(-48 * time.Hour),
+		}, 0); err != nil {
+			return err
+		}
+		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+			ItemID: "movie-prog-1", ItemType: "Movie", Name: "Progress", UpdatedAt: base.Add(-48 * time.Hour),
+		})
+	}); err != nil {
+		t.Fatalf("seed flow/media: %v", err)
+	}
+
+	// One discrete start, then several progress heartbeats.
+	for i, evt := range []struct {
+		typ string
+		id  string
+	}{
+		{"PlaybackStart", "evt-prog-start"},
+		{"PlaybackProgress", "evt-prog-1"},
+		{"PlaybackProgress", "evt-prog-2"},
+		{"PlaybackProgress", "evt-prog-3"},
+	} {
+		cur = base.Add(time.Duration(i) * time.Minute)
+		event := jellyfin.BuildWebhookEvent(
+			jellyfin.WebhookPayload{ItemID: "movie-prog-1", ItemType: "Movie", NotificationType: evt.typ, EventID: evt.id},
+			map[string]any{"ItemId": "movie-prog-1", "NotificationType": evt.typ, "EventId": evt.id},
+		)
+		if err := svc.HandleJellyfinWebhook(context.Background(), event); err != nil {
+			t.Fatalf("webhook %s: %v", evt.typ, err)
+		}
+	}
+
+	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
+		m, found, err := tx.GetMedia(context.Background(), "movie-prog-1")
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatal("media not found")
+		}
+		if m.PlayCountTotal != 1 {
+			t.Fatalf("only the discrete start counts: got PlayCountTotal=%d want=1", m.PlayCountTotal)
+		}
+		wantLastPlayed := base.Add(3 * time.Minute) // last progress tick
+		if !m.LastPlayedAt.Equal(wantLastPlayed) {
+			t.Fatalf("progress ticks must advance LastPlayedAt: got=%s want=%s", m.LastPlayedAt, wantLastPlayed)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read media: %v", err)
+	}
+}
+
 func TestBackfillReplayPreservesDelayedActiveFlowSchedule(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)

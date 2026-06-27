@@ -197,10 +197,16 @@ func TestWebhook_PlaybackProgress_OneEvent_NoEventRecord(t *testing.T) {
 		t.Error("expected PlaybackProgress dedupe key to be marked processed")
 	}
 
-	// Play state must have been updated on the media record.
+	// Play state must have been updated on the media record. PlaybackProgress
+	// advances LastPlayedAt (so active-watch detection stays current) but must
+	// NOT increment PlayCountTotal — only discrete start/stop events count as a
+	// play, otherwise high-frequency heartbeats inflate the count.
 	media := mustGetMedia(t, store, itemID)
-	if media.PlayCountTotal == 0 {
-		t.Error("expected PlayCountTotal to be incremented by PlaybackProgress")
+	if !media.LastPlayedAt.Equal(now) {
+		t.Errorf("expected PlaybackProgress to advance LastPlayedAt to %s, got %s", now, media.LastPlayedAt)
+	}
+	if media.PlayCountTotal != 0 {
+		t.Errorf("expected PlaybackProgress not to increment PlayCountTotal, got %d", media.PlayCountTotal)
 	}
 }
 

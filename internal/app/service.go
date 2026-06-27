@@ -669,7 +669,17 @@ type pendingPlayedRecovery struct {
 }
 
 func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.WebhookEvent, now time.Time) (string, []targetRef, []hitlFinalizeRequest, error) {
-	eventAt, _ := sourceTimestampForJellyfinEvent(event)
+	eventAt, ok := sourceTimestampForJellyfinEvent(event)
+	if !ok {
+		// A live webhook with no embedded timestamp (common for PlaybackStart/
+		// PlaybackProgress, whose payloads often omit LastPlayedAt) occurred ~now.
+		// Without this, eventAt stays zero and the playback media-update below
+		// never advances LastPlayedAt, so the review clock treats an actively-
+		// watched item as never played. now already equals the resolved source
+		// timestamp when one exists (see HandleJellyfinWebhook), so this only
+		// affects the unresolved case.
+		eventAt = now
+	}
 	playbackEvent := isPlaybackEvent(event.EventType)
 	catalogIndexEvent := isCatalogIndexEvent(event.EventType)
 	removalEvent := isRemovalEvent(event.EventType)
@@ -875,7 +885,13 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 			if eventAt.After(media.LastPlayedAt) {
 				media.LastPlayedAt = eventAt
 			}
-			media.PlayCountTotal++
+			// PlaybackProgress fires repeatedly during a single watch; counting
+			// each heartbeat inflates PlayCountTotal. Only discrete play events
+			// (start/stop) represent a play. Progress ticks still advance
+			// LastPlayedAt above so active-watch detection stays current.
+			if !isPlaybackProgressEvent(event.EventType) {
+				media.PlayCountTotal++
+			}
 			if eventAt.After(media.LastPlaybackEventAt) {
 				media.LastPlaybackEventAt = eventAt
 			}
