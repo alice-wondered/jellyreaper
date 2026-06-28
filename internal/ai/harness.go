@@ -222,6 +222,7 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 		"Example queries you should handle with tools: 'what is the next item up for review?', 'how many scooby doo movies do we have?', 'how many tv shows do we have right now?', 'show me all RWBY targets and states', 'how many seasons of The Magicians are tracked', 'which scooby titles are archived vs active', 'what has not been played recently'.",
 		"For examples above: use list_ready for next-up; use query_library for counts/state/listing/last-played context; use fuzzy_search_targets + query_target_state when a single target needs deeper inspection.",
 		"Use schedule_delete for deletion requests; rely on domain logic for item vs projection delete semantics.",
+		"Anime movie download workflow: when the user wants to download an anime movie via Nyaa, use search_nyaa then add_to_qbit with save_path=/data/downloads/torrent. The movie must already be added to Radarr first (so Radarr can auto-import when the download completes). Remind the user to add it to Radarr if they haven't.",
 		"When asked to change how long HITL waits before timeout, use set_hitl_timeout_hours.",
 		"When asked 'what is next up for review', call list_ready with limit=1.",
 		"When asked for counts, do not guess; call query_library first.",
@@ -274,7 +275,7 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 				"type": "object",
 				"properties": map[string]any{
 					"magnet_or_url": map[string]any{"type": "string", "description": "Magnet link or direct .torrent URL"},
-					"save_path":     map[string]any{"type": "string", "description": "Override save path (omit to use default anime movies folder)"},
+					"save_path":     map[string]any{"type": "string", "description": "Override save path. Use /data/downloads/torrent for anime movies (manual import via Radarr after download). Omit to use the configured default (anime series)."},
 				},
 				"required": []string{"magnet_or_url"},
 			},
