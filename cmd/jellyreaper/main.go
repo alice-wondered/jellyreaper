@@ -25,6 +25,8 @@ import (
 
 	"jellyreaper/internal/config"
 	"jellyreaper/internal/domain"
+	"jellyreaper/internal/nyaa"
+	"jellyreaper/internal/qbit"
 	api "jellyreaper/internal/http"
 	"jellyreaper/internal/jobs"
 	"jellyreaper/internal/jobs/handlers"
@@ -222,6 +224,11 @@ func main() {
 	}
 	if assistant != nil {
 		assistant.SetDecisionService(appService)
+		assistant.SetNyaaService(nyaa.NewService(cfg.NyaaTrustedOnly))
+		if cfg.QbitURL != "" {
+			assistant.SetQbitService(qbit.NewService(cfg.QbitURL, cfg.QbitUsername, cfg.QbitPassword), cfg.QbitAnimePath)
+			logger.Info("qbit service enabled")
+		}
 	}
 	appService.SetBackfillWriteBatching(cfg.BackfillWriteBatchSize, cfg.BackfillWriteBatchTimeout, cfg.BackfillWriteQueueCapacity)
 	// Wire the OOB reconciler and event pruner now that appService is fully

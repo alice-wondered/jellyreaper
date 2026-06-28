@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"jellyreaper/internal/domain"
+	"jellyreaper/internal/nyaa"
+	"jellyreaper/internal/qbit"
 	"jellyreaper/internal/repo"
 )
 
@@ -29,6 +31,10 @@ type Harness struct {
 	model      string
 	logger     *slog.Logger
 	decision   DecisionService
+
+	nyaa          *nyaa.Service
+	qbit          *qbit.Service
+	qbitAnimePath string
 
 	mu                sync.Mutex
 	history           map[string]*ringBuffer
@@ -134,6 +140,13 @@ func (h *Harness) SetDecisionService(decision DecisionService) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.decision = decision
+}
+
+func (h *Harness) SetNyaaService(s *nyaa.Service) { h.nyaa = s }
+
+func (h *Harness) SetQbitService(s *qbit.Service, animePath string) {
+	h.qbit = s
+	h.qbitAnimePath = animePath
 }
 
 func (h *Harness) SetMaxThreadContexts(max int) {
@@ -242,6 +255,30 @@ func (h *Harness) respondBestEffort(ctx context.Context, threadID string, userNa
 		{Name: "set_review_days", Description: "Set policy review period in days for active flows.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"days": map[string]any{"type": "integer", "minimum": 1, "maximum": 3650}}, "required": []string{"days"}}},
 		{Name: "set_defer_days", Description: "Set default defer period in days.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"days": map[string]any{"type": "integer", "minimum": 1, "maximum": 365}}, "required": []string{"days"}}},
 		{Name: "set_hitl_timeout_hours", Description: "Set default HITL review timeout in hours before timeout action.", Parameters: map[string]any{"type": "object", "properties": map[string]any{"hours": map[string]any{"type": "integer", "minimum": 1, "maximum": 8760}}, "required": []string{"hours"}}},
+		{
+			Name:        "search_nyaa",
+			Description: "Search Nyaa.si for anime torrents. Returns numbered results with title, size, seeders, and magnet link. Use this when the user asks to find or grab an anime movie or episode from Nyaa.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"query": map[string]any{"type": "string", "description": "Search query, e.g. 'Jujutsu Kaisen 0 1080p'"},
+					"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 10, "description": "Max results to return (default 5)"},
+				},
+				"required": []string{"query"},
+			},
+		},
+		{
+			Name:        "add_to_qbit",
+			Description: "Send a torrent magnet link or .torrent URL to qBittorrent. Downloads into the Radarr anime movies folder by default. Use after the user picks a result from search_nyaa.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"magnet_or_url": map[string]any{"type": "string", "description": "Magnet link or direct .torrent URL"},
+					"save_path":     map[string]any{"type": "string", "description": "Override save path (omit to use default anime movies folder)"},
+				},
+				"required": []string{"magnet_or_url"},
+			},
+		},
 	}
 
 	messages := []ChatMessage{{Role: "system", Content: system}, {Role: "user", Content: userPrompt}}
@@ -454,6 +491,69 @@ func (h *Harness) executeToolCall(ctx context.Context, threadID string, toolName
 			return "", "", err
 		}
 		return h.setHITLTimeoutHours(ctx, args.Hours)
+	case "search_nyaa":
+		type args struct {
+			Query string `json:"query"`
+			Limit int    `json:"limit"`
+		}
+		a, err := decodeToolArgs[args](rawArguments)
+		if err != nil {
+			return "", "", err
+		}
+		if h.nyaa == nil {
+			return `{"error":"nyaa service not configured"}`, "", nil
+		}
+		limit := a.Limit
+		if limit <= 0 {
+			limit = 5
+		}
+		results, err := h.nyaa.Search(ctx, a.Query, limit)
+		if err != nil {
+			return fmt.Sprintf(`{"error":%q}`, err.Error()), "", nil
+		}
+		if len(results) == 0 {
+			return `{"results":[]}`, "No results found on Nyaa for that query.", nil
+		}
+		type jsonResult struct {
+			Index   int    `json:"index"`
+			Title   string `json:"title"`
+			Size    string `json:"size"`
+			Seeders int    `json:"seeders"`
+			Magnet  string `json:"magnet"`
+		}
+		jResults := make([]jsonResult, len(results))
+		for i, r := range results {
+			jResults[i] = jsonResult{Index: i + 1, Title: r.Title, Size: r.Size, Seeders: r.Seeders, Magnet: r.Magnet}
+		}
+		toolJSON, _ := json.Marshal(map[string]any{"results": jResults})
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("**Nyaa results for `%s`:**\n", a.Query))
+		for i, r := range results {
+			sb.WriteString(fmt.Sprintf("%d. **%s** — %s, %d seeders\n", i+1, r.Title, r.Size, r.Seeders))
+		}
+		return string(toolJSON), sb.String(), nil
+
+	case "add_to_qbit":
+		type args struct {
+			MagnetOrURL string `json:"magnet_or_url"`
+			SavePath    string `json:"save_path"`
+		}
+		a, err := decodeToolArgs[args](rawArguments)
+		if err != nil {
+			return "", "", err
+		}
+		if h.qbit == nil || !h.qbit.Enabled() {
+			return `{"error":"qbit service not configured"}`, "", nil
+		}
+		savePath := a.SavePath
+		if savePath == "" {
+			savePath = h.qbitAnimePath
+		}
+		if err := h.qbit.AddTorrent(ctx, a.MagnetOrURL, savePath, "radarr"); err != nil {
+			return fmt.Sprintf(`{"error":%q}`, err.Error()), "", nil
+		}
+		return `{"status":"ok"}`, "Torrent sent to qBittorrent.", nil
+
 	default:
 		return "", "", fmt.Errorf("unknown tool: %s", toolName)
 	}

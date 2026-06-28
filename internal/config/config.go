@@ -59,6 +59,11 @@ type Config struct {
 	RadarrAPIKey         string
 	SonarrURL            string
 	SonarrAPIKey         string
+	QbitURL              string
+	QbitUsername         string
+	QbitPassword         string
+	QbitAnimePath        string
+	NyaaTrustedOnly      bool
 
 	BackfillEnabled            bool
 	BackfillInterval           time.Duration
@@ -152,6 +157,15 @@ func LoadFromEnv() (Config, error) {
 		backfillPlaybackEnabled = parsed
 	}
 
+	nyaaTrustedOnly := false
+	if raw := strings.TrimSpace(os.Getenv("NYAA_TRUSTED_ONLY")); raw != "" {
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse NYAA_TRUSTED_ONLY: %w", err)
+		}
+		nyaaTrustedOnly = parsed
+	}
+
 	backfillWriteBatchSize := defaultBackfillWriteBatchSize
 	if raw := strings.TrimSpace(os.Getenv("BACKFILL_WRITE_BATCH_SIZE")); raw != "" {
 		parsed, err := strconv.Atoi(raw)
@@ -226,6 +240,11 @@ func LoadFromEnv() (Config, error) {
 		RadarrAPIKey:         strings.TrimSpace(os.Getenv("RADARR_API_KEY")),
 		SonarrURL:            strings.TrimSpace(os.Getenv("SONARR_URL")),
 		SonarrAPIKey:         strings.TrimSpace(os.Getenv("SONARR_API_KEY")),
+		QbitURL:              strings.TrimSpace(os.Getenv("QBIT_URL")),
+		QbitUsername:         strings.TrimSpace(os.Getenv("QBIT_USERNAME")),
+		QbitPassword:         strings.TrimSpace(os.Getenv("QBIT_PASSWORD")),
+		QbitAnimePath:        strings.TrimSpace(os.Getenv("QBIT_ANIME_PATH")),
+		NyaaTrustedOnly:      nyaaTrustedOnly,
 
 		BackfillEnabled:            backfillEnabled,
 		BackfillInterval:           backfillInterval,
