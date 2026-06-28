@@ -37,7 +37,7 @@ func (s *Service) Search(ctx context.Context, query string, limit int) ([]Result
 	if s.trustedOnly {
 		filter = "2"
 	}
-	u := "https://nyaa.si/?page=rss&c=2_0&f=" + filter + "&q=" + url.QueryEscape(query)
+	u := "https://nyaa.si/?page=rss&c=1_0&f=" + filter + "&q=" + url.QueryEscape(query)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
