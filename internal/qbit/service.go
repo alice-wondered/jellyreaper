@@ -51,8 +51,10 @@ func (s *Service) AddTorrent(ctx context.Context, magnetOrURL, savePath, categor
 	}
 	defer loginResp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(loginResp.Body, 256))
-	if strings.TrimSpace(string(body)) != "Ok." {
-		return fmt.Errorf("qbit login failed: %s", strings.TrimSpace(string(body)))
+	// qBittorrent <5 returns 200 + "Ok.", v5+ returns 204 No Content
+	bodyStr := strings.TrimSpace(string(body))
+	if loginResp.StatusCode != http.StatusNoContent && bodyStr != "Ok." {
+		return fmt.Errorf("qbit login failed: %s", bodyStr)
 	}
 
 	var buf strings.Builder
