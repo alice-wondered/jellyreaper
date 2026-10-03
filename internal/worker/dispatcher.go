@@ -33,6 +33,14 @@ type Dispatcher struct {
 	logger             *slog.Logger
 	now                func() time.Time
 	notifyDeleteFailed DeleteFailedNotifier
+	deleteGate         DeleteGate
+}
+
+// DeleteGate reports whether delete-producing jobs may run now. A closed
+// gate defers them; it never fails them.
+type DeleteGate struct {
+	Allowed   func() bool
+	RecheckIn time.Duration
 }
 
 func NewDispatcher(repository repo.Repository, registry *jobs.Registry, logger *slog.Logger) *Dispatcher {
@@ -53,7 +61,16 @@ func (d *Dispatcher) SetDeleteFailedNotifier(notifier DeleteFailedNotifier) {
 	d.notifyDeleteFailed = notifier
 }
 
+// SetDeleteGate holds hitl_timeout (the unattended delete trigger) and
+// execute_delete while the gate is closed.
+func (d *Dispatcher) SetDeleteGate(gate DeleteGate) {
+	d.deleteGate = gate
+}
+
 func (d *Dispatcher) Dispatch(ctx context.Context, job domain.JobRecord) error {
+	if d.gated(job) {
+		return d.deferGated(ctx, job, d.now().Add(d.deleteGate.RecheckIn))
+	}
 	handler, ok := d.registry.Get(job.Kind)
 	if !ok {
 		err := fmt.Errorf("unknown job kind %q", job.Kind)
@@ -109,6 +126,36 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job domain.JobRecord) error {
 	fields := []any{"lex", jobLogLexicon(job.Kind), "kind", job.Kind, "job_id", job.JobID, "flow_id", job.FlowID, "item_id", job.ItemID}
 	fields = append(fields, d.jobOutcomeFields(ctx, job)...)
 	d.logger.Info("job completed", fields...)
+	return nil
+}
+
+func (d *Dispatcher) gated(job domain.JobRecord) bool {
+	if d.deleteGate.Allowed == nil || d.deleteGate.Allowed() {
+		return false
+	}
+	return job.Kind == domain.JobKindHITLTimeout || job.Kind == domain.JobKindExecuteDelete
+}
+
+// deferGated releases the lease and requeues without touching Attempts: a held
+// job has not failed, and burning retries here would turn a long outage into
+// terminal DeleteFailed flows.
+func (d *Dispatcher) deferGated(ctx context.Context, job domain.JobRecord, runAt time.Time) error {
+	err := d.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
+		current, found, err := tx.GetJob(ctx, job.JobID)
+		if err != nil || !found {
+			return err
+		}
+		current.Status = domain.JobStatusPending
+		current.RunAt = runAt
+		current.LeaseOwner = ""
+		current.LeaseUntil = time.Time{}
+		current.UpdatedAt = d.now().UTC()
+		return tx.UpdateJob(ctx, current)
+	})
+	if err != nil {
+		return fmt.Errorf("defer gated job %s: %w", job.JobID, err)
+	}
+	d.logger.Info("job deferred: deletes gated", "lex", jobLogLexicon(job.Kind), "kind", job.Kind, "job_id", job.JobID, "item_id", job.ItemID, "run_at", runAt)
 	return nil
 }
 

@@ -89,6 +89,26 @@ func (c *Client) DeleteItem(ctx context.Context, itemID string) error {
 	return fmt.Errorf("jellyfin delete failed with status %d", resp.StatusCode)
 }
 
+// Ping hits the authenticated /System/Info so "up" means usable by the
+// backfill and delete paths, not just reachable.
+func (c *Client) Ping(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/System/Info", nil)
+	if err != nil {
+		return fmt.Errorf("build jellyfin ping request: %w", err)
+	}
+	req.Header.Set("X-Emby-Token", c.apiKey)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("perform jellyfin ping: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("jellyfin ping returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func (c *Client) FetchProviderIDs(ctx context.Context, itemID string) (map[string]string, error) {
 	if txguard.InTx(ctx) {
 		return nil, fmt.Errorf("jellyfin fetch provider ids %q: %w", itemID, ErrIOInTransaction)

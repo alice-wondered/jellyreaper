@@ -45,6 +45,41 @@ func (m *FlowManager) SetNowFunc(fn func() time.Time) {
 	m.now = fn
 }
 
+// ExtendDecisionDeadlines gives every pending HITL decision back the time an
+// outage took from it: deadline := max(deadline+outage, now+minWindow). The
+// flow version is deliberately NOT bumped, so the queued hitl_timeout job
+// stays valid; when it fires before the new deadline the timeout handler
+// re-defers itself to it.
+func (m *FlowManager) ExtendDecisionDeadlines(ctx context.Context, outage, minWindow time.Duration) (int, error) {
+	now := m.now()
+	floor := now.Add(minWindow)
+	extended := 0
+	err := m.repo.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
+		extended = 0
+		flows, err := tx.ListFlows(ctx)
+		if err != nil {
+			return err
+		}
+		for _, flow := range flows {
+			if flow.State != domain.FlowStatePendingReview || flow.DecisionDeadlineAt.IsZero() {
+				continue
+			}
+			deadline := flow.DecisionDeadlineAt.Add(outage)
+			if deadline.Before(floor) {
+				deadline = floor
+			}
+			flow.DecisionDeadlineAt = deadline
+			flow.UpdatedAt = now
+			if err := tx.UpsertFlowCAS(ctx, flow, flow.Version); err != nil {
+				return err
+			}
+			extended++
+		}
+		return nil
+	})
+	return extended, err
+}
+
 // TransitionResult captures side-effects that must happen after the tx
 // commits. Callers inspect this and perform Discord I/O, wake signals, etc.
 type TransitionResult struct {

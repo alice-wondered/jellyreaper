@@ -28,6 +28,7 @@ import (
 	"jellyreaper/internal/nyaa"
 	"jellyreaper/internal/qbit"
 	api "jellyreaper/internal/http"
+	"jellyreaper/internal/heartbeat"
 	"jellyreaper/internal/jellyseerr"
 	"jellyreaper/internal/jobs"
 	"jellyreaper/internal/jobs/handlers"
@@ -264,7 +265,15 @@ func main() {
 	schedulerObj := scheduler.NewScheduler(schedulerLoop, wake)
 	evaluatePolicyHandler.SetEvalScheduler(schedulerObj)
 	sendHITLPromptHandler.SetEvalScheduler(schedulerObj)
-	hitlTimeoutHandler.SetFlowManager(scheduler.NewFlowManager(store, schedulerObj, logger))
+	flowManager := scheduler.NewFlowManager(store, schedulerObj, logger)
+	hitlTimeoutHandler.SetFlowManager(flowManager)
+	monitor := heartbeat.NewMonitor(store, jellyfin.NewClient(cfg.JellyfinURL, cfg.JellyfinAPIKey, nil), flowManager, heartbeat.Config{
+		Interval:         cfg.HeartbeatInterval,
+		Grace:            cfg.OutageGrace,
+		MinWindow:        hitlTimeout,
+		AssumedLastAlive: cfg.AssumeLastAliveAt,
+	}, logger)
+	dispatcher.SetDeleteGate(worker.DeleteGate{Allowed: monitor.DeletesAllowed, RecheckIn: cfg.HeartbeatInterval})
 	appService.SetEvalScheduler(schedulerObj)
 
 	if len(cfg.DiscordPublicKey) == 0 {
@@ -286,6 +295,12 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	if err := monitor.Startup(ctx); err != nil {
+		logger.Error("heartbeat startup failed; refusing to start with unshifted deadlines", "error", err)
+		os.Exit(1)
+	}
+
+	backfillRunning := false
 	if cfg.BackfillEnabled {
 		if cfg.JellyfinURL == "" || cfg.JellyfinAPIKey == "" {
 			logger.Warn("backfill enabled but jellyfin credentials are incomplete; skipping backfill startup")
@@ -313,10 +328,12 @@ func main() {
 					)
 				})
 
+				backfillRunning = true
 				logger.Info("running startup backfill before scheduler/http")
 				if err := runBackfillOnce(ctx, logger, store, appService, discordService, cfg, backfillSvc, true); err != nil {
-					logger.Warn("startup backfill run failed", "error", err)
+					logger.Warn("startup backfill run failed; deletes stay gated until a backfill succeeds", "error", err)
 				} else {
+					monitor.MarkReconciled()
 					logNextQueuedJob(ctx, logger, store)
 				}
 				// Schedule a reconciliation run after startup backfill so stale
@@ -329,10 +346,17 @@ func main() {
 					logger.Warn("failed to schedule startup prune events", "error", err)
 				}
 
-				go runBackfillLoop(ctx, logger, store, appService, discordService, cfg, backfillSvc, false)
+				go runBackfillLoop(ctx, logger, store, appService, discordService, cfg, backfillSvc, false, monitor.MarkReconciled)
 			}
 		}
 	}
+
+	if !backfillRunning {
+		// Nothing will ever reconcile plays, so gating on it would hold deletes forever.
+		logger.Warn("backfill not running; deletes gated on jellyfin reachability only")
+		monitor.MarkReconciled()
+	}
+	go monitor.Run(ctx)
 
 	// One-time startup reconciliation catches flows that got stuck in a
 	// prior run (e.g. pending_review with no HITL prompt, or active flows
@@ -379,7 +403,7 @@ func main() {
 }
 
 // can we somehow combine this with the "run backfill once" logic? This feels like a weird split in our code
-func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.Repository, appService *app.Service, discordService *discord.Service, cfg config.Config, backfillSvc *jellyfin.BackfillService, runStartup bool) {
+func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.Repository, appService *app.Service, discordService *discord.Service, cfg config.Config, backfillSvc *jellyfin.BackfillService, runStartup bool, onReconciled func()) {
 	if cfg.DiscordChannelID != "" {
 		if err := discordService.SendSystemMessage(cfg.DiscordChannelID, "Starting Jellyfin backfill and reconciliation run."); err != nil {
 			logger.Warn("failed to send backfill start announcement", "error", err)
@@ -390,6 +414,7 @@ func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.R
 		if err := runBackfillOnce(ctx, logger, repository, appService, discordService, cfg, backfillSvc, true); err != nil {
 			logger.Warn("startup backfill run failed", "error", err)
 		} else {
+			onReconciled()
 			logNextQueuedJob(ctx, logger, repository)
 		}
 	}
@@ -403,6 +428,8 @@ func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.R
 		case <-ticker.C:
 			if err := runBackfillOnce(ctx, logger, repository, appService, discordService, cfg, backfillSvc, false); err != nil {
 				logger.Warn("periodic backfill run failed", "error", err)
+			} else {
+				onReconciled()
 			}
 			// After each backfill cycle, schedule an OOB deletion reconcile job.
 			// The job is idempotent (daily key) so this is safe to call repeatedly.

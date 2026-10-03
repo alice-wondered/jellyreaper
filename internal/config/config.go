@@ -69,6 +69,9 @@ type Config struct {
 
 	BackfillEnabled            bool
 	BackfillInterval           time.Duration
+	HeartbeatInterval          time.Duration
+	OutageGrace                time.Duration
+	AssumeLastAliveAt          time.Time
 	BackfillLookback           time.Duration
 	BackfillOverlap            time.Duration
 	BackfillLimit              int32
@@ -110,6 +113,20 @@ func LoadFromEnv() (Config, error) {
 		jellyfinURL = "http://" + host + ":" + jellyfinPort
 	}
 
+	heartbeatInterval, err := parseDurationEnv("HEARTBEAT_INTERVAL", time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	outageGrace, err := parseDurationEnv("OUTAGE_GRACE", 10*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
+	var assumeLastAliveAt time.Time
+	if raw := strings.TrimSpace(os.Getenv("ASSUME_LAST_ALIVE_AT")); raw != "" {
+		if assumeLastAliveAt, err = time.Parse(time.RFC3339, raw); err != nil {
+			return Config{}, fmt.Errorf("ASSUME_LAST_ALIVE_AT must be RFC3339 (e.g. 2026-09-04T00:55:00Z): %w", err)
+		}
+	}
 	backfillInterval, err := parseDurationEnv("BACKFILL_INTERVAL", defaultBackfillInterval)
 	if err != nil {
 		return Config{}, err
@@ -252,6 +269,9 @@ func LoadFromEnv() (Config, error) {
 
 		BackfillEnabled:            backfillEnabled,
 		BackfillInterval:           backfillInterval,
+		HeartbeatInterval:          heartbeatInterval,
+		OutageGrace:                outageGrace,
+		AssumeLastAliveAt:          assumeLastAliveAt,
 		BackfillLookback:           backfillLookback,
 		BackfillOverlap:            backfillOverlap,
 		BackfillLimit:              backfillLimit,
