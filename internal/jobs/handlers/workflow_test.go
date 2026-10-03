@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	"jellyreaper/internal/discord"
 	"jellyreaper/internal/domain"
 	"jellyreaper/internal/jellyfin"
+	"jellyreaper/internal/jellyseerr"
 	"jellyreaper/internal/radarr"
 	"jellyreaper/internal/repo"
 	bboltrepo "jellyreaper/internal/repo/bbolt"
@@ -61,6 +63,20 @@ func (s *arrRemovalSpy) RemoveSeasonByProviderIDs(_ context.Context, providerIDs
 	return s.err
 }
 
+type jellyseerrSpy struct {
+	calls int
+	kind  jellyseerr.MediaKind
+	tmdb  string
+	err   error
+}
+
+func (s *jellyseerrSpy) ClearMedia(_ context.Context, kind jellyseerr.MediaKind, providerIDs map[string]string) error {
+	s.calls++
+	s.kind = kind
+	s.tmdb = providerIDs["tmdb"]
+	return s.err
+}
+
 func TestExecuteDeleteHandlerTransitionsToDeleted(t *testing.T) {
 	store := testStore(t)
 	now := time.Now().UTC()
@@ -92,6 +108,8 @@ func TestExecuteDeleteHandlerTransitionsToDeleted(t *testing.T) {
 
 	client := jellyfin.NewClient(server.URL, "api-key", server.Client())
 	h := NewExecuteDeleteHandler(store, client)
+	seerr := &jellyseerrSpy{}
+	h.SetJellyseerrService(seerr)
 
 	err := h.Handle(context.Background(), domain.JobRecord{JobID: "job1", ItemID: "item1", IdempotencyKey: "dedupe:1"})
 	if err != nil {
@@ -99,6 +117,9 @@ func TestExecuteDeleteHandlerTransitionsToDeleted(t *testing.T) {
 	}
 	if !deleteCalled {
 		t.Fatal("expected jellyfin delete call")
+	}
+	if seerr.calls != 0 {
+		t.Fatalf("expected no jellyseerr clear for an item of unknown type, got %d", seerr.calls)
 	}
 
 	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
@@ -159,9 +180,14 @@ func TestExecuteDeleteHandlerMovieProjectionTriggersRadarrRemoval(t *testing.T) 
 	radarrSpy := &arrRemovalSpy{}
 	h := NewExecuteDeleteHandler(store, jellyfin.NewClient(server.URL, "api-key", server.Client()))
 	h.SetRadarrService(radarrSpy)
+	seerr := &jellyseerrSpy{err: errors.New("jellyseerr down")}
+	h.SetJellyseerrService(seerr)
 
 	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-arr-movie", ItemID: "target:movie:mv-arr", IdempotencyKey: "dedupe:arr-movie"}); err != nil {
-		t.Fatalf("execute movie delete: %v", err)
+		t.Fatalf("expected jellyseerr failure not to fail the delete job, got %v", err)
+	}
+	if seerr.calls != 1 || seerr.kind != jellyseerr.MediaKindMovie || seerr.tmdb != "603" {
+		t.Fatalf("expected one movie clear for tmdb 603, got calls=%d kind=%q tmdb=%q", seerr.calls, seerr.kind, seerr.tmdb)
 	}
 	if radarrSpy.calls != 1 {
 		t.Fatalf("expected one radarr removal call, got %d", radarrSpy.calls)
@@ -213,9 +239,14 @@ func TestExecuteDeleteHandlerSeasonProjectionTriggersSonarrSeasonRemoval(t *test
 	sonarrSpy := &arrRemovalSpy{}
 	h := NewExecuteDeleteHandler(store, jellyfin.NewClient(server.URL, "api-key", server.Client()))
 	h.SetSonarrService(sonarrSpy)
+	seerr := &jellyseerrSpy{}
+	h.SetJellyseerrService(seerr)
 
 	if err := h.Handle(context.Background(), domain.JobRecord{JobID: "job-arr-season", ItemID: "target:season:season-arr", IdempotencyKey: "dedupe:arr-season"}); err != nil {
 		t.Fatalf("execute season delete: %v", err)
+	}
+	if seerr.calls != 1 || seerr.kind != jellyseerr.MediaKindTV || seerr.tmdb != "2316" {
+		t.Fatalf("expected one tv clear for series tmdb 2316, got calls=%d kind=%q tmdb=%q", seerr.calls, seerr.kind, seerr.tmdb)
 	}
 	if sonarrSpy.calls != 1 {
 		t.Fatalf("expected one sonarr season removal call for season projection, got %d", sonarrSpy.calls)

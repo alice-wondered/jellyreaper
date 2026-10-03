@@ -86,34 +86,95 @@ func (s *Service) RemoveSeasonByProviderIDs(ctx context.Context, providerIDs map
 			return err
 		}
 	}
-	body, err := json.Marshal(map[string]any{"episodeIds": episodeIDs, "monitored": false})
+	s.logger.Info("sonarr season delete unmonitoring season", "lex", "SONARR-DELETE", "series_id", series.ID, "season_number", seasonNumber, "endpoint", "/api/v3/series/{id}")
+	gone, err := s.unmonitorSeason(ctx, series.ID, seasonNumber)
 	if err != nil {
-		return fmt.Errorf("encode sonarr season monitor payload: %w", err)
+		return err
 	}
-	endpoint := fmt.Sprintf("%s/api/v3/episode/monitor", s.baseURL)
-	s.logger.Info("sonarr season delete unmonitoring episodes", "lex", "SONARR-DELETE", "series_id", series.ID, "season_number", seasonNumber, "episode_count", len(episodeIDs), "endpoint", "/api/v3/episode/monitor")
+	if gone {
+		s.logger.Info("sonarr season delete already gone", "lex", "SONARR-DELETE", "series_id", series.ID, "season_number", seasonNumber)
+		return nil
+	}
+	s.logger.Info("sonarr season delete complete", "lex", "SONARR-DELETE", "series_id", series.ID, "season_number", seasonNumber, "episode_count", len(episodeIDs), "episode_file_count", len(episodeFileIDs))
+	return nil
+}
+
+// unmonitorSeason flips the season-level monitored flag rather than the
+// episodes'. Sonarr cascades season→episode monitoring only when the season
+// flag changes (SeriesService.UpdateSeries), so leaving the season monitored
+// with unmonitored episodes makes a later Jellyseerr re-request (which sets
+// the season monitored=true) a no-op that never re-monitors or searches.
+// Returns gone=true when Sonarr 404s (series removed between list and update).
+func (s *Service) unmonitorSeason(ctx context.Context, seriesID, seasonNumber int) (gone bool, err error) {
+	endpoint := fmt.Sprintf("%s/api/v3/series/%d", s.baseURL, seriesID)
+	series, gone, err := s.getSeriesRaw(ctx, endpoint)
+	if err != nil || gone {
+		return gone, err
+	}
+	seasons, _ := series["seasons"].([]any)
+	matched := false
+	for _, raw := range seasons {
+		season, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if n, ok := season["seasonNumber"].(json.Number); ok && n.String() == strconv.Itoa(seasonNumber) {
+			season["monitored"] = false
+			matched = true
+		}
+	}
+	if !matched {
+		return false, fmt.Errorf("%w: season %d missing from sonarr series %d", ErrNotManaged, seasonNumber, seriesID)
+	}
+	body, err := json.Marshal(series)
+	if err != nil {
+		return false, fmt.Errorf("encode sonarr series update payload: %w", err)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("build sonarr season monitor request: %w", err)
+		return false, fmt.Errorf("build sonarr series update request: %w", err)
 	}
 	req.Header.Set("X-Api-Key", s.apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("perform sonarr season monitor request: %w", err)
+		return false, fmt.Errorf("perform sonarr series update request: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		s.logger.Info("sonarr season delete complete", "lex", "SONARR-DELETE", "series_id", series.ID, "season_number", seasonNumber, "episode_count", len(episodeIDs), "episode_file_count", len(episodeFileIDs))
-		return nil
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		return false, nil
+	case resp.StatusCode == http.StatusNotFound:
+		return true, nil
 	}
-	// 404 — series/season/episodes already gone in Sonarr between our list
-	// and our monitor PUT. Idempotent success.
+	return false, fmt.Errorf("sonarr series update returned status %d", resp.StatusCode)
+}
+
+// getSeriesRaw keeps the full resource as untyped JSON: PUT /series replaces
+// the whole series, so every field we don't model must round-trip unchanged.
+func (s *Service) getSeriesRaw(ctx context.Context, endpoint string) (series map[string]any, gone bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("build sonarr series get request: %w", err)
+	}
+	req.Header.Set("X-Api-Key", s.apiKey)
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return nil, false, fmt.Errorf("perform sonarr series get request: %w", err)
+	}
+	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		s.logger.Info("sonarr season delete already gone", "lex", "SONARR-DELETE", "series_id", series.ID, "season_number", seasonNumber)
-		return nil
+		return nil, true, nil
 	}
-	return fmt.Errorf("sonarr season monitor returned status %d", resp.StatusCode)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, false, fmt.Errorf("sonarr series get returned status %d", resp.StatusCode)
+	}
+	dec := json.NewDecoder(io.LimitReader(resp.Body, 8<<20))
+	dec.UseNumber()
+	if err := dec.Decode(&series); err != nil {
+		return nil, false, fmt.Errorf("decode sonarr series get response: %w", err)
+	}
+	return series, false, nil
 }
 
 func (s *Service) findSeries(ctx context.Context, providerIDs map[string]string) (seriesResource, bool, error) {

@@ -13,6 +13,7 @@ import (
 	"jellyreaper/internal/discord"
 	"jellyreaper/internal/domain"
 	"jellyreaper/internal/jellyfin"
+	"jellyreaper/internal/jellyseerr"
 	"jellyreaper/internal/jobs"
 	"jellyreaper/internal/radarr"
 	"jellyreaper/internal/repo"
@@ -702,6 +703,7 @@ type ExecuteDeleteHandler struct {
 	logger     *slog.Logger
 	radarr     radarrRemover
 	sonarr     sonarrRemover
+	jellyseerr jellyseerrClearer
 }
 
 type radarrRemover interface {
@@ -710,6 +712,10 @@ type radarrRemover interface {
 
 type sonarrRemover interface {
 	RemoveSeasonByProviderIDs(context.Context, map[string]string, int) error
+}
+
+type jellyseerrClearer interface {
+	ClearMedia(context.Context, jellyseerr.MediaKind, map[string]string) error
 }
 
 func NewExecuteDeleteHandler(repository repo.Repository, client *jellyfin.Client) *ExecuteDeleteHandler {
@@ -732,6 +738,10 @@ func (h *ExecuteDeleteHandler) SetRadarrService(remover radarrRemover) {
 
 func (h *ExecuteDeleteHandler) SetSonarrService(remover sonarrRemover) {
 	h.sonarr = remover
+}
+
+func (h *ExecuteDeleteHandler) SetJellyseerrService(clearer jellyseerrClearer) {
+	h.jellyseerr = clearer
 }
 
 func (h *ExecuteDeleteHandler) Kind() domain.JobKind { return domain.JobKindExecuteDelete }
@@ -904,6 +914,7 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 		"child_count", len(deletedChildren),
 		"jobs_purged", purged,
 	)
+	h.clearJellyseerr(ctx, flow, deletedChildren)
 	if h.discord != nil && strings.TrimSpace(flow.Discord.ChannelID) != "" && strings.TrimSpace(flow.Discord.MessageID) != "" {
 		name := strings.TrimSpace(flow.DisplayName)
 		if name == "" {
@@ -914,6 +925,38 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 		}
 	}
 	return nil
+}
+
+// clearJellyseerr runs after the local commit and never fails the job: a
+// retry would re-drive arr/Jellyfin deletes that already happened, and
+// Jellyseerr's daily availability sync converges the same state eventually.
+func (h *ExecuteDeleteHandler) clearJellyseerr(ctx context.Context, flow domain.Flow, deleted []domain.MediaItem) {
+	if h.jellyseerr == nil {
+		return
+	}
+	kind, ok := jellyseerrKind(flow, deleted)
+	if !ok {
+		return
+	}
+	if err := h.jellyseerr.ClearMedia(ctx, kind, domain.NormalizeProviderIDs(flow.ProviderIDs)); err != nil {
+		h.logger.Warn("jellyseerr clear failed; re-requests stay blocked until its availability sync", "lex", "JELLYSEERR", "item_id", flow.ItemID, "kind", kind, "error", err)
+	}
+}
+
+// Generic "item" subjects only qualify when the media is known to be a
+// movie; guessing would point a TV tmdb id at /movie and clear the wrong title.
+func jellyseerrKind(flow domain.Flow, deleted []domain.MediaItem) (jellyseerr.MediaKind, bool) {
+	switch flow.SubjectType {
+	case "season":
+		return jellyseerr.MediaKindTV, true
+	case "movie":
+		return jellyseerr.MediaKindMovie, true
+	case "item":
+		if len(deleted) == 1 && strings.EqualFold(deleted[0].ItemType, "Movie") {
+			return jellyseerr.MediaKindMovie, true
+		}
+	}
+	return "", false
 }
 
 func (h *ExecuteDeleteHandler) getFlow(ctx context.Context, itemID string) (domain.Flow, bool, error) {

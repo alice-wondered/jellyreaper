@@ -28,6 +28,7 @@ import (
 	"jellyreaper/internal/nyaa"
 	"jellyreaper/internal/qbit"
 	api "jellyreaper/internal/http"
+	"jellyreaper/internal/jellyseerr"
 	"jellyreaper/internal/jobs"
 	"jellyreaper/internal/jobs/handlers"
 	"jellyreaper/internal/radarr"
@@ -221,6 +222,10 @@ func main() {
 	if cfg.SonarrURL != "" && cfg.SonarrAPIKey != "" {
 		executeDeleteHandler.SetSonarrService(sonarr.NewService(cfg.SonarrURL, cfg.SonarrAPIKey))
 		logger.Info("sonarr service enabled")
+	}
+	if cfg.JellyseerrURL != "" && cfg.JellyseerrAPIKey != "" {
+		executeDeleteHandler.SetJellyseerrService(jellyseerr.NewService(cfg.JellyseerrURL, cfg.JellyseerrAPIKey))
+		logger.Info("jellyseerr service enabled")
 	}
 	if assistant != nil {
 		assistant.SetDecisionService(appService)
