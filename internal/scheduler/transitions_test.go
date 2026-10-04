@@ -421,12 +421,12 @@ func TestPlayed_AutoComputesNextEvalFromMedia(t *testing.T) {
 	mgr := newMgr(t, store)
 	fixedNow := time.Date(2026, 4, 10, 14, 0, 0, 0, time.UTC)
 
+	playedAt := fixedNow.Add(-10 * 24 * time.Hour) // 10 days ago
 	f := baseFlow("target:movie:ply-auto", domain.FlowStatePendingReview)
 	f.PolicySnapshot.ExpireAfterDays = 60
+	f.CreatedAt = playedAt.Add(-30 * 24 * time.Hour) // in the library before the play
 	seedFlow(t, store, f)
 
-	// Seed media with a recent play.
-	playedAt := fixedNow.Add(-10 * 24 * time.Hour) // 10 days ago
 	seedMedia(t, store, domain.MediaItem{
 		ItemID:       "ply-auto",
 		ItemType:     "Movie",
