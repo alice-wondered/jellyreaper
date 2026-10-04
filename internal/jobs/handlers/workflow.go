@@ -151,25 +151,17 @@ func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord
 			flow.PolicySnapshot.TimeoutAction = "delete"
 		}
 
-		lastPlayed, known, err := mostRecentPlayForFlow(ctx, tx, flow)
+		lastPlayed, _, err := mostRecentPlayForFlow(ctx, tx, flow)
 		if err != nil {
 			return err
 		}
-		if !known {
-			createdAt, createdKnown, err := mostRecentCreatedForFlow(ctx, tx, flow)
-			if err != nil {
-				return err
-			}
-			if createdKnown {
-				lastPlayed = createdAt
-				known = true
-			} else {
-				lastPlayed = time.Unix(0, 0).UTC()
-				known = true
-			}
+		createdAt, _, err := mostRecentCreatedForFlow(ctx, tx, flow)
+		if err != nil {
+			return err
 		}
-		if known {
-			dueAt := lastPlayed.Add(time.Duration(expireDays) * 24 * time.Hour)
+		// Zero anchor (no play, no media, no flow CreatedAt) stays due now.
+		if anchor := domain.ReviewAnchor(flow, lastPlayed, createdAt); !anchor.IsZero() {
+			dueAt := anchor.Add(time.Duration(expireDays) * 24 * time.Hour)
 			if dueAt.After(now) {
 				expected := flow.Version
 				flow.NextActionAt = dueAt
@@ -178,7 +170,7 @@ func (h *EvaluatePolicyHandler) Handle(ctx context.Context, job domain.JobRecord
 				if err := tx.UpsertFlowCAS(ctx, flow, expected); err != nil {
 					return err
 				}
-				h.logger.Info("policy evaluation deferred", "lex", "POLICY-EVAL", "item_id", job.ItemID, "reason", "not_due_yet", "last_played_at", lastPlayed, "due_at", dueAt)
+				h.logger.Info("policy evaluation deferred", "lex", "POLICY-EVAL", "item_id", job.ItemID, "reason", "not_due_yet", "last_played_at", lastPlayed, "anchor", anchor, "due_at", dueAt)
 				return h.evalScheduler.RequestEval(ctx, tx, flow, now, dueAt, "not_due_yet", "eval:"+flow.ItemID, flow.Version)
 			}
 		}

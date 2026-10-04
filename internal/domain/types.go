@@ -46,6 +46,24 @@ const (
 	JobKindPruneEvents JobKind = "prune_events"
 )
 
+// ReviewAnchor is when a flow's review clock starts: the latest play, else the
+// media's added date, never earlier than the flow's own CreatedAt. Jellyfin
+// keys played state by provider id, so a re-added item arrives carrying plays
+// from before it was deleted; and a season can get a flow before any episode
+// is indexed, with neither a play nor an added date. A delete removes the
+// flow, so CreatedAt marks when the item (re)entered the library. Zero means
+// nothing is known.
+func ReviewAnchor(flow Flow, lastPlayed, added time.Time) time.Time {
+	anchor := lastPlayed
+	if anchor.IsZero() {
+		anchor = added
+	}
+	if flow.CreatedAt.After(anchor) {
+		anchor = flow.CreatedAt
+	}
+	return anchor
+}
+
 type MediaItem struct {
 	ItemID              string            `json:"item_id"`
 	ProviderIDs         map[string]string `json:"provider_ids,omitempty"`

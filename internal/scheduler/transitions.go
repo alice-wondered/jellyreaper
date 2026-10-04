@@ -400,9 +400,8 @@ func (m *FlowManager) computeNextEval(ctx context.Context, tx repo.TxRepository,
 					latest = item.LastPlayedAt
 				}
 			}
-			if !latest.IsZero() {
-				dueAt := latest.Add(time.Duration(expireDays) * 24 * time.Hour)
-				if dueAt.After(now) {
+			if anchor := domain.ReviewAnchor(flow, latest, time.Time{}); !anchor.IsZero() {
+				if dueAt := anchor.Add(time.Duration(expireDays) * 24 * time.Hour); dueAt.After(now) {
 					return dueAt
 				}
 			}

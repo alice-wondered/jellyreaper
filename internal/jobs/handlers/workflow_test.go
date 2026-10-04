@@ -453,7 +453,7 @@ func TestEvaluatePolicyAssumesNeverPlayedWhenMetricsMissing(t *testing.T) {
 				HITLTimeoutHrs:  48,
 				TimeoutAction:   "delete",
 			},
-			CreatedAt: now,
+			CreatedAt: now.Add(-31 * 24 * time.Hour), // known for a full review window, never played
 			UpdatedAt: now,
 		}, 0)
 	}); err != nil {
@@ -621,7 +621,7 @@ func TestEvaluatePolicyUsesGlobalReviewDaysMetaLazily(t *testing.T) {
 				HITLTimeoutHrs:  48,
 				TimeoutAction:   "delete",
 			},
-			CreatedAt: now,
+			CreatedAt: now.Add(-10 * 24 * time.Hour), // seen when indexed, before the play
 			UpdatedAt: now,
 		}, 0)
 	}); err != nil {
