@@ -203,6 +203,16 @@ Behavior:
 | `JELLYSEERR_URL` | no | - | Jellyseerr base URL; deletes clear its media record so the title can be requested again immediately |
 | `JELLYSEERR_API_KEY` | no | - | Jellyseerr API key |
 
+### Outage Protection
+
+Deletes (`hitl_timeout`, `execute_delete`) run only while Jellyfin answers `/System/Info` **and** a backfill has succeeded since boot. While either is false they are deferred, not failed. Outages of at least `OUTAGE_GRACE` push every pending HITL deadline out by the outage length, with at least `DEFAULT_HITL_TIMEOUT_HOURS` left after recovery. This covers jellyreaper downtime, measured from a persisted heartbeat, and Jellyfin downtime, measured live.
+
+| Variable | Required | Default | Description |
+|---|---:|---|---|
+| `HEARTBEAT_INTERVAL` | no | `1m` | liveness write + Jellyfin probe cadence; also the recheck delay for gated deletes |
+| `OUTAGE_GRACE` | no | `10m` | shorter outages shift nothing |
+| `ASSUME_LAST_ALIVE_AT` | no | - | RFC3339; used only when no heartbeat has ever been recorded (first boot of a heartbeat-aware build). Safe to leave set |
+
 ### Policy Defaults
 
 | Variable | Required | Default | Description |
