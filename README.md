@@ -200,6 +200,8 @@ Behavior:
 | `RADARR_API_KEY` | no | - | Radarr API key |
 | `SONARR_URL` | no | - | Sonarr base URL for series removal sync |
 | `SONARR_API_KEY` | no | - | Sonarr API key |
+| `JELLYSEERR_URL` | no | - | Jellyseerr base URL; deletes clear its media record so the title can be requested again immediately |
+| `JELLYSEERR_API_KEY` | no | - | Jellyseerr API key |
 
 ### Policy Defaults
 

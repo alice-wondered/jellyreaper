@@ -59,6 +59,8 @@ type Config struct {
 	RadarrAPIKey         string
 	SonarrURL            string
 	SonarrAPIKey         string
+	JellyseerrURL        string
+	JellyseerrAPIKey     string
 	QbitURL              string
 	QbitUsername         string
 	QbitPassword         string
@@ -240,6 +242,8 @@ func LoadFromEnv() (Config, error) {
 		RadarrAPIKey:         strings.TrimSpace(os.Getenv("RADARR_API_KEY")),
 		SonarrURL:            strings.TrimSpace(os.Getenv("SONARR_URL")),
 		SonarrAPIKey:         strings.TrimSpace(os.Getenv("SONARR_API_KEY")),
+		JellyseerrURL:        strings.TrimSpace(os.Getenv("JELLYSEERR_URL")),
+		JellyseerrAPIKey:     strings.TrimSpace(os.Getenv("JELLYSEERR_API_KEY")),
 		QbitURL:              strings.TrimSpace(os.Getenv("QBIT_URL")),
 		QbitUsername:         strings.TrimSpace(os.Getenv("QBIT_USERNAME")),
 		QbitPassword:         strings.TrimSpace(os.Getenv("QBIT_PASSWORD")),

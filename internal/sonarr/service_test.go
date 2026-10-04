@@ -6,21 +6,35 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 )
 
-func TestRemoveSeasonByProviderIDsUpdatesEpisodeMonitorState(t *testing.T) {
+func seriesDetail() map[string]any {
+	return map[string]any{
+		"id":               77,
+		"title":            "Sample Series",
+		"qualityProfileId": 4,
+		"seasons": []map[string]any{
+			{"seasonNumber": 1, "monitored": true},
+			{"seasonNumber": 3, "monitored": true},
+		},
+	}
+}
+
+func TestRemoveSeasonByProviderIDsUnmonitorsSeasonFlag(t *testing.T) {
 	var sawBulkDelete bool
-	var sawMonitor bool
-	var sawSeriesDelete bool
+	var put map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/series":
 			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 77, "tvdbId": 73244, "imdbId": "tt0386676", "title": "Sample Series"}})
-		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/v3/series"):
-			sawSeriesDelete = true
-			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/series/77":
+			_ = json.NewEncoder(w).Encode(seriesDetail())
+		case r.Method == http.MethodPut && r.URL.Path == "/api/v3/series/77":
+			if err := json.NewDecoder(r.Body).Decode(&put); err != nil {
+				t.Fatalf("decode series put body: %v", err)
+			}
+			w.WriteHeader(http.StatusAccepted)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/episode":
 			if got := r.URL.Query().Get("seriesId"); got != "77" {
 				t.Fatalf("expected seriesId=77, got %q", got)
@@ -30,24 +44,10 @@ func TestRemoveSeasonByProviderIDsUpdatesEpisodeMonitorState(t *testing.T) {
 			}
 			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1001, "episodeFileId": 501}, {"id": 1002, "episodeFileId": 502}})
 		case r.Method == http.MethodDelete && r.URL.Path == "/api/v3/episodefile/bulk":
-			var body map[string]any
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				t.Fatalf("decode bulk delete body: %v", err)
-			}
 			sawBulkDelete = true
 			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodPut && r.URL.Path == "/api/v3/episode/monitor":
-			var body map[string]any
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				t.Fatalf("decode monitor body: %v", err)
-			}
-			if body["monitored"] != false {
-				t.Fatalf("expected monitored=false, got %#v", body["monitored"])
-			}
-			sawMonitor = true
-			w.WriteHeader(http.StatusOK)
 		default:
-			w.WriteHeader(http.StatusNotFound)
+			t.Fatalf("unexpected sonarr call %s %s", r.Method, r.URL.Path)
 		}
 	}))
 	defer server.Close()
@@ -56,14 +56,48 @@ func TestRemoveSeasonByProviderIDsUpdatesEpisodeMonitorState(t *testing.T) {
 	if err := svc.RemoveSeasonByProviderIDs(context.Background(), map[string]string{"tvdb": "73244"}, 3); err != nil {
 		t.Fatalf("remove season by provider ids: %v", err)
 	}
-	if !sawMonitor {
-		t.Fatal("expected matched season episodes to be unmonitored")
-	}
 	if !sawBulkDelete {
 		t.Fatal("expected matched season episode files to be deleted")
 	}
-	if sawSeriesDelete {
-		t.Fatal("did not expect any sonarr series delete endpoint call during season operation")
+	if put == nil {
+		t.Fatal("expected series PUT flipping the season monitored flag")
+	}
+	monitored := map[float64]any{}
+	for _, raw := range put["seasons"].([]any) {
+		season := raw.(map[string]any)
+		monitored[season["seasonNumber"].(float64)] = season["monitored"]
+	}
+	if monitored[3] != false {
+		t.Fatalf("expected season 3 monitored=false, got %#v", monitored[3])
+	}
+	if monitored[1] != true {
+		t.Fatalf("expected season 1 untouched, got %#v", monitored[1])
+	}
+	if put["qualityProfileId"] != float64(4) || put["title"] != "Sample Series" {
+		t.Fatalf("expected unmodeled series fields to round-trip, got %#v", put)
+	}
+}
+
+func TestRemoveSeasonByProviderIDsSeasonMissingFromSeriesIsNotManaged(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/series":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 77, "tvdbId": 73244}})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/episode":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1001, "episodeFileId": 0}})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/series/77":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 77, "seasons": []map[string]any{{"seasonNumber": 1, "monitored": true}}})
+		case r.Method == http.MethodPut:
+			t.Fatal("did not expect a series PUT when the season is absent")
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	err := NewService(server.URL, "k").RemoveSeasonByProviderIDs(context.Background(), map[string]string{"tvdb": "73244"}, 3)
+	if !errors.Is(err, ErrNotManaged) {
+		t.Fatalf("expected ErrNotManaged, got %v", err)
 	}
 }
 
@@ -74,8 +108,10 @@ func TestRemoveSeasonByProviderIDsMonitor404IsIdempotent(t *testing.T) {
 			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 77, "tvdbId": 73244, "imdbId": "tt0386676"}})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/episode":
 			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 1001, "episodeFileId": 0}})
-		case r.Method == http.MethodPut && r.URL.Path == "/api/v3/episode/monitor":
-			// Series/season disappeared between our list and our PUT.
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/series/77":
+			_ = json.NewEncoder(w).Encode(seriesDetail())
+		case r.Method == http.MethodPut && r.URL.Path == "/api/v3/series/77":
+			// Series disappeared between our GET and our PUT.
 			w.WriteHeader(http.StatusNotFound)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -95,7 +131,7 @@ func TestRemoveSeasonByProviderIDsNoMatchReturnsError(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/series":
 			_ = json.NewEncoder(w).Encode([]map[string]any{{"id": 2, "tvdbId": 2, "imdbId": "tt0000002"}})
-		case r.Method == http.MethodPut && r.URL.Path == "/api/v3/episode/monitor":
+		case r.Method == http.MethodPut:
 			monitorCalls++
 			w.WriteHeader(http.StatusOK)
 		default:
