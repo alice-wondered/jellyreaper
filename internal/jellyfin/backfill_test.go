@@ -520,7 +520,9 @@ func TestBackfillFetchChangedItemsSinceRealisticAnonymizedUserPlaybackPattern(t 
 		t.Fatalf("new backfill service: %v", err)
 	}
 
-	items, err := b.FetchChangedItemsSince(context.Background(), time.Now().Add(-90*24*time.Hour), 100)
+	// Relative to the fixture, not wall clock: the window must keep holding
+	// recentMoviePlay as real time moves past it.
+	items, err := b.FetchChangedItemsSince(context.Background(), recentMoviePlay.Add(-90*24*time.Hour), 100)
 	if err != nil {
 		t.Fatalf("fetch changed items: %v", err)
 	}
