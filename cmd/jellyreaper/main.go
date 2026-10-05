@@ -25,13 +25,13 @@ import (
 
 	"jellyreaper/internal/config"
 	"jellyreaper/internal/domain"
-	"jellyreaper/internal/nyaa"
-	"jellyreaper/internal/qbit"
-	api "jellyreaper/internal/http"
 	"jellyreaper/internal/heartbeat"
+	api "jellyreaper/internal/http"
 	"jellyreaper/internal/jellyseerr"
 	"jellyreaper/internal/jobs"
 	"jellyreaper/internal/jobs/handlers"
+	"jellyreaper/internal/nyaa"
+	"jellyreaper/internal/qbit"
 	"jellyreaper/internal/radarr"
 	"jellyreaper/internal/repo"
 	"jellyreaper/internal/scheduler"
@@ -299,6 +299,11 @@ func main() {
 		logger.Error("heartbeat startup failed; refusing to start with unshifted deadlines", "error", err)
 		os.Exit(1)
 	}
+	// Before backfill and the scheduler: season flows read plays through the
+	// episode→season link, so identities must match Jellyfin first.
+	if _, err := appService.ReconcileMediaIdentities(ctx, identityReconcileInterval); err != nil {
+		logger.Warn("media identity reconcile failed; retrying after the next backfill", "error", err)
+	}
 
 	backfillRunning := false
 	if cfg.BackfillEnabled {
@@ -311,21 +316,6 @@ func main() {
 			} else {
 				backfillSvc.SetWarningHook(func(stage string, warnErr error) {
 					logger.Warn("backfill warning", "stage", stage, "error", warnErr)
-				})
-				backfillSvc.SetProgressHook(func(progress jellyfin.FetchProgress) {
-					remaining := 0
-					if progress.TotalRecordCount > 0 && progress.TotalRecordCount > progress.Fetched {
-						remaining = progress.TotalRecordCount - progress.Fetched
-					}
-					logger.Info("backfill fetch progress",
-						"stream", progress.Stream,
-						"page", progress.Page,
-						"page_items", progress.PageItems,
-						"fetched", progress.Fetched,
-						"total", progress.TotalRecordCount,
-						"remaining", remaining,
-						"since", progress.Since,
-					)
 				})
 
 				backfillRunning = true
@@ -403,6 +393,10 @@ func main() {
 }
 
 // can we somehow combine this with the "run backfill once" logic? This feels like a weird split in our code
+// Upstream renumbering (TVDB/TMDB reorders) is rare; daily keeps season
+// membership honest without listing every episode each backfill cycle.
+const identityReconcileInterval = 24 * time.Hour
+
 func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.Repository, appService *app.Service, discordService *discord.Service, cfg config.Config, backfillSvc *jellyfin.BackfillService, runStartup bool, onReconciled func()) {
 	if cfg.DiscordChannelID != "" {
 		if err := discordService.SendSystemMessage(cfg.DiscordChannelID, "Starting Jellyfin backfill and reconciliation run."); err != nil {
@@ -430,6 +424,9 @@ func runBackfillLoop(ctx context.Context, logger *slog.Logger, repository repo.R
 				logger.Warn("periodic backfill run failed", "error", err)
 			} else {
 				onReconciled()
+				if _, err := appService.ReconcileMediaIdentities(ctx, identityReconcileInterval); err != nil {
+					logger.Warn("media identity reconcile failed", "error", err)
+				}
 			}
 			// After each backfill cycle, schedule an OOB deletion reconcile job.
 			// The job is idempotent (daily key) so this is safe to call repeatedly.
@@ -497,7 +494,7 @@ func runBackfillOnce(ctx context.Context, logger *slog.Logger, repository repo.R
 		logger.Info("backfill item ingest page", "page_items", len(page.Items), "start_index", cursor.ItemsStartIndex)
 		nextCursor := cursor
 		nextCursor.ItemsProcessed += len(page.Items)
-		nextCursor.MaxSeen = maxBackfillTimestamp(nextCursor.MaxSeen, computeBackfillCheckpoint(nextCursor.MaxSeen, nil, page.Items))
+		nextCursor.MaxSeen = maxBackfillTimestamp(nextCursor.MaxSeen, computeBackfillCheckpoint(nextCursor.MaxSeen, page.Items))
 		if page.HasMore {
 			nextCursor.ItemsStartIndex = page.NextStartIndex
 		} else {
@@ -555,22 +552,6 @@ func retryBackoffDelay(attempt int, base time.Duration, max time.Duration) time.
 	return delay
 }
 
-func ingestBackfillBatch(
-	ctx context.Context,
-	ingestItems func(context.Context, []jellyfin.ItemSnapshot) error,
-	ingestPlayback func(context.Context, []jellyfin.PlaybackEvent) error,
-	items []jellyfin.ItemSnapshot,
-	plays []jellyfin.PlaybackEvent,
-) error {
-	if err := ingestItems(ctx, items); err != nil {
-		return fmt.Errorf("item ingest: %w", err)
-	}
-	if err := ingestPlayback(ctx, plays); err != nil {
-		return fmt.Errorf("playback ingest: %w", err)
-	}
-	return nil
-}
-
 func logNextQueuedJob(ctx context.Context, logger *slog.Logger, repository repo.Repository) {
 	job, found, err := repository.GetNextQueuedJob(ctx)
 	if err != nil {
@@ -618,13 +599,8 @@ func resolveBackfillStart(ctx context.Context, repository repo.Repository, cfg c
 	return parsed.Add(-cfg.BackfillOverlap), nil
 }
 
-func computeBackfillCheckpoint(startedAt time.Time, plays []jellyfin.PlaybackEvent, items []jellyfin.ItemSnapshot) time.Time {
+func computeBackfillCheckpoint(startedAt time.Time, items []jellyfin.ItemSnapshot) time.Time {
 	maxSeen := startedAt.UTC()
-	for _, play := range plays {
-		if play.Date.After(maxSeen) {
-			maxSeen = play.Date
-		}
-	}
 	for _, item := range items {
 		if item.LastPlayedAt.After(maxSeen) {
 			maxSeen = item.LastPlayedAt
@@ -643,38 +619,6 @@ func saveBackfillCheckpoint(ctx context.Context, repository repo.Repository, at 
 	return repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
 		return tx.SetMeta(ctx, backfillCheckpointKey, at.UTC().Format(time.RFC3339Nano))
 	})
-}
-
-func fetchPlaybackPageWithRetry(ctx context.Context, logger *slog.Logger, backfillSvc *jellyfin.BackfillService, since time.Time, startIndex int32, limit int32) (jellyfin.PlaybackPage, error) {
-	var lastErr error
-	for attempt := 0; attempt < fetchRetryMaxAttempts; attempt++ {
-		page, err := backfillSvc.FetchPlaybackEventsPage(ctx, since, startIndex, limit)
-		if err == nil {
-			if attempt > 0 {
-				logger.Info("backfill playback fetch recovered", "attempt", attempt+1, "since", since, "start_index", startIndex)
-			}
-			return page, nil
-		}
-		lastErr = err
-
-		delay := retryBackoffDelay(attempt, fetchRetryBaseDelay, fetchRetryMaxDelay)
-		logger.Warn("backfill playback fetch retrying",
-			"attempt", attempt+1,
-			"max_attempts", fetchRetryMaxAttempts,
-			"retry_in", delay,
-			"since", since,
-			"start_index", startIndex,
-			"rate_limited", isRateLimitErr(err),
-			"error", err,
-		)
-
-		select {
-		case <-ctx.Done():
-			return jellyfin.PlaybackPage{}, ctx.Err()
-		case <-time.After(delay):
-		}
-	}
-	return jellyfin.PlaybackPage{}, lastErr
 }
 
 func fetchChangedItemsPageWithRetry(ctx context.Context, logger *slog.Logger, backfillSvc *jellyfin.BackfillService, since time.Time, startIndex int32, limit int32) (jellyfin.ItemPage, error) {

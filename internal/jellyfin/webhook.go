@@ -20,6 +20,7 @@ type WebhookPayload struct {
 	ItemType           string            `json:"ItemType,omitempty"`
 	SeasonID           string            `json:"SeasonId,omitempty"`
 	SeasonName         string            `json:"SeasonName,omitempty"`
+	SeasonNumber       *int              `json:"SeasonNumber,omitempty"`
 	SeriesID           string            `json:"SeriesId,omitempty"`
 	SeriesName         string            `json:"SeriesName,omitempty"`
 	ServerURL          string            `json:"ServerUrl,omitempty"`

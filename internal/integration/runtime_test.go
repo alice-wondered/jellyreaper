@@ -38,21 +38,6 @@ func (h evalCounterHandler) Handle(context.Context, domain.JobRecord) error {
 	return nil
 }
 
-type removalRecorder struct {
-	calls atomic.Int64
-	last  map[string]string
-}
-
-func (r *removalRecorder) RemoveByProviderIDs(_ context.Context, providerIDs map[string]string) error {
-	r.calls.Add(1)
-	cpy := make(map[string]string, len(providerIDs))
-	for k, v := range providerIDs {
-		cpy[k] = v
-	}
-	r.last = cpy
-	return nil
-}
-
 func openStore(t *testing.T) *bboltrepo.Store {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "integration.db")
@@ -99,7 +84,7 @@ func TestIntegrationWebhookToSchedulerDispatch(t *testing.T) {
 	go func() { _ = loop.Run(ctx) }()
 
 	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+		return tx.CreateMedia(context.Background(), domain.MediaItem{
 			ItemID:       "item-timeout",
 			Name:         "Timeout Movie",
 			Title:        "Timeout Movie",
@@ -332,7 +317,7 @@ func TestIntegrationBackfillIndexesStateFromGeneratedTypes(t *testing.T) {
 		case "/Items":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"Items": []map[string]any{
-					{"Id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8", "Name": "BF Movie", "DateCreated": now.Format(time.RFC3339), "DateLastMediaAdded": now.Format(time.RFC3339)},
+					{"Id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8", "Type": "Movie", "Name": "BF Movie", "DateCreated": now.Format(time.RFC3339), "DateLastMediaAdded": now.Format(time.RFC3339)},
 				},
 			})
 		case "/Users":
@@ -350,24 +335,17 @@ func TestIntegrationBackfillIndexesStateFromGeneratedTypes(t *testing.T) {
 		t.Fatalf("new backfill service: %v", err)
 	}
 
-	plays, err := b.FetchPlaybackEventsSince(context.Background(), now.Add(-time.Minute), 50)
-	if err != nil {
-		t.Fatalf("fetch plays: %v", err)
-	}
-	items, err := b.FetchChangedItemsSince(context.Background(), now.Add(-time.Minute), 50)
+	page, err := b.FetchChangedItemsPage(context.Background(), now.Add(-time.Minute), 0, 50)
 	if err != nil {
 		t.Fatalf("fetch changed items: %v", err)
 	}
-
-	if len(plays) != 1 || plays[0].ItemID != "item-bf" {
-		t.Fatalf("unexpected plays: %#v", plays)
-	}
+	items := page.Items
 	if len(items) != 1 || items[0].Name != "BF Movie" {
 		t.Fatalf("unexpected changed items: %#v", items)
 	}
 
 	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: items[0].ItemID, Title: items[0].Name, LastPlayedAt: plays[0].Date, UpdatedAt: time.Now().UTC()}); err != nil {
+		if err := tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: items[0].ItemID, ItemType: items[0].ItemType, Title: items[0].Name, UpdatedAt: time.Now().UTC()}); err != nil {
 			return err
 		}
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{FlowID: "flow:" + items[0].ItemID, ItemID: items[0].ItemID, State: domain.FlowStateActive, Version: 0, CreatedAt: time.Now().UTC()}, 0)
@@ -430,17 +408,18 @@ func TestIntegrationBackfillUsesUserPlaybackToDeferReviewScheduling(t *testing.T
 		t.Fatalf("new backfill service: %v", err)
 	}
 
-	items, err := b.FetchChangedItemsSince(context.Background(), now.Add(-365*24*time.Hour), 100)
+	page, err := b.FetchChangedItemsPage(context.Background(), now.Add(-365*24*time.Hour), 0, 100)
 	if err != nil {
 		t.Fatalf("fetch changed items: %v", err)
 	}
+	items := page.Items
 	if usersCalls.Load() == 0 || userItemsCalls.Load() == 0 {
 		t.Fatalf("expected user playback enrichment calls, users=%d user_items=%d", usersCalls.Load(), userItemsCalls.Load())
 	}
 
 	appSvc := app.NewService(store, nil, nil)
 	appSvc.SetPolicyDefaults(60, 15*24*time.Hour)
-	if err := appSvc.IngestBackfillItems(context.Background(), items); err != nil {
+	if err := appSvc.IngestBackfillItemsWithCursor(context.Background(), items, "", ""); err != nil {
 		t.Fatalf("ingest backfill items: %v", err)
 	}
 
@@ -524,10 +503,11 @@ func TestIntegrationCanonicalizesIDsAcrossBackfillAndWebhookSources(t *testing.T
 		t.Fatalf("new backfill service: %v", err)
 	}
 
-	items, err := b.FetchChangedItemsSince(context.Background(), now.Add(-365*24*time.Hour), 100)
+	page, err := b.FetchChangedItemsPage(context.Background(), now.Add(-365*24*time.Hour), 0, 100)
 	if err != nil {
 		t.Fatalf("fetch changed items: %v", err)
 	}
+	items := page.Items
 
 	pub, _, _ := ed25519.GenerateKey(nil)
 	discordSvc, err := discord.NewService("", pub)
@@ -536,7 +516,7 @@ func TestIntegrationCanonicalizesIDsAcrossBackfillAndWebhookSources(t *testing.T
 	}
 	appSvc := app.NewService(store, nil, nil)
 	appSvc.SetPolicyDefaults(60, 15*24*time.Hour)
-	if err := appSvc.IngestBackfillItems(context.Background(), items); err != nil {
+	if err := appSvc.IngestBackfillItemsWithCursor(context.Background(), items, "", ""); err != nil {
 		t.Fatalf("ingest backfill items: %v", err)
 	}
 
@@ -643,10 +623,11 @@ func TestIntegrationWebhookDeleteDoesNotTriggerARRRemovalPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new backfill service: %v", err)
 	}
-	items, err := b.FetchChangedItemsSince(context.Background(), now.Add(-365*24*time.Hour), 100)
+	page, err := b.FetchChangedItemsPage(context.Background(), now.Add(-365*24*time.Hour), 0, 100)
 	if err != nil {
 		t.Fatalf("fetch changed items: %v", err)
 	}
+	items := page.Items
 
 	pub, _, _ := ed25519.GenerateKey(nil)
 	discordSvc, err := discord.NewService("", pub)
@@ -655,7 +636,7 @@ func TestIntegrationWebhookDeleteDoesNotTriggerARRRemovalPath(t *testing.T) {
 	}
 	appSvc := app.NewService(store, nil, nil)
 	appSvc.SetPolicyDefaults(60, 15*24*time.Hour)
-	if err := appSvc.IngestBackfillItems(context.Background(), items); err != nil {
+	if err := appSvc.IngestBackfillItemsWithCursor(context.Background(), items, "", ""); err != nil {
 		t.Fatalf("ingest backfill items: %v", err)
 	}
 

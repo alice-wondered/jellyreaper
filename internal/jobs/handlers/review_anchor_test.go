@@ -49,7 +49,7 @@ func TestEvaluatePolicyNeverReviewsBeforeItemEnteredLibrary(t *testing.T) {
 			now := time.Now().UTC()
 			if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
 				for _, m := range tc.media {
-					if err := tx.UpsertMedia(ctx, m); err != nil {
+					if err := tx.CreateMedia(ctx, m); err != nil {
 						return err
 					}
 				}

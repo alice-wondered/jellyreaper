@@ -5,13 +5,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 	"time"
 
 	bbolt "go.etcd.io/bbolt"
 
-	"jellyreaper/internal/jellyfin"
 	bboltrepo "jellyreaper/internal/repo/bbolt"
 )
 
@@ -24,54 +22,6 @@ func testRepoStore(t *testing.T) *bboltrepo.Store {
 	}
 	t.Cleanup(func() { _ = store.Close(); _ = os.Remove(path) })
 	return store
-}
-
-func TestIngestBackfillBatchProcessesItemsBeforePlayback(t *testing.T) {
-	called := make([]string, 0, 2)
-	err := ingestBackfillBatch(
-		context.Background(),
-		func(context.Context, []jellyfin.ItemSnapshot) error {
-			called = append(called, "items")
-			return nil
-		},
-		func(context.Context, []jellyfin.PlaybackEvent) error {
-			called = append(called, "playback")
-			return nil
-		},
-		[]jellyfin.ItemSnapshot{{ItemID: "item-1"}},
-		[]jellyfin.PlaybackEvent{{ItemID: "item-1", Type: "PlaybackStart"}},
-	)
-	if err != nil {
-		t.Fatalf("ingest backfill batch: %v", err)
-	}
-
-	if want := []string{"items", "playback"}; !reflect.DeepEqual(called, want) {
-		t.Fatalf("unexpected ingest order: got=%v want=%v", called, want)
-	}
-}
-
-func TestIngestBackfillBatchStopsWhenItemIngestFails(t *testing.T) {
-	calledPlayback := false
-	itemErr := errors.New("items failed")
-
-	err := ingestBackfillBatch(
-		context.Background(),
-		func(context.Context, []jellyfin.ItemSnapshot) error {
-			return itemErr
-		},
-		func(context.Context, []jellyfin.PlaybackEvent) error {
-			calledPlayback = true
-			return nil
-		},
-		[]jellyfin.ItemSnapshot{{ItemID: "item-1"}},
-		[]jellyfin.PlaybackEvent{{ItemID: "item-1", Type: "PlaybackStart"}},
-	)
-	if err == nil {
-		t.Fatal("expected item ingest error")
-	}
-	if calledPlayback {
-		t.Fatal("playback ingest should not run after item ingest failure")
-	}
 }
 
 func TestRetryBackoffDelayCapsAtMaximum(t *testing.T) {

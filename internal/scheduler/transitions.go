@@ -316,6 +316,10 @@ func (m *FlowManager) Delete(ctx context.Context, itemID string, src TransitionS
 // PlayedRequest contains parameters for a Played transition.
 type PlayedRequest struct {
 	NextEvalAt time.Time // if set, overrides the auto-computed next eval time
+	// PlayedAt is the play that triggered the recovery. It anchors the next
+	// eval even when no linked media row has recorded the play yet, so a
+	// recovery can never schedule an immediate re-review.
+	PlayedAt time.Time
 	TransitionSource
 }
 
@@ -340,7 +344,7 @@ func (m *FlowManager) Played(ctx context.Context, itemID string, req PlayedReque
 
 		nextEvalAt := req.NextEvalAt
 		if nextEvalAt.IsZero() {
-			nextEvalAt = m.computeNextEval(ctx, tx, flow, now)
+			nextEvalAt = m.computeNextEval(ctx, tx, flow, now, req.PlayedAt)
 		}
 
 		result.FinalizePrompt = captureFinalization(&flow, "played", req.TransitionSource)
@@ -385,26 +389,25 @@ func (m *FlowManager) Played(ctx context.Context, itemID string, req PlayedReque
 
 // computeNextEval determines when the next eval should run based on
 // the flow's media play history and policy snapshot.
-func (m *FlowManager) computeNextEval(ctx context.Context, tx repo.TxRepository, flow domain.Flow, now time.Time) time.Time {
+func (m *FlowManager) computeNextEval(ctx context.Context, tx repo.TxRepository, flow domain.Flow, now, playedAt time.Time) time.Time {
 	expireDays := flow.PolicySnapshot.ExpireAfterDays
 	if expireDays <= 0 {
 		expireDays = 30
 	}
+	latest := playedAt
 	parts := strings.SplitN(flow.ItemID, ":", 3)
 	if len(parts) == 3 && parts[0] == "target" {
-		media, err := tx.ListMediaBySubject(ctx, parts[1], parts[2])
-		if err == nil {
-			var latest time.Time
+		if media, err := tx.ListMediaBySubject(ctx, parts[1], parts[2]); err == nil {
 			for _, item := range media {
 				if item.LastPlayedAt.After(latest) {
 					latest = item.LastPlayedAt
 				}
 			}
-			if anchor := domain.ReviewAnchor(flow, latest, time.Time{}); !anchor.IsZero() {
-				if dueAt := anchor.Add(time.Duration(expireDays) * 24 * time.Hour); dueAt.After(now) {
-					return dueAt
-				}
-			}
+		}
+	}
+	if anchor := domain.ReviewAnchor(flow, latest, time.Time{}); !anchor.IsZero() {
+		if dueAt := anchor.Add(time.Duration(expireDays) * 24 * time.Hour); dueAt.After(now) {
+			return dueAt
 		}
 	}
 	return now

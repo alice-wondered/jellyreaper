@@ -9,7 +9,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -223,12 +222,4 @@ func BuildProviderIDs(raw map[string]string) map[string]string {
 		return nil
 	}
 	return out
-}
-
-func EncodeQuery(values map[string]string) string {
-	v := url.Values{}
-	for k, val := range values {
-		v.Set(k, val)
-	}
-	return v.Encode()
 }

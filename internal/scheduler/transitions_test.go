@@ -39,7 +39,7 @@ func seedFlow(t *testing.T, store *bboltrepo.Store, flow domain.Flow) {
 func seedMedia(t *testing.T, store *bboltrepo.Store, item domain.MediaItem) {
 	t.Helper()
 	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
-		return tx.UpsertMedia(context.Background(), item)
+		return tx.CreateMedia(context.Background(), item)
 	})
 	if err != nil {
 		t.Fatalf("seed media: %v", err)

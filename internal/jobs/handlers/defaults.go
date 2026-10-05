@@ -5,7 +5,6 @@ import (
 	"log/slog"
 
 	"jellyreaper/internal/domain"
-	"jellyreaper/internal/jobs"
 )
 
 type NoopHandler struct {
@@ -27,16 +26,4 @@ func (h *NoopHandler) Kind() domain.JobKind {
 func (h *NoopHandler) Handle(ctx context.Context, job domain.JobRecord) error {
 	h.logger.InfoContext(ctx, "noop job handler executed", "job_id", job.JobID, "kind", job.Kind)
 	return nil
-}
-
-func DefaultHandlers(logger *slog.Logger) []jobs.JobHandler {
-	return []jobs.JobHandler{
-		NewNoopHandler(domain.JobKindEvaluatePolicy, logger),
-		NewNoopHandler(domain.JobKindSendHITLPrompt, logger),
-		NewNoopHandler(domain.JobKindHITLTimeout, logger),
-		NewNoopHandler(domain.JobKindExecuteDelete, logger),
-		NewNoopHandler(domain.JobKindVerifyDelete, logger),
-		NewNoopHandler(domain.JobKindReconcileItem, logger),
-		NewNoopHandler(domain.JobKindPruneEvents, logger),
-	}
 }

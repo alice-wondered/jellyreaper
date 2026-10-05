@@ -58,9 +58,10 @@ func seedMediaOOB(t *testing.T, store interface {
 }, itemID string, now time.Time) {
 	t.Helper()
 	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+		return tx.CreateMedia(context.Background(), domain.MediaItem{
 			ItemID:    itemID,
 			Name:      "Media " + itemID,
+			ItemType:  "Movie",
 			CreatedAt: now,
 			UpdatedAt: now,
 		})

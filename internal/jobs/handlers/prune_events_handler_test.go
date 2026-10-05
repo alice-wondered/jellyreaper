@@ -6,27 +6,7 @@ import (
 	"time"
 
 	"jellyreaper/internal/domain"
-	"jellyreaper/internal/repo"
 )
-
-// appendHandlerTestEvent writes a single domain.Event into the store.
-func appendHandlerTestEvent(t *testing.T, store interface{ repo.Repository }, eventID string, occurredAt time.Time) {
-	t.Helper()
-	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
-		return tx.AppendEvent(ctx, domain.Event{
-			EventID:        eventID,
-			FlowID:         "flow:test",
-			ItemID:         "test:item",
-			Type:           "test.event",
-			Source:         "test",
-			OccurredAt:     occurredAt,
-			IdempotencyKey: eventID,
-			Payload:        map[string]any{"id": eventID},
-		})
-	}); err != nil {
-		t.Fatalf("appendHandlerTestEvent %s: %v", eventID, err)
-	}
-}
 
 // mockEventPruner is a test double for EventPruner.
 type mockEventPruner struct {

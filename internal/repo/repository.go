@@ -21,7 +21,17 @@ type TxRepository interface {
 	DeleteFlow(ctx context.Context, itemID string) error
 
 	GetMedia(ctx context.Context, itemID string) (domain.MediaItem, bool, error)
-	UpsertMedia(ctx context.Context, media domain.MediaItem) error
+	// CreateMedia inserts a new row and refuses an incomplete identity
+	// (domain.ErrIncompleteIdentity) or an existing row (ErrAlreadyExists).
+	CreateMedia(ctx context.Context, media domain.MediaItem) error
+	// PatchMedia applies fn to an existing row and refuses any change to its
+	// identity (domain.ErrIdentityImmutable).
+	PatchMedia(ctx context.Context, itemID string, fn func(*domain.MediaItem)) error
+	// ReconcileMediaIdentity sets identity from Jellyfin, the only authority
+	// allowed to change it (upstream renumbering, legacy rows). It refuses an
+	// incomplete identity, so it can never blank or park a row. Returns the
+	// previous identity and whether anything changed.
+	ReconcileMediaIdentity(ctx context.Context, itemID string, id domain.MediaIdentity, seasonName string) (domain.MediaIdentity, bool, error)
 	DeleteMedia(ctx context.Context, itemID string) error
 	ListMediaBySubject(ctx context.Context, subjectType string, subjectID string) ([]domain.MediaItem, error)
 
@@ -42,6 +52,8 @@ type TxRepository interface {
 	DeleteJobsForItem(ctx context.Context, itemID string) (int, error)
 
 	IsProcessed(ctx context.Context, key string) (bool, error)
+	// PruneDedupe deletes up to limit records marked before olderThan.
+	PruneDedupe(ctx context.Context, olderThan time.Time, limit int) (int, error)
 	MarkProcessed(ctx context.Context, key string, at time.Time) error
 
 	GetMeta(ctx context.Context, key string) (string, bool, error)

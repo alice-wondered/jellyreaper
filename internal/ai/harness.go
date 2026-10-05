@@ -99,17 +99,6 @@ type threadState struct {
 	AliasToItemID    map[string]string
 }
 
-type intent struct {
-	Intent string `json:"intent"`
-	Query  string `json:"query"`
-	Days   int    `json:"days"`
-}
-
-func NewHarness(repository repo.Repository, apiKey string, model string) *Harness {
-	provider, _ := NewProvider(ProviderConfig{Provider: ProviderOpenAICompatible, APIKey: apiKey})
-	return NewHarnessWithProvider(repository, provider, model)
-}
-
 func NewHarnessWithProvider(repository repo.Repository, provider ChatProvider, model string) *Harness {
 	if strings.TrimSpace(model) == "" {
 		model = "gpt-5-mini"
@@ -147,16 +136,6 @@ func (h *Harness) SetNyaaService(s *nyaa.Service) { h.nyaa = s }
 func (h *Harness) SetQbitService(s *qbit.Service, animePath string) {
 	h.qbit = s
 	h.qbitAnimePath = animePath
-}
-
-func (h *Harness) SetMaxThreadContexts(max int) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if max <= 0 {
-		max = 1
-	}
-	h.maxThreads = max
-	h.pruneThreadContextsLocked()
 }
 
 // TypingFunc is called by the harness at the start of each tool-loop
@@ -1570,45 +1549,6 @@ func (h *Harness) getFlowByID(ctx context.Context, itemID string) (domain.Flow, 
 		return domain.Flow{}, false, err
 	}
 	return out, found, nil
-}
-
-func (h *Harness) renderFlowSummary(ctx context.Context, flow domain.Flow) string {
-	title := strings.TrimSpace(flow.DisplayName)
-	if title == "" {
-		title = "Untitled target"
-	}
-	archived := flow.State == domain.FlowStateArchived
-	ready := flow.State == domain.FlowStatePendingReview || (flow.State == domain.FlowStateActive && !flow.NextActionAt.IsZero() && !flow.NextActionAt.After(time.Now().UTC()))
-	media, hasMedia, _ := h.getMediaByID(ctx, flow.ItemID)
-	b := strings.Builder{}
-	b.WriteString("**")
-	b.WriteString(title)
-	b.WriteString("**")
-	if hasMedia && strings.TrimSpace(media.SeasonName) != "" {
-		b.WriteString(" — ")
-		b.WriteString(media.SeasonName)
-		if strings.TrimSpace(media.SeriesName) != "" {
-			b.WriteString(" of ")
-			b.WriteString(media.SeriesName)
-		}
-	}
-	b.WriteString(" (")
-	b.WriteString(strings.ToLower(flow.SubjectType))
-	b.WriteString(")")
-	b.WriteString(" | state: ")
-	b.WriteString(string(flow.State))
-	b.WriteString(" | archived: ")
-	b.WriteString(strconv.FormatBool(archived))
-	b.WriteString(" | ready: ")
-	b.WriteString(strconv.FormatBool(ready))
-	if !flow.NextActionAt.IsZero() {
-		b.WriteString(" | next action: ")
-		b.WriteString(h.humanizeWhen(flow.NextActionAt))
-	}
-	if strings.TrimSpace(flow.ImageURL) != "" {
-		b.WriteString(" | has artwork")
-	}
-	return b.String()
 }
 
 func (h *Harness) humanizeWhen(at time.Time) string {

@@ -43,12 +43,6 @@ func (r *Registry) Register(handler JobHandler) error {
 	return nil
 }
 
-func (r *Registry) MustRegister(handler JobHandler) {
-	if err := r.Register(handler); err != nil {
-		panic(err)
-	}
-}
-
 func (r *Registry) Get(kind domain.JobKind) (JobHandler, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

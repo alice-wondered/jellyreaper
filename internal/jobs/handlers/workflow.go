@@ -772,11 +772,11 @@ func (h *ExecuteDeleteHandler) Handle(ctx context.Context, job domain.JobRecord)
 		deletedChildren = children
 		if h.sonarr != nil {
 			providerIDs := domain.NormalizeProviderIDs(flow.ProviderIDs)
-			seasonNumber := seasonNumberFromDeletedMedia(deletedChildren)
+			seasonNumber, placed := seasonNumberFromDeletedMedia(deletedChildren)
 			switch {
 			case len(providerIDs) == 0:
 				h.logger.Info("sonarr season delete falling back to jellyfin due to missing projection provider ids", "lex", "DELETE-SONARR", "item_id", flow.ItemID)
-			case seasonNumber <= 0:
+			case !placed:
 				h.logger.Info("sonarr season delete falling back to jellyfin due to missing season number", "lex", "DELETE-SONARR", "item_id", flow.ItemID)
 			default:
 				h.logger.Info("execute delete sonarr primary season action", "lex", "DELETE-SONARR", "item_id", flow.ItemID, "season_number", seasonNumber, "child_count", len(deletedChildren))
@@ -979,7 +979,15 @@ func (h *ExecuteDeleteHandler) getMedia(ctx context.Context, itemID string) (dom
 	return media, found, nil
 }
 
-func seasonNumberFromDeletedMedia(deleted []domain.MediaItem) int {
+// seasonNumberFromDeletedMedia prefers Jellyfin's season number; 0 is
+// Specials, a real Sonarr season. The name parse only covers rows indexed
+// before season numbers were stored, and cannot see Specials.
+func seasonNumberFromDeletedMedia(deleted []domain.MediaItem) (int, bool) {
+	for _, media := range deleted {
+		if media.SeasonNumber != nil {
+			return *media.SeasonNumber, true
+		}
+	}
 	for _, media := range deleted {
 		name := strings.TrimSpace(media.SeasonName)
 		if name == "" {
@@ -993,11 +1001,11 @@ func seasonNumberFromDeletedMedia(deleted []domain.MediaItem) int {
 				continue
 			}
 			if n, err := strconv.Atoi(tok); err == nil && n > 0 {
-				return n
+				return n, true
 			}
 		}
 	}
-	return 0
+	return 0, false
 }
 
 func (h *ExecuteDeleteHandler) deleteAggregateChildren(ctx context.Context, flow domain.Flow) ([]domain.MediaItem, error) {

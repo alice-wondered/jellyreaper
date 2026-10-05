@@ -10,63 +10,6 @@ import (
 	"jellyreaper/internal/repo"
 )
 
-// countEvents returns the number of event records in the store.
-func countEvents(t *testing.T, store interface{ repo.Repository }, now time.Time) int {
-	t.Helper()
-	var n int
-	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
-		// PruneEvents with a zero cutoff doesn't delete anything but we just
-		// need a count; instead, re-seed and check via a dedicated helper.
-		// We achieve the count by pruning everything older than a far-future
-		// cutoff and counting what was deleted — then we'd need to undo it.
-		// A simpler approach: use the events from a well-known set inserted
-		// below. So this helper just needs the raw count.
-		// bbolt exposes no Count() on TxRepository; we use PruneEvents with
-		// a far-future cutoff on a *copy* is not available. We instead count
-		// via a dedicated countEventsInTx helper.
-		n = countEventsInTx(t, tx)
-		return nil
-	}); err != nil {
-		t.Fatalf("count events: %v", err)
-	}
-	return n
-}
-
-// countEventsInTx counts event records by pruning a scratch store or by
-// using PruneEvents with the far-future sentinel and observing the delta.
-// Because TxRepository.PruneEvents actually deletes, we count by calling
-// PruneEvents(far-future) on a tx that we roll back — but WithTx doesn't
-// support read-only views. Instead we record count as a side effect by
-// comparing before/after a prune of nothing.
-//
-// Simpler: we leverage PruneEvents(zero) to delete nothing and observe the
-// returned count is 0, then we use PruneEvents(far future) and *assert* the
-// caller hasn't passed a store that already has extra events. For the tests
-// in this file we always start from a fresh store with known state, so we
-// compute the expected count directly.
-//
-// In practice: just use AppendEvent + IsProcessed/MarkProcessed pattern and
-// count by seeding known events and checking their presence. The helper below
-// is a simplification that counts via PruneEvents(epoch) — prunes nothing —
-// and uses a sentinel trick.
-func countEventsInTx(_ *testing.T, tx repo.TxRepository) int {
-	// We use PruneEvents with the zero time (the epoch) as cutoff so nothing
-	// is deleted (all events have OccurredAt >= epoch), and get back 0. That
-	// doesn't help us count. Instead we use PruneEvents with a far-future
-	// cutoff to delete all events and return the count — but this is
-	// destructive. Since we only call this right before a prune assertion
-	// that verifies specific counts, we can use a separate counting strategy:
-	// count events written to the bucket using PruneEvents with the known
-	// cutoff and restoring is not possible.
-	//
-	// Pragmatic solution: count by using the PruneEvents return value directly
-	// in tests that know the cutoff, and use a dedicated "no-op" prune for
-	// simple existence checks. For this helper we simply return -1 to signal
-	// "not supported"; callers should use pruneAndCount instead.
-	n, _ := tx.PruneEvents(context.Background(), time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC))
-	return n
-}
-
 // pruneAndCountAll prunes all events from the store (using a far-future
 // cutoff) and returns how many were deleted. Useful for counting before/after
 // assertions. DESTRUCTIVE — only call on stores where you expect to empty
@@ -104,12 +47,15 @@ func makeWebhookEvent(eventType, itemID, dedupeKey string, occurredAt time.Time)
 func seedMediaItem(t *testing.T, store interface{ repo.Repository }, itemID string, now time.Time) {
 	t.Helper()
 	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
-		return tx.UpsertMedia(ctx, domain.MediaItem{
-			ItemID:    itemID,
-			Name:      "Test " + itemID,
-			ItemType:  "Episode",
-			CreatedAt: now,
-			UpdatedAt: now,
+		return tx.CreateMedia(ctx, domain.MediaItem{
+			ItemID:       itemID,
+			Name:         "Test " + itemID,
+			ItemType:     "Episode",
+			SeriesID:     "series-fixture",
+			SeasonID:     "season-fixture",
+			CreatedAt:    now,
+			UpdatedAt:    now,
+			SeasonNumber: seasonNo(1),
 		})
 	}); err != nil {
 		t.Fatalf("seed media %s: %v", itemID, err)
@@ -192,9 +138,9 @@ func TestWebhook_PlaybackProgress_OneEvent_NoEventRecord(t *testing.T) {
 		t.Errorf("expected 0 events for PlaybackProgress, got %d", n)
 	}
 
-	// Dedupe must have been marked so a duplicate is silently ignored.
-	if !isProcessed(t, store, dedupeKey) {
-		t.Error("expected PlaybackProgress dedupe key to be marked processed")
+	// Progress ticks are idempotent and must not grow the dedupe bucket.
+	if isProcessed(t, store, dedupeKey) {
+		t.Error("PlaybackProgress must not leave a dedupe record")
 	}
 
 	// Play state must have been updated on the media record. PlaybackProgress
