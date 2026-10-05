@@ -5,11 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -18,6 +19,7 @@ import (
 	"jellyreaper/internal/domain"
 	"jellyreaper/internal/jellyfin"
 	"jellyreaper/internal/jobs"
+	"jellyreaper/internal/lru"
 	"jellyreaper/internal/repo"
 	"jellyreaper/internal/scheduler"
 )
@@ -68,8 +70,11 @@ type Service struct {
 	defaultExpireDays     int
 	defaultHITLTimeoutHrs int
 	jellyfinClient        *jellyfin.Client
-	providerIDsMu         sync.RWMutex
-	providerIDsCache      map[string]map[string]string
+	// Bounded: entries per item, so an unbounded map grows with the library
+	// and every item ever seen. A miss costs one Jellyfin lookup.
+	providerIDsCache      *lru.Cache[string, map[string]string]
+	identityCache         *lru.Cache[string, jellyfin.ResolvedIdentity]
+	unindexedWarned       *lru.Cache[string, struct{}]
 	backfillBatchSize     int
 	backfillBatchTimeout  time.Duration
 	backfillQueueCapacity int
@@ -91,7 +96,9 @@ func NewService(repository repo.Repository, logger *slog.Logger, wake func(time.
 		defaultDelayWindow:    defaultDelayDuration,
 		defaultExpireDays:     defaultExpireDays,
 		defaultHITLTimeoutHrs: defaultHITLTimeoutH,
-		providerIDsCache:      map[string]map[string]string{},
+		providerIDsCache:      lru.New[string, map[string]string](itemCacheSize),
+		identityCache:         lru.New[string, jellyfin.ResolvedIdentity](itemCacheSize),
+		unindexedWarned:       lru.New[string, struct{}](warnedCacheSize),
 		backfillBatchSize:     defaultBackfillBatchSize,
 		backfillBatchTimeout:  defaultBackfillBatchTimeout,
 		backfillQueueCapacity: defaultBackfillQueueCapacity,
@@ -224,9 +231,8 @@ func (s *Service) SetDiscordService(discordSvc *discord.Service) {
 
 func (s *Service) SetJellyfinClient(client *jellyfin.Client) {
 	s.jellyfinClient = client
-	s.providerIDsMu.Lock()
-	s.providerIDsCache = map[string]map[string]string{}
-	s.providerIDsMu.Unlock()
+	s.providerIDsCache = lru.New[string, map[string]string](itemCacheSize)
+	s.identityCache = lru.New[string, jellyfin.ResolvedIdentity](itemCacheSize)
 }
 
 // ReconcileStaleFlows scans for flows that are stuck and re-enqueues
@@ -573,7 +579,34 @@ func (s *Service) PruneOldEvents(ctx context.Context, retention time.Duration) (
 			"cutoff", cutoff.Format(time.RFC3339),
 		)
 	}
+	dedupePruned, err := s.pruneDedupe(ctx, cutoff)
+	if err != nil {
+		return pruned, fmt.Errorf("prune dedupe: %w", err)
+	}
+	if dedupePruned > 0 {
+		s.logger.InfoContext(ctx, "pruned old dedupe records", "lex", "PRUNE-EVENTS", "pruned", dedupePruned, "cutoff", cutoff.Format(time.RFC3339))
+	}
 	return pruned, nil
+}
+
+// pruneDedupe drains stale dedupe records one bounded transaction at a time,
+// releasing the bbolt write lock between batches.
+func (s *Service) pruneDedupe(ctx context.Context, cutoff time.Time) (int, error) {
+	total := 0
+	for {
+		var n int
+		if err := s.repository.WithTx(ctx, func(ctx context.Context, tx repo.TxRepository) error {
+			var err error
+			n, err = tx.PruneDedupe(ctx, cutoff, dedupePruneBatch)
+			return err
+		}); err != nil {
+			return total, err
+		}
+		total += n
+		if n < dedupePruneBatch {
+			return total, nil
+		}
+	}
 }
 
 // SchedulePruneEvents enqueues a JobKindPruneEvents job to run at runAt.
@@ -624,11 +657,9 @@ func extractJellyfinIDFromFlowItemID(itemID string) string {
 
 func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.WebhookEvent) error {
 	s.enrichProviderIDsFromJellyfin(ctx, &event)
+	s.resolveIdentityFromJellyfin(ctx, &event)
 
 	now := s.now().UTC()
-	if sourceNow, ok := sourceTimestampForJellyfinEvent(event); ok {
-		now = sourceNow
-	}
 	itemID, targets, finalizations, err := s.applyJellyfinWebhookTx(ctx, event, now)
 	if err != nil {
 		return err
@@ -664,8 +695,20 @@ func (s *Service) HandleJellyfinWebhook(ctx context.Context, event jellyfin.Webh
 	return nil
 }
 
+const (
+	itemCacheSize   = 20_000 // > library size (~3.5k episodes + movies) with headroom
+	warnedCacheSize = 4_096
+	// progressWriteInterval bounds how stale LastPlayedAt can be during an
+	// active watch; review windows are days, so minutes are noise.
+	progressWriteInterval = 5 * time.Minute
+	// rescheduleSlack: due-date shifts smaller than this are not rewritten.
+	rescheduleSlack  = time.Hour
+	dedupePruneBatch = 10_000
+)
+
 type pendingPlayedRecovery struct {
-	itemID string
+	itemID   string
+	playedAt time.Time
 }
 
 func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.WebhookEvent, now time.Time) (string, []targetRef, []hitlFinalizeRequest, error) {
@@ -675,9 +718,7 @@ func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.Web
 		// PlaybackProgress, whose payloads often omit LastPlayedAt) occurred ~now.
 		// Without this, eventAt stays zero and the playback media-update below
 		// never advances LastPlayedAt, so the review clock treats an actively-
-		// watched item as never played. now already equals the resolved source
-		// timestamp when one exists (see HandleJellyfinWebhook), so this only
-		// affects the unresolved case.
+		// watched item as never played.
 		eventAt = now
 	}
 	playbackEvent := isPlaybackEvent(event.EventType)
@@ -700,6 +741,7 @@ func (s *Service) applyJellyfinWebhookTx(ctx context.Context, event jellyfin.Web
 	// FlowManager owns its own tx for each transition.
 	for _, pr := range playedRecoveries {
 		result, playErr := s.flowManager.Played(ctx, pr.itemID, scheduler.PlayedRequest{
+			PlayedAt: pr.playedAt,
 			TransitionSource: scheduler.TransitionSource{
 				Source: "jellyfin",
 				Reason: "playback_recovered",
@@ -726,12 +768,17 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 	if err != nil {
 		return err
 	}
-	processed, err := tx.IsProcessed(ctx, dedupeKey)
-	if err != nil {
-		return err
-	}
-	if processed {
-		return nil
+	// Progress ticks are idempotent (every effect is throttled or a no-op) and
+	// one dedupe key per tick grew the bucket to 1.5M keys; they skip dedupe.
+	dedupe := !isPlaybackProgressEvent(event.EventType)
+	if dedupe {
+		processed, err := tx.IsProcessed(ctx, dedupeKey)
+		if err != nil {
+			return err
+		}
+		if processed {
+			return nil
+		}
 	}
 
 	// PlaybackProgress position-tick heartbeats are high-frequency events whose
@@ -782,24 +829,16 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		if err != nil {
 			return err
 		}
-		media := domain.MediaItem{ItemID: itemID, UpdatedAt: now}
+		// Patch starts from the stored row so no field is dropped by omission;
+		// a new row is born with its identity, which is never patched after.
+		media := existing
+		if !found {
+			media = domain.MediaItem{ItemID: itemID, ItemType: event.Payload.ItemType, SeriesID: event.Payload.SeriesID, SeasonID: event.Payload.SeasonID, SeasonNumber: event.Payload.SeasonNumber, SeasonName: event.Payload.SeasonName}
+		}
+		media.UpdatedAt = now
 		catalogUpdateAllowed := true
 		playbackUpdateAllowed := true
 		if found {
-			media.CreatedAt = existing.CreatedAt
-			media.Name = existing.Name
-			media.Title = existing.Title
-			media.ItemType = existing.ItemType
-			media.SeasonID = existing.SeasonID
-			media.SeasonName = existing.SeasonName
-			media.SeriesID = existing.SeriesID
-			media.SeriesName = existing.SeriesName
-			media.ImageURL = existing.ImageURL
-			media.LastPlayedAt = existing.LastPlayedAt
-			media.PlayCountTotal = existing.PlayCountTotal
-			media.LastCatalogEventAt = existing.LastCatalogEventAt
-			media.LastPlaybackEventAt = existing.LastPlaybackEventAt
-			media.ProviderIDs = existing.ProviderIDs
 			if catalogIndexEvent && !eventAt.IsZero() && eventAt.Before(existing.LastCatalogEventAt) {
 				catalogUpdateAllowed = false
 			}
@@ -834,18 +873,6 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 				media.Name = event.Payload.Name
 				media.Title = event.Payload.Name
 			}
-			if event.Payload.ItemType != "" {
-				media.ItemType = event.Payload.ItemType
-			}
-			if event.Payload.SeasonID != "" {
-				media.SeasonID = event.Payload.SeasonID
-			}
-			if event.Payload.SeasonName != "" {
-				media.SeasonName = event.Payload.SeasonName
-			}
-			if event.Payload.SeriesID != "" {
-				media.SeriesID = event.Payload.SeriesID
-			}
 			if event.Payload.SeriesName != "" {
 				media.SeriesName = event.Payload.SeriesName
 			}
@@ -864,43 +891,51 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 			if eventAt.After(media.LastCatalogEventAt) {
 				media.LastCatalogEventAt = eventAt
 			}
-			if itemTypeLower == "episode" {
-				oldSeasonID := strings.TrimSpace(existing.SeasonID)
-				newSeasonID := strings.TrimSpace(media.SeasonID)
-				switch {
-				case !found && newSeasonID != "":
-					seasonEpisodeDelta[newSeasonID]++
-				case found && oldSeasonID != newSeasonID:
-					if oldSeasonID != "" {
-						seasonEpisodeDelta[oldSeasonID]--
-					}
-					if newSeasonID != "" {
-						seasonEpisodeDelta[newSeasonID]++
-					}
-				}
-			}
 		}
 
-		if playbackEvent && playbackUpdateAllowed {
+		// PlaybackProgress fires about once a second during a watch. A tick only
+		// advances the play clock once progressWriteInterval has passed, so an
+		// active watch stays current without a write per tick; start/stop are
+		// discrete plays and always land.
+		progressTick := isPlaybackProgressEvent(event.EventType)
+		if playbackEvent && playbackUpdateAllowed && (!progressTick || eventAt.Sub(media.LastPlayedAt) >= progressWriteInterval) {
 			if eventAt.After(media.LastPlayedAt) {
 				media.LastPlayedAt = eventAt
 			}
-			// PlaybackProgress fires repeatedly during a single watch; counting
-			// each heartbeat inflates PlayCountTotal. Only discrete play events
-			// (start/stop) represent a play. Progress ticks still advance
-			// LastPlayedAt above so active-watch detection stays current.
-			if !isPlaybackProgressEvent(event.EventType) {
+			if !progressTick {
 				media.PlayCountTotal++
 			}
 			if eventAt.After(media.LastPlaybackEventAt) {
 				media.LastPlaybackEventAt = eventAt
 			}
 		}
-		if !removalEvent {
-			if err := tx.UpsertMedia(ctx, media); err != nil {
+		switch {
+		case !removalEvent && found:
+			unchanged := existing
+			unchanged.UpdatedAt = media.UpdatedAt
+			if reflect.DeepEqual(unchanged, media) {
+				break // nothing but the timestamp would change
+			}
+			if err := tx.PatchMedia(ctx, itemID, func(m *domain.MediaItem) { *m = media }); err != nil {
 				return err
 			}
-		} else if found {
+		case !removalEvent:
+			err := tx.CreateMedia(ctx, media)
+			if errors.Is(err, domain.ErrIncompleteIdentity) {
+				// Never index a partial row. The next backfill page carries the
+				// full identity from Jellyfin and creates it then.
+				if s.unindexedWarned.Add(itemID, struct{}{}) {
+					s.logger.WarnContext(ctx, "media not indexed: identity unresolved", "lex", "CATALOG-INDEX", "item_id", itemID, "event_type", event.EventType, "error", err)
+				}
+				break
+			}
+			if err != nil {
+				return err
+			}
+			if media.Identity().IsEpisode() {
+				seasonEpisodeDelta[domain.NormalizeID(media.SeasonID)]++
+			}
+		case found:
 			if itemTypeLower == "episode" {
 				seasonID := strings.TrimSpace(existing.SeasonID)
 				if seasonID == "" {
@@ -936,6 +971,13 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		}
 	}
 
+	// A new flow is born when the item entered the library: Jellyfin's catalog
+	// date, else now. Never eventAt: on backfill that is the item's restored
+	// LastPlayedAt, which made a re-added season look months old on arrival.
+	enteredLibraryAt := catalogEventTimestamp(event.Payload)
+	if enteredLibraryAt.IsZero() || enteredLibraryAt.After(now) {
+		enteredLibraryAt = now
+	}
 	for _, target := range targets {
 		targetProviderIDs := projectionProviderIDsForTarget(target, event)
 		flow, found, err := tx.GetFlow(ctx, target.Canonical)
@@ -965,7 +1007,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 					TimeoutAction:   "delete",
 				},
 				LastCatalogEventAt: eventAt,
-				CreatedAt:          now,
+				CreatedAt:          enteredLibraryAt,
 			}
 			if target.Type == "season" {
 				flow.EpisodeCount = 0
@@ -1018,7 +1060,7 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 						TimeoutAction:   "delete",
 					},
 					LastCatalogEventAt: eventAt,
-					CreatedAt:          now,
+					CreatedAt:          enteredLibraryAt,
 					UpdatedAt:          now,
 				}
 				if target.Type == "season" {
@@ -1118,7 +1160,8 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 			// FlowManager computes nextEvalAt from media history internally.
 			if pendingPlayed != nil {
 				*pendingPlayed = append(*pendingPlayed, pendingPlayedRecovery{
-					itemID: target.Canonical,
+					itemID:   target.Canonical,
+					playedAt: eventAt,
 				})
 			}
 			continue
@@ -1149,6 +1192,9 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 		if err != nil {
 			return err
 		}
+		if playbackEvent && eventAt.After(playAt) {
+			playAt = eventAt
+		}
 		addedAt, _, err := mostRecentCreatedForTarget(ctx, tx, flow)
 		if err != nil {
 			return err
@@ -1159,10 +1205,14 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 			}
 		}
 
-		// Plays always win: reschedule unconditionally on a playback event so that a
-		// play during a longer delay window still resets the review clock to
-		// lastPlay+reviewDays. For non-playback catalog events only advance if later.
-		if playbackEvent || flow.NextActionAt.Before(runAt) {
+		// Plays always win: a play may move the review in either direction (it
+		// overrides a longer Delay window) and always clears a Delay outcome.
+		// Catalog events only push later. Either way, a shift smaller than
+		// rescheduleSlack is not a change worth a write and a version bump:
+		// progress ticks would otherwise rewrite the flow every second.
+		shift := runAt.Sub(flow.NextActionAt)
+		overridesDelay := playbackEvent && flow.HITLOutcome == "delay"
+		if overridesDelay || shift >= rescheduleSlack || (playbackEvent && shift <= -rescheduleSlack) {
 			expected := flow.Version
 			flow.NextActionAt = runAt
 			flow.UpdatedAt = now
@@ -1176,11 +1226,14 @@ func (s *Service) applyJellyfinWebhookInTx(ctx context.Context, tx repo.TxReposi
 			}
 		}
 
-		if err := s.evalScheduler.RequestEval(ctx, tx, flow, now, runAt, "jellyfin_webhook", dedupeKey+":eval", flow.Version); err != nil {
+		if err := s.evalScheduler.RequestEval(ctx, tx, flow, now, flow.NextActionAt, "jellyfin_webhook", dedupeKey+":eval", flow.Version); err != nil {
 			return err
 		}
 	}
 
+	if !dedupe {
+		return nil
+	}
 	return tx.MarkProcessed(ctx, dedupeKey, now)
 }
 
@@ -1415,63 +1468,6 @@ func (s *Service) RequestImmediateReview(ctx context.Context, itemID string) err
 	return nil
 }
 
-func (s *Service) IngestBackfillPlayback(ctx context.Context, events []jellyfin.PlaybackEvent) error {
-	return s.ingestBackfillPlaybackWithCursor(ctx, events, "", "")
-}
-
-func (s *Service) IngestBackfillPlaybackWithCursor(ctx context.Context, events []jellyfin.PlaybackEvent, cursorKey string, cursorValue string) error {
-	return s.ingestBackfillPlaybackWithCursor(ctx, events, cursorKey, cursorValue)
-}
-
-func (s *Service) ingestBackfillPlaybackWithCursor(ctx context.Context, events []jellyfin.PlaybackEvent, cursorKey string, cursorValue string) error {
-	total := len(events)
-	opCh := make(chan backfillWriteOp, s.backfillQueueCapacity)
-	for i, e := range events {
-		if total > 0 && ((i+1)%ingestProgressEvery == 0 || i+1 == total) {
-			s.logger.InfoContext(ctx, "backfill playback ingest progress", "lex", "BACKFILL-INGEST", "stream", "playback", "processed", i+1, "total", total)
-		}
-
-		key := "backfill:play:" + e.ItemID + ":" + e.Type + ":" + strconv.FormatInt(e.Date.UnixNano(), 10)
-		if e.Date.IsZero() {
-			key = "backfill:play:" + e.ItemID + ":" + e.Type + ":" + strconv.Itoa(i)
-		}
-		evt := jellyfin.WebhookEvent{
-			Payload: jellyfin.WebhookPayload{
-				ItemID:           e.ItemID,
-				Name:             "",
-				NotificationType: e.Type,
-			},
-			Raw:        map[string]any{"source": "backfill", "type": e.Type, "item_id": e.ItemID, "name": e.Name},
-			ItemID:     e.ItemID,
-			EventType:  e.Type,
-			DedupeKey:  key,
-			OccurredAt: e.Date,
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case opCh <- backfillWriteOp{event: &evt}:
-		}
-	}
-	if cursorKey != "" {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case opCh <- backfillWriteOp{cursorKey: cursorKey, cursorValue: cursorValue}:
-		}
-	}
-	close(opCh)
-	if err := s.processWebhookBatches(ctx, opCh, "backfill_playback"); err != nil {
-		return err
-	}
-	s.wake(s.now().UTC())
-	return nil
-}
-
-func (s *Service) IngestBackfillItems(ctx context.Context, items []jellyfin.ItemSnapshot) error {
-	return s.ingestBackfillItemsWithCursor(ctx, items, "", "")
-}
-
 func (s *Service) IngestBackfillItemsWithCursor(ctx context.Context, items []jellyfin.ItemSnapshot, cursorKey string, cursorValue string) error {
 	return s.ingestBackfillItemsWithCursor(ctx, items, cursorKey, cursorValue)
 }
@@ -1493,6 +1489,7 @@ func (s *Service) ingestBackfillItemsWithCursor(ctx context.Context, items []jel
 				Name:               it.Name,
 				SeasonID:           it.SeasonID,
 				SeasonName:         it.SeasonName,
+				SeasonNumber:       it.SeasonNumber,
 				SeriesID:           it.SeriesID,
 				SeriesName:         it.SeriesName,
 				PrimaryImageURL:    it.ImageURL,
@@ -1578,11 +1575,15 @@ func (s *Service) processWebhookBatches(ctx context.Context, ops <-chan backfill
 					continue
 				}
 				event := *op.event
+				// now is bookkeeping (flow CreatedAt, UpdatedAt, eval floor);
+				// eventAt is when it happened. A backfill event's source time is
+				// the item's LastPlayedAt, which Jellyfin restores across a
+				// delete/re-add, so it must never stamp CreatedAt.
 				now := s.now().UTC()
-				if sourceNow, ok := sourceTimestampForJellyfinEvent(event); ok {
-					now = sourceNow
-				}
 				eventAt := now
+				if sourceAt, ok := sourceTimestampForJellyfinEvent(event); ok {
+					eventAt = sourceAt
+				}
 				if err := s.applyJellyfinWebhookInTx(
 					ctx,
 					tx,
@@ -1608,6 +1609,7 @@ func (s *Service) processWebhookBatches(ctx context.Context, ops <-chan backfill
 		// Execute pending playback recoveries outside the backfill tx.
 		for _, pr := range playedRecoveries {
 			if _, playErr := s.flowManager.Played(ctx, pr.itemID, scheduler.PlayedRequest{
+				PlayedAt:         pr.playedAt,
 				TransitionSource: scheduler.TransitionSource{Source: "jellyfin", Reason: "backfill_playback_recovered"},
 			}); playErr != nil {
 				s.logger.Warn("backfill playback recovery failed", "item_id", pr.itemID, "error", playErr)
@@ -1686,18 +1688,58 @@ func (s *Service) enrichProviderIDsFromJellyfin(ctx context.Context, event *jell
 	event.Payload.ProviderIDs = providerIDs
 }
 
+// resolveIdentityFromJellyfin completes a payload's identity before the write
+// tx opens (the tx forbids network I/O). Webhook payloads omit SeasonId often
+// enough that trusting them left a third of episodes unlinked; Jellyfin is
+// the authority, and its answer is final for the item's lifetime.
+func (s *Service) resolveIdentityFromJellyfin(ctx context.Context, event *jellyfin.WebhookEvent) {
+	p := &event.Payload
+	itemID := domain.NormalizeID(event.ItemID)
+	if s.jellyfinClient == nil || itemID == "" || isRemovalEvent(event.EventType) {
+		return
+	}
+	have := domain.MediaIdentity{ItemType: p.ItemType, SeriesID: p.SeriesID, SeasonID: p.SeasonID}
+	if p.SeasonNumber != nil {
+		have.SeasonNumber, have.Placed = *p.SeasonNumber, true
+	}
+	if have.Validate() == nil || (have.ItemType != "" && !supportsMediaIndexType(have.ItemType)) {
+		return
+	}
+	res, ok := s.identityCache.Get(itemID)
+	if !ok {
+		fetched, found, err := s.jellyfinClient.FetchIdentity(ctx, itemID)
+		if err != nil {
+			s.logger.Warn("jellyfin identity lookup failed; backfill will index the item", "item_id", itemID, "error", err)
+			return
+		}
+		if !found || fetched.Identity.Validate() != nil {
+			// Not placed yet ("Season Unknown"): never cache it, or the
+			// placeholder would outlive Jellyfin's real answer.
+			return
+		}
+		s.identityCache.Put(itemID, fetched)
+		res = fetched
+	}
+	id := res.Identity
+	p.ItemType, p.SeriesID, p.SeasonID = id.ItemType, id.SeriesID, id.SeasonID
+	if id.Placed {
+		n := id.SeasonNumber
+		p.SeasonNumber = &n
+	}
+	if res.SeasonName != "" {
+		p.SeasonName = res.SeasonName
+	}
+}
+
 func (s *Service) fetchProviderIDsCached(ctx context.Context, itemID string) (map[string]string, error) {
 	itemID = domain.NormalizeID(itemID)
 	if itemID == "" || s.jellyfinClient == nil {
 		return nil, nil
 	}
 
-	s.providerIDsMu.RLock()
-	if cached, ok := s.providerIDsCache[itemID]; ok {
-		s.providerIDsMu.RUnlock()
+	if cached, ok := s.providerIDsCache.Get(itemID); ok {
 		return domain.NormalizeProviderIDs(cached), nil
 	}
-	s.providerIDsMu.RUnlock()
 
 	ids, err := s.jellyfinClient.FetchProviderIDs(ctx, itemID)
 	if err != nil {
@@ -1705,11 +1747,9 @@ func (s *Service) fetchProviderIDsCached(ctx context.Context, itemID string) (ma
 	}
 	norm := domain.NormalizeProviderIDs(ids)
 
-	s.providerIDsMu.Lock()
 	if len(norm) > 0 {
-		s.providerIDsCache[itemID] = domain.NormalizeProviderIDs(norm)
+		s.providerIDsCache.Put(itemID, norm)
 	}
-	s.providerIDsMu.Unlock()
 
 	return norm, nil
 }
@@ -2259,14 +2299,6 @@ func formatSeasonLabel(seasonName string, seriesName string, fallback string) st
 		return season + " of " + series
 	}
 	return chooseName(seasonName, seriesName, fallback)
-}
-
-func humanTimeLabel(t time.Time) string {
-	if t.IsZero() {
-		return "unknown"
-	}
-	unix := t.UTC().Unix()
-	return fmt.Sprintf("<t:%d:R> (<t:%d:f>)", unix, unix)
 }
 
 func shortHash(value string) string {

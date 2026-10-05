@@ -523,6 +523,11 @@ func (t *txRepo) UpsertFlowCAS(ctx context.Context, flow domain.Flow, expectedVe
 	if err := bucketPutJSON(b, flow.ItemID, flow); err != nil {
 		return fmt.Errorf("persist flow %s: %w", flow.ItemID, err)
 	}
+	// Most upserts are schedule/state changes; the index covers only the name
+	// and id, and rebuilding it rewrites one key per trigram.
+	if found && flowSearchText(current) == flowSearchText(flow) {
+		return nil
+	}
 	if found {
 		if err := removeFlowSearchIndex(searchDoc, searchTri, current.ItemID); err != nil {
 			return err
@@ -583,22 +588,93 @@ func (t *txRepo) GetMedia(ctx context.Context, itemID string) (domain.MediaItem,
 	return domain.MediaItem{}, false, nil
 }
 
-func (t *txRepo) UpsertMedia(ctx context.Context, media domain.MediaItem) error {
+func (t *txRepo) CreateMedia(ctx context.Context, media domain.MediaItem) error {
 	if err := checkContext(ctx); err != nil {
 		return err
 	}
 	if media.ItemID == "" {
-		return fmt.Errorf("upsert media: item id required: %w", ErrInvalidInput)
+		return fmt.Errorf("create media: item id required: %w", ErrInvalidInput)
 	}
+	if err := media.Identity().Validate(); err != nil {
+		return fmt.Errorf("create media %s: %w", media.ItemID, err)
+	}
+	media = normalizeMedia(media)
+	b, err := requireBucket(t.tx, bucketMedia)
+	if err != nil {
+		return err
+	}
+	if b.Get([]byte(media.ItemID)) != nil {
+		return fmt.Errorf("create media %s: %w", media.ItemID, ErrAlreadyExists)
+	}
+	return putMedia(b, media)
+}
+
+func (t *txRepo) PatchMedia(ctx context.Context, itemID string, fn func(*domain.MediaItem)) error {
+	return t.updateMedia(ctx, itemID, func(m *domain.MediaItem) error {
+		before := m.Identity()
+		fn(m)
+		if m.Identity() != before {
+			return fmt.Errorf("patch media %s: %w", m.ItemID, domain.ErrIdentityImmutable)
+		}
+		return nil
+	})
+}
+
+func (t *txRepo) ReconcileMediaIdentity(ctx context.Context, itemID string, id domain.MediaIdentity, seasonName string) (domain.MediaIdentity, bool, error) {
+	if err := id.Validate(); err != nil {
+		return domain.MediaIdentity{}, false, fmt.Errorf("reconcile media %s: %w", itemID, err)
+	}
+	var before domain.MediaIdentity
+	changed := false
+	err := t.updateMedia(ctx, itemID, func(m *domain.MediaItem) error {
+		before = m.Identity()
+		changed = before != id || (seasonName != "" && m.SeasonName != seasonName)
+		id.Apply(m)
+		if seasonName != "" {
+			m.SeasonName = seasonName
+		}
+		return nil
+	})
+	return before, changed, err
+}
+
+func (t *txRepo) updateMedia(ctx context.Context, itemID string, fn func(*domain.MediaItem) error) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	itemID = domain.NormalizeID(itemID)
+	if itemID == "" {
+		return fmt.Errorf("update media: item id required: %w", ErrInvalidInput)
+	}
+	b, err := requireBucket(t.tx, bucketMedia)
+	if err != nil {
+		return err
+	}
+	var media domain.MediaItem
+	found, err := bucketGetJSON(b, itemID, &media)
+	if err != nil {
+		return fmt.Errorf("decode media %s: %w", itemID, err)
+	}
+	if !found {
+		return fmt.Errorf("update media %s: %w", itemID, ErrNotFound)
+	}
+	if err := fn(&media); err != nil {
+		return err
+	}
+	media.ItemID = itemID
+	return putMedia(b, normalizeMedia(media))
+}
+
+func normalizeMedia(media domain.MediaItem) domain.MediaItem {
 	media.ItemID = domain.NormalizeID(media.ItemID)
 	media.SeasonID = domain.NormalizeID(media.SeasonID)
 	media.SeriesID = domain.NormalizeID(media.SeriesID)
 	media.LastUserID = domain.NormalizeID(media.LastUserID)
 	media.ProviderIDs = domain.NormalizeProviderIDs(media.ProviderIDs)
-	b, err := requireBucket(t.tx, bucketMedia)
-	if err != nil {
-		return err
-	}
+	return media
+}
+
+func putMedia(b *bbolt.Bucket, media domain.MediaItem) error {
 	if err := bucketPutJSON(b, media.ItemID, media); err != nil {
 		return fmt.Errorf("persist media %s: %w", media.ItemID, err)
 	}
@@ -943,6 +1019,34 @@ func (t *txRepo) IsProcessed(ctx context.Context, key string) (bool, error) {
 		return false, err
 	}
 	return b.Get(keyBytes(key)) != nil, nil
+}
+
+// PruneDedupe deletes up to limit dedupe records marked before olderThan and
+// returns how many it removed. Callers loop in separate transactions so one
+// commit never holds the write lock for the whole (historically 1.5M-key)
+// bucket.
+func (t *txRepo) PruneDedupe(ctx context.Context, olderThan time.Time, limit int) (int, error) {
+	if err := checkContext(ctx); err != nil {
+		return 0, err
+	}
+	b, err := requireBucket(t.tx, bucketDedupe)
+	if err != nil {
+		return 0, err
+	}
+	var stale [][]byte
+	c := b.Cursor()
+	for k, v := c.First(); k != nil && len(stale) < limit; k, v = c.Next() {
+		at, err := time.Parse(time.RFC3339Nano, string(v))
+		if err != nil || at.Before(olderThan) {
+			stale = append(stale, append([]byte(nil), k...))
+		}
+	}
+	for _, k := range stale {
+		if err := b.Delete(k); err != nil {
+			return 0, fmt.Errorf("prune dedupe: %w", err)
+		}
+	}
+	return len(stale), nil
 }
 
 func (t *txRepo) MarkProcessed(ctx context.Context, key string, at time.Time) error {

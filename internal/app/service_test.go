@@ -765,6 +765,7 @@ func TestWebhookEpisodeCatalogEventAggregatesToSeasonTarget(t *testing.T) {
 			SeriesName:       "My Show",
 			NotificationType: "ItemAdded",
 			EventID:          "evt-episode-1",
+			SeasonNumber:     seasonNo(1),
 		},
 		Raw:       map[string]any{"ItemId": "ep-1", "ItemType": "Episode", "SeasonId": "season-1", "SeriesId": "series-1", "EventId": "evt-episode-1"},
 		ItemID:    "ep-1",
@@ -833,6 +834,7 @@ func TestWebhookEpisodeCatalogEventFetchesSeriesProviderIDs(t *testing.T) {
 			SeriesName:       "My Show",
 			NotificationType: "ItemUpdated",
 			EventID:          "evt-provider-1",
+			SeasonNumber:     seasonNo(1),
 		},
 		Raw:       map[string]any{"EventId": "evt-provider-1"},
 		ItemID:    "ep-provider-1",
@@ -927,12 +929,13 @@ func TestParseCustomIDWithColonsInTargetID(t *testing.T) {
 
 func TestDeriveTargetsUsesIDsNotTitles(t *testing.T) {
 	event := jellyfin.WebhookEvent{Payload: jellyfin.WebhookPayload{
-		ItemType:   "Episode",
-		Name:       "Some:Anime:Episode",
-		SeasonID:   "season-01",
-		SeasonName: "Season: 1",
-		SeriesID:   "series-abc",
-		SeriesName: "Anime: Saga",
+		ItemType:     "Episode",
+		Name:         "Some:Anime:Episode",
+		SeasonID:     "season-01",
+		SeasonName:   "Season: 1",
+		SeriesID:     "series-abc",
+		SeriesName:   "Anime: Saga",
+		SeasonNumber: seasonNo(1),
 	}}
 
 	targets := deriveTargets(event)
@@ -966,7 +969,7 @@ func TestIngestBackfillItemsSchedulesDeferredEvaluateFromLastPlay(t *testing.T) 
 	svc.SyncFlowManagerClock()
 
 	lastPlayed := now.Add(-2 * time.Hour)
-	err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+	err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{{
 		ItemID:       "ep-backfill-1",
 		ItemType:     "Episode",
 		SeasonID:     "season-1",
@@ -976,7 +979,9 @@ func TestIngestBackfillItemsSchedulesDeferredEvaluateFromLastPlay(t *testing.T) 
 		Name:         "Pilot",
 		LastPlayedAt: lastPlayed,
 		PlayCount:    3,
-	}})
+		DateCreated:  now.Add(-10 * 24 * time.Hour), // real snapshots always carry it,
+		SeasonNumber: seasonNo(1),
+	}}, "", "")
 	if err != nil {
 		t.Fatalf("ingest backfill items: %v", err)
 	}
@@ -1023,10 +1028,10 @@ func TestIngestBackfillReplayIsIdempotentForSameRevision(t *testing.T) {
 		PlayCount:          2,
 	}
 
-	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{item}); err != nil {
+	if err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{item}, "", ""); err != nil {
 		t.Fatalf("first backfill ingest: %v", err)
 	}
-	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{item}); err != nil {
+	if err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{item}, "", ""); err != nil {
 		t.Fatalf("replayed backfill ingest: %v", err)
 	}
 
@@ -1082,7 +1087,7 @@ func TestBackfillAfterLivePlaybackCanAdvanceMissedDowntimePlay(t *testing.T) {
 		LastPlayedAt:       base.Add(-3 * time.Hour),
 		PlayCount:          1,
 	}
-	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{item}); err != nil {
+	if err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{item}, "", ""); err != nil {
 		t.Fatalf("seed backfill: %v", err)
 	}
 
@@ -1102,7 +1107,7 @@ func TestBackfillAfterLivePlaybackCanAdvanceMissedDowntimePlay(t *testing.T) {
 	missedPlay := base.Add(-time.Hour)
 	item.LastPlayedAt = missedPlay
 	item.PlayCount = 3
-	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{item}); err != nil {
+	if err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{item}, "", ""); err != nil {
 		t.Fatalf("downtime backfill replay: %v", err)
 	}
 
@@ -1147,14 +1152,14 @@ func TestFullBackfillOverLiveIndexCanAdvancePlaybackWithoutRegression(t *testing
 	}
 
 	missedPlay := base.Add(-time.Hour)
-	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+	if err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{{
 		ItemID:             "movie-magicians-2",
 		ItemType:           "Movie",
 		Name:               "The Magicians",
 		DateLastMediaAdded: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
 		LastPlayedAt:       missedPlay,
 		PlayCount:          5,
-	}}); err != nil {
+	}}, "", ""); err != nil {
 		t.Fatalf("full backfill replay over live index: %v", err)
 	}
 
@@ -1189,12 +1194,12 @@ func TestBackfillReplayPreservesArchivedFlowState(t *testing.T) {
 		t.Fatalf("seed archived flow: %v", err)
 	}
 
-	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+	if err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{{
 		ItemID:             "movie-archived-1",
 		ItemType:           "Movie",
 		Name:               "The Magicians",
 		DateLastMediaAdded: now.Add(-48 * time.Hour),
-	}}); err != nil {
+	}}, "", ""); err != nil {
 		t.Fatalf("backfill replay: %v", err)
 	}
 
@@ -1237,7 +1242,7 @@ func TestPlaybackDuringDelayResolvesDelayAndReschedulesEval(t *testing.T) {
 		}, 0); err != nil {
 			return err
 		}
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+		return tx.CreateMedia(context.Background(), domain.MediaItem{
 			ItemID:    "movie-play-win-1",
 			ItemType:  "Movie",
 			Name:      "Play Wins Movie",
@@ -1321,7 +1326,7 @@ func TestTimestamplessPlaybackRegistersAsNow(t *testing.T) {
 		}, 0); err != nil {
 			return err
 		}
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+		return tx.CreateMedia(context.Background(), domain.MediaItem{
 			ItemID:    "movie-tsless-1",
 			ItemType:  "Movie",
 			Name:      "Timestampless",
@@ -1395,7 +1400,7 @@ func TestPlaybackProgressDoesNotInflatePlayCount(t *testing.T) {
 		}, 0); err != nil {
 			return err
 		}
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+		return tx.CreateMedia(context.Background(), domain.MediaItem{
 			ItemID: "movie-prog-1", ItemType: "Movie", Name: "Progress", UpdatedAt: base.Add(-48 * time.Hour),
 		})
 	}); err != nil {
@@ -1412,7 +1417,7 @@ func TestPlaybackProgressDoesNotInflatePlayCount(t *testing.T) {
 		{"PlaybackProgress", "evt-prog-2"},
 		{"PlaybackProgress", "evt-prog-3"},
 	} {
-		cur = base.Add(time.Duration(i) * time.Minute)
+		cur = base.Add(time.Duration(i) * progressWriteInterval) // each tick past the throttle
 		event := jellyfin.BuildWebhookEvent(
 			jellyfin.WebhookPayload{ItemID: "movie-prog-1", ItemType: "Movie", NotificationType: evt.typ, EventID: evt.id},
 			map[string]any{"ItemId": "movie-prog-1", "NotificationType": evt.typ, "EventId": evt.id},
@@ -1433,7 +1438,7 @@ func TestPlaybackProgressDoesNotInflatePlayCount(t *testing.T) {
 		if m.PlayCountTotal != 1 {
 			t.Fatalf("only the discrete start counts: got PlayCountTotal=%d want=1", m.PlayCountTotal)
 		}
-		wantLastPlayed := base.Add(3 * time.Minute) // last progress tick
+		wantLastPlayed := base.Add(3 * progressWriteInterval) // last progress tick
 		if !m.LastPlayedAt.Equal(wantLastPlayed) {
 			t.Fatalf("progress ticks must advance LastPlayedAt: got=%s want=%s", m.LastPlayedAt, wantLastPlayed)
 		}
@@ -1471,7 +1476,7 @@ func TestBackfillReplayPreservesDelayedActiveFlowSchedule(t *testing.T) {
 		}, 0); err != nil {
 			return err
 		}
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+		return tx.CreateMedia(context.Background(), domain.MediaItem{
 			ItemID:             "movie-delayed-1",
 			ItemType:           "Movie",
 			Name:               "RWBY",
@@ -1484,14 +1489,14 @@ func TestBackfillReplayPreservesDelayedActiveFlowSchedule(t *testing.T) {
 		t.Fatalf("seed delayed flow/media: %v", err)
 	}
 
-	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+	if err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{{
 		ItemID:             "movie-delayed-1",
 		ItemType:           "Movie",
 		Name:               "RWBY",
 		DateLastMediaAdded: now.Add(-72 * time.Hour),
 		LastPlayedAt:       lastPlayed,
 		PlayCount:          1,
-	}}); err != nil {
+	}}, "", ""); err != nil {
 		t.Fatalf("backfill replay: %v", err)
 	}
 
@@ -1523,7 +1528,7 @@ func TestBackfillReplayRecoversPendingReviewFlowWhenPlaybackAdvanced(t *testing.
 		}, 0); err != nil {
 			return err
 		}
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+		return tx.CreateMedia(context.Background(), domain.MediaItem{
 			ItemID:       "movie-pending-backfill-1",
 			ItemType:     "Movie",
 			Name:         "The Magicians",
@@ -1535,13 +1540,13 @@ func TestBackfillReplayRecoversPendingReviewFlowWhenPlaybackAdvanced(t *testing.
 	}
 
 	newPlay := now.Add(-time.Hour)
-	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+	if err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{{
 		ItemID:       "movie-pending-backfill-1",
 		ItemType:     "Movie",
 		Name:         "The Magicians",
 		LastPlayedAt: newPlay,
 		PlayCount:    2,
-	}}); err != nil {
+	}}, "", ""); err != nil {
 		t.Fatalf("backfill replay with advanced playback: %v", err)
 	}
 
@@ -1583,7 +1588,7 @@ func TestIngestBackfillItemsEpisodeUsesSeriesProviderIDsAndCache(t *testing.T) {
 
 	svc.SetJellyfinClient(jellyfin.NewClient(server.URL, "api-key", server.Client()))
 
-	err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{
+	err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{
 		{
 			ItemID:       "ep-backfill-provider-1",
 			ItemType:     "Episode",
@@ -1594,6 +1599,7 @@ func TestIngestBackfillItemsEpisodeUsesSeriesProviderIDsAndCache(t *testing.T) {
 			Name:         "Episode 1",
 			ProviderIDs:  map[string]string{"imdb": "tt-episode-1", "tmdb": "7001"},
 			LastPlayedAt: now,
+			SeasonNumber: seasonNo(1),
 		},
 		{
 			ItemID:       "ep-backfill-provider-2",
@@ -1605,8 +1611,9 @@ func TestIngestBackfillItemsEpisodeUsesSeriesProviderIDsAndCache(t *testing.T) {
 			Name:         "Episode 2",
 			ProviderIDs:  map[string]string{"imdb": "tt-episode-2", "tmdb": "7002"},
 			LastPlayedAt: now,
+			SeasonNumber: seasonNo(1),
 		},
-	})
+	}, "", "")
 	if err != nil {
 		t.Fatalf("ingest backfill items: %v", err)
 	}
@@ -1649,7 +1656,7 @@ func TestIngestBackfillItemsPreservesHigherPlaybackMetrics(t *testing.T) {
 	svc.SyncFlowManagerClock()
 
 	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+		return tx.CreateMedia(context.Background(), domain.MediaItem{
 			ItemID:         "movie-1",
 			Name:           "Movie One",
 			Title:          "Movie One",
@@ -1662,14 +1669,14 @@ func TestIngestBackfillItemsPreservesHigherPlaybackMetrics(t *testing.T) {
 		t.Fatalf("seed media: %v", err)
 	}
 
-	err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+	err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{{
 		ItemID:     "movie-1",
 		ItemType:   "Movie",
 		Name:       "Movie One",
 		PlayCount:  0,
 		ImageURL:   "",
 		SeriesName: "",
-	}})
+	}}, "", "")
 	if err != nil {
 		t.Fatalf("ingest backfill items: %v", err)
 	}
@@ -1690,11 +1697,11 @@ func TestLiveWebhookUpdatesSameBackfilledItem(t *testing.T) {
 	svc.now = func() time.Time { return now }
 	svc.SyncFlowManagerClock()
 
-	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+	if err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{{
 		ItemID:   "movie-live-1",
 		ItemType: "Movie",
 		Name:     "Old Title",
-	}}); err != nil {
+	}}, "", ""); err != nil {
 		t.Fatalf("seed backfill item: %v", err)
 	}
 
@@ -1859,64 +1866,6 @@ func TestIngestBackfillItemsWithCursorPersistsCursorMeta(t *testing.T) {
 	}
 }
 
-func TestIngestBackfillPlaybackUsesOriginalEventTimestamp(t *testing.T) {
-	store := newTestStore(t)
-	svc := NewService(store, nil, nil)
-	now := time.Date(2026, 4, 9, 10, 0, 0, 0, time.UTC)
-	svc.now = func() time.Time { return now }
-	svc.SyncFlowManagerClock()
-
-	eventAt := now.Add(-72 * time.Hour)
-	err := svc.IngestBackfillPlayback(context.Background(), []jellyfin.PlaybackEvent{{
-		ItemID: "movie-playback-ts",
-		Type:   "PlaybackStart",
-		Name:   "Movie Playback TS",
-		Date:   eventAt,
-	}})
-	if err != nil {
-		t.Fatalf("ingest backfill playback: %v", err)
-	}
-
-	media := mustGetMedia(t, store, "movie-playback-ts")
-	if !media.LastPlayedAt.Equal(eventAt) {
-		t.Fatalf("expected last played at original event time, got=%s want=%s", media.LastPlayedAt, eventAt)
-	}
-	if media.PlayCountTotal != 1 {
-		t.Fatalf("expected play count to increment to 1, got %d", media.PlayCountTotal)
-	}
-}
-
-func TestIngestBackfillPlaybackDoesNotCreateReviewFlowWithoutItemType(t *testing.T) {
-	store := newTestStore(t)
-	svc := NewService(store, nil, nil)
-	now := time.Date(2026, 4, 9, 12, 0, 0, 0, time.UTC)
-	svc.now = func() time.Time { return now }
-	svc.SyncFlowManagerClock()
-
-	err := svc.IngestBackfillPlayback(context.Background(), []jellyfin.PlaybackEvent{{
-		ItemID: "movie-no-type",
-		Type:   "PlaybackStart",
-		Name:   "alice is playing Movie X",
-		Date:   now.Add(-time.Hour),
-	}})
-	if err != nil {
-		t.Fatalf("ingest backfill playback: %v", err)
-	}
-
-	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
-		_, found, err := tx.GetFlow(context.Background(), "target:item:movie-no-type")
-		if err != nil {
-			return err
-		}
-		if found {
-			t.Fatal("expected no review flow from playback-only backfill event without item type")
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("verify flow absence: %v", err)
-	}
-}
-
 func TestHandlePlaybackWebhookDoesNotCreateFlowOrOverwriteNames(t *testing.T) {
 	store := newTestStore(t)
 	svc := NewService(store, nil, nil)
@@ -1925,7 +1874,7 @@ func TestHandlePlaybackWebhookDoesNotCreateFlowOrOverwriteNames(t *testing.T) {
 	svc.SyncFlowManagerClock()
 
 	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{
+		if err := tx.CreateMedia(context.Background(), domain.MediaItem{
 			ItemID:         "movie-play-1",
 			Name:           "Canonical Movie",
 			Title:          "Canonical Movie",
@@ -2006,10 +1955,10 @@ func TestHandleSeasonRemovalMarksChildrenAndSeasonFlowDeleted(t *testing.T) {
 	svc.SyncFlowManagerClock()
 
 	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-rm-1", SeasonID: "season-rm-1", SeasonName: "Season X", UpdatedAt: now}); err != nil {
+		if err := tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: "ep-rm-1", SeasonID: "season-rm-1", SeasonName: "Season X", UpdatedAt: now, ItemType: "Episode", SeriesID: "series-fixture", SeasonNumber: seasonNo(1)}); err != nil {
 			return err
 		}
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-rm-2", SeasonID: "season-rm-1", SeasonName: "Season X", UpdatedAt: now}); err != nil {
+		if err := tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: "ep-rm-2", SeasonID: "season-rm-1", SeasonName: "Season X", UpdatedAt: now, ItemType: "Episode", SeriesID: "series-fixture", SeasonNumber: seasonNo(1)}); err != nil {
 			return err
 		}
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
@@ -2087,10 +2036,10 @@ func TestEpisodeRemovalKeepsSeasonProjectionWhenEpisodesRemain(t *testing.T) {
 	svc.SyncFlowManagerClock()
 
 	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-rm-one", SeasonID: "season-rm-keep", SeasonName: "Season Keep", UpdatedAt: now}); err != nil {
+		if err := tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: "ep-rm-one", SeasonID: "season-rm-keep", SeasonName: "Season Keep", UpdatedAt: now, ItemType: "Episode", SeriesID: "series-fixture", SeasonNumber: seasonNo(1)}); err != nil {
 			return err
 		}
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-rm-two", SeasonID: "season-rm-keep", SeasonName: "Season Keep", UpdatedAt: now}); err != nil {
+		if err := tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: "ep-rm-two", SeasonID: "season-rm-keep", SeasonName: "Season Keep", UpdatedAt: now, ItemType: "Episode", SeriesID: "series-fixture", SeasonNumber: seasonNo(1)}); err != nil {
 			return err
 		}
 		return tx.UpsertFlowCAS(context.Background(), domain.Flow{
@@ -2120,6 +2069,7 @@ func TestEpisodeRemovalKeepsSeasonProjectionWhenEpisodesRemain(t *testing.T) {
 			SeasonName:       "Season Keep",
 			NotificationType: "ItemDeleted",
 			EventID:          "evt-episode-rm-one",
+			SeasonNumber:     seasonNo(1),
 		},
 		Raw:       map[string]any{"EventId": "evt-episode-rm-one"},
 		ItemID:    "ep-rm-one",
@@ -2218,7 +2168,7 @@ func TestPlaybackStaleEventDoesNotIncrementPlayCount(t *testing.T) {
 	svc.SyncFlowManagerClock()
 
 	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+		return tx.CreateMedia(context.Background(), domain.MediaItem{
 			ItemID:              "movie-play-stale",
 			Name:                "Play Movie",
 			Title:               "Play Movie",
@@ -2268,7 +2218,7 @@ func TestPlaybackEventClosesOpenHITLAndReschedulesEvaluation(t *testing.T) {
 	svc.SyncFlowManagerClock()
 
 	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{
+		if err := tx.CreateMedia(context.Background(), domain.MediaItem{
 			ItemID:       "movie-hitl-play",
 			Name:         "Playback Recovery Movie",
 			Title:        "Playback Recovery Movie",
@@ -2886,7 +2836,7 @@ func TestWebhookPlaybackRecoveryPurgesStaleHITLJobs(t *testing.T) {
 		}, 0); err != nil {
 			return err
 		}
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "recovery", ItemType: "Movie", LastPlayedAt: now, UpdatedAt: now}); err != nil {
+		if err := tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: "recovery", ItemType: "Movie", LastPlayedAt: now, UpdatedAt: now}); err != nil {
 			return err
 		}
 		// Seed a stale prompt and stale timeout — both should be purged.
@@ -3131,13 +3081,13 @@ func TestBackfillNeverPlayedItemDeferredByDateCreated(t *testing.T) {
 	svc.defaultExpireDays = expireDays
 	dateCreated := now // added today
 
-	err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+	err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{{
 		ItemID:      "movie-never-played-backfill",
 		ItemType:    "Movie",
 		Name:        "Never Played Backfill Movie",
 		DateCreated: dateCreated,
 		// LastPlayedAt is zero — never played
-	}})
+	}}, "", "")
 	if err != nil {
 		t.Fatalf("ingest backfill items: %v", err)
 	}
@@ -3191,7 +3141,7 @@ func TestRepeatedBackfillDoesNotOverrideDeferredEvalForNeverPlayedItem(t *testin
 	}
 
 	// First backfill run.
-	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{item}); err != nil {
+	if err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{item}, "", ""); err != nil {
 		t.Fatalf("first backfill: %v", err)
 	}
 
@@ -3207,7 +3157,7 @@ func TestRepeatedBackfillDoesNotOverrideDeferredEvalForNeverPlayedItem(t *testin
 		DateCreated:        dateCreated,
 		DateLastMediaAdded: dateCreated.Add(time.Second), // nudge to change dedupe key
 	}
-	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{item2}); err != nil {
+	if err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{item2}, "", ""); err != nil {
 		t.Fatalf("second backfill: %v", err)
 	}
 
@@ -3252,12 +3202,12 @@ func TestNeverPlayedItemOlderThanThresholdIsImmediatelyDueForReview(t *testing.T
 	now := dateCreated.Add(time.Duration(expireDays+1) * 24 * time.Hour)
 	svc.now = func() time.Time { return now }
 
-	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+	if err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{{
 		ItemID:      "movie-old-never-played",
 		ItemType:    "Movie",
 		Name:        "Old Never Played Movie",
 		DateCreated: dateCreated,
-	}}); err != nil {
+	}}, "", ""); err != nil {
 		t.Fatalf("ingest backfill: %v", err)
 	}
 
@@ -3290,14 +3240,14 @@ func TestPlayedItemAnchorsOnLastPlayedAtNotCreatedAt(t *testing.T) {
 	now := time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC)
 	svc.now = func() time.Time { return now }
 
-	if err := svc.IngestBackfillItems(context.Background(), []jellyfin.ItemSnapshot{{
+	if err := svc.IngestBackfillItemsWithCursor(context.Background(), []jellyfin.ItemSnapshot{{
 		ItemID:       "movie-played-recently",
 		ItemType:     "Movie",
 		Name:         "Played Recently Movie",
 		DateCreated:  dateCreated,
 		LastPlayedAt: lastPlayed,
 		PlayCount:    1,
-	}}); err != nil {
+	}}, "", ""); err != nil {
 		t.Fatalf("ingest backfill: %v", err)
 	}
 

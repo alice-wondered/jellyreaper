@@ -66,6 +66,11 @@ func (s *Scheduler) RequestEval(ctx context.Context, tx repo.TxRepository, flow 
 		return err
 	}
 
+	if found && job.Status == domain.JobStatusPending && job.RunAt.Equal(runAt) {
+		if current, err := jobs.DecodePayload[jobs.EvaluatePolicyPayload](job); err == nil && current.FlowVersion == flowVersion {
+			return nil // already scheduled exactly so; rewriting it is a no-op write
+		}
+	}
 	if found {
 		activelyLeased := job.Status == domain.JobStatusLeased && now.Before(job.LeaseUntil)
 

@@ -62,15 +62,20 @@ func seedFlow(t *testing.T, store *bboltrepo.Store, itemID string, title string,
 func seedMedia(t *testing.T, store *bboltrepo.Store, itemID string, seasonID string, seriesID string, seriesName string) {
 	t.Helper()
 	now := time.Date(2026, 4, 8, 10, 0, 0, 0, time.UTC)
+	itemType := "Episode"
+	if seasonID == "" {
+		itemType = "Movie"
+	}
 	err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{
-			ItemID:     itemID,
-			ItemType:   "Episode",
-			SeasonID:   seasonID,
-			SeriesID:   seriesID,
-			SeriesName: seriesName,
-			CreatedAt:  now,
-			UpdatedAt:  now,
+		return tx.CreateMedia(context.Background(), domain.MediaItem{
+			ItemID:       itemID,
+			ItemType:     itemType,
+			SeasonID:     seasonID,
+			SeriesID:     seriesID,
+			SeriesName:   seriesName,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+			SeasonNumber: seasonNo(1),
 		})
 	})
 	if err != nil {
@@ -104,7 +109,7 @@ func TestQueryTargetState_SelectCandidateByNumber(t *testing.T) {
 	seedFlow(t, store, "m-1", "Alien", domain.FlowStateActive)
 	seedFlow(t, store, "m-2", "Alien 3", domain.FlowStateArchived)
 
-	h := NewHarness(store, "", "")
+	h := NewHarnessWithProvider(store, nil, "")
 	threadID := "thread-1"
 
 	out, _, err := h.queryTargetState(context.Background(), threadID, "alien")
@@ -131,7 +136,7 @@ func TestArchiveConfirmFlow_YesArchivesSelection(t *testing.T) {
 	store := newTestStore(t)
 	seedFlow(t, store, "m-7", "Blade Runner", domain.FlowStateActive)
 
-	h := NewHarness(store, "", "")
+	h := NewHarnessWithProvider(store, nil, "")
 	threadID := "thread-archive"
 
 	out, _, err := h.setArchiveState(context.Background(), threadID, "blade", true)
@@ -160,7 +165,7 @@ func TestArchiveConfirmFlow_NoCancels(t *testing.T) {
 	store := newTestStore(t)
 	seedFlow(t, store, "m-8", "Arrival", domain.FlowStateActive)
 
-	h := NewHarness(store, "", "")
+	h := NewHarnessWithProvider(store, nil, "")
 	threadID := "thread-cancel"
 
 	_, _, err := h.setArchiveState(context.Background(), threadID, "arrival", true)
@@ -186,7 +191,7 @@ func TestScheduleDelete_ConfirmQueuesDeleteJob(t *testing.T) {
 	store := newTestStore(t)
 	seedFlow(t, store, "m-9", "Interstellar", domain.FlowStateActive)
 
-	h := NewHarness(store, "", "")
+	h := NewHarnessWithProvider(store, nil, "")
 	h.SetDecisionService(app.NewService(store, nil, nil))
 	threadID := "thread-delete"
 
@@ -231,7 +236,7 @@ func TestScheduleDelete_NoCancelsWithoutQueueing(t *testing.T) {
 	store := newTestStore(t)
 	seedFlow(t, store, "target:season:season-77", "Season 77", domain.FlowStateActive)
 
-	h := NewHarness(store, "", "")
+	h := NewHarnessWithProvider(store, nil, "")
 	h.SetDecisionService(app.NewService(store, nil, nil))
 	threadID := "thread-delete-cancel"
 
@@ -264,7 +269,7 @@ func TestScheduleDelete_NoCancelsWithoutQueueing(t *testing.T) {
 
 func TestHistoryRingBufferKeepsRecentWindow(t *testing.T) {
 	store := newTestStore(t)
-	h := NewHarness(store, "", "")
+	h := NewHarnessWithProvider(store, nil, "")
 	threadID := "thread-ring"
 
 	for i := 1; i <= 25; i++ {
@@ -282,7 +287,7 @@ func TestHistoryRingBufferKeepsRecentWindow(t *testing.T) {
 
 func TestHistoryRestoresFromDiscordOnMiss(t *testing.T) {
 	store := newTestStore(t)
-	h := NewHarness(store, "", "")
+	h := NewHarnessWithProvider(store, nil, "")
 	threadID := "thread-restore"
 	called := 0
 
@@ -314,8 +319,8 @@ func TestHistoryRestoresFromDiscordOnMiss(t *testing.T) {
 
 func TestThreadContextCapEvictsLeastRecentlyUsed(t *testing.T) {
 	store := newTestStore(t)
-	h := NewHarness(store, "", "")
-	h.SetMaxThreadContexts(2)
+	h := NewHarnessWithProvider(store, nil, "")
+	h.maxThreads = 2
 
 	h.appendHistory("thread-1", "alice: one")
 	h.appendHistory("thread-2", "alice: two")
@@ -338,7 +343,7 @@ func TestSerializeThreadContextUsesHumanReadableState(t *testing.T) {
 	store := newTestStore(t)
 	seedFlow(t, store, "target:season:s-human", "Season Human", domain.FlowStateActive)
 
-	h := NewHarness(store, "", "")
+	h := NewHarnessWithProvider(store, nil, "")
 	state := threadState{
 		SelectedTargetID: "target:season:s-human",
 		PendingAction:    "schedule_delete",
@@ -362,7 +367,7 @@ func TestAliasMemorySupportsTitleLabelFollowUp(t *testing.T) {
 	seedFlow(t, store, "m-21", "Dune", domain.FlowStateActive)
 	seedFlow(t, store, "m-22", "Dune Part Two", domain.FlowStateActive)
 
-	h := NewHarness(store, "", "")
+	h := NewHarnessWithProvider(store, nil, "")
 	threadID := "thread-alias"
 
 	out, _, err := h.setArchiveState(context.Background(), threadID, "dune", false)
@@ -389,7 +394,7 @@ func TestRememberAliasToolStoresCustomPhrase(t *testing.T) {
 	store := newTestStore(t)
 	seedFlow(t, store, "m-41", "The Matrix", domain.FlowStateActive)
 
-	h := NewHarness(store, "", "")
+	h := NewHarnessWithProvider(store, nil, "")
 	threadID := "thread-remember-alias"
 
 	_, _, err := h.queryTargetState(context.Background(), threadID, "matrix")
@@ -415,7 +420,7 @@ func TestDelayTargetDays_UpdatesFlowViaService(t *testing.T) {
 	store := newTestStore(t)
 	seedFlow(t, store, "target:season:s-delay", "Season Delay", domain.FlowStatePendingReview)
 
-	h := NewHarness(store, "", "")
+	h := NewHarnessWithProvider(store, nil, "")
 	h.SetDecisionService(app.NewService(store, nil, nil))
 	threadID := "thread-delay"
 
@@ -440,7 +445,7 @@ func TestScheduleDeleteProjection_UsesProjectionSelectionFlow(t *testing.T) {
 	seedMedia(t, store, "ep-1", "s-1", "series-1", "The Office")
 	seedMedia(t, store, "ep-2", "s-2", "series-1", "The Office")
 
-	h := NewHarness(store, "", "")
+	h := NewHarnessWithProvider(store, nil, "")
 	h.SetDecisionService(app.NewService(store, nil, nil))
 	threadID := "thread-series-delete"
 
@@ -497,7 +502,7 @@ func TestFuzzySearchTargets_FiltersBySubjectType(t *testing.T) {
 	seedFlow(t, store, "target:movie:m-1", "Dune", domain.FlowStateActive)
 	seedFlow(t, store, "target:season:s-9", "Season 1 of Dune Series", domain.FlowStateActive)
 
-	h := NewHarness(store, "", "")
+	h := NewHarnessWithProvider(store, nil, "")
 	out, _, err := h.fuzzySearchTargets(context.Background(), "dune", "movie", 10)
 	if err != nil {
 		t.Fatalf("fuzzy search targets: %v", err)
@@ -516,7 +521,7 @@ func TestQueryLibrary_CountsMoviesByTitleQuery(t *testing.T) {
 	seedFlow(t, store, "target:movie:m-2", "Scooby-Doo on Zombie Island", domain.FlowStateActive)
 	seedFlow(t, store, "target:movie:m-3", "Interstellar", domain.FlowStateActive)
 
-	h := NewHarness(store, "", "")
+	h := NewHarnessWithProvider(store, nil, "")
 	out, _, err := h.queryLibrary(context.Background(), "scooby", "flows", "movie", 10)
 	if err != nil {
 		t.Fatalf("query library: %v", err)
@@ -539,7 +544,7 @@ func TestQueryLibrary_ReturnsDistinctTVShowCount(t *testing.T) {
 	seedMedia(t, store, "ep-mag-2", "s-2", "series-mag", "The Magicians")
 	seedMedia(t, store, "ep-rwby-1", "s-3", "series-rwby", "RWBY")
 
-	h := NewHarness(store, "", "")
+	h := NewHarnessWithProvider(store, nil, "")
 	out, _, err := h.queryLibrary(context.Background(), "", "both", "", 10)
 	if err != nil {
 		t.Fatalf("query library summary: %v", err)
@@ -560,7 +565,7 @@ func TestQueryLibrary_ReturnsRichFlowsAndMediaForIntrospection(t *testing.T) {
 	seedMedia(t, store, "m-scooby", "", "", "")
 	seedMedia(t, store, "ep-mag-1", "s-mag-1", "series-mag", "The Magicians")
 
-	h := NewHarness(store, "", "")
+	h := NewHarnessWithProvider(store, nil, "")
 	fuzzy, _, err := h.fuzzySearchTargets(context.Background(), "magicians", "season", 5)
 	if err != nil {
 		t.Fatalf("fuzzy search: %v", err)
@@ -603,7 +608,7 @@ func TestQueryLibraryFilteredCounts(t *testing.T) {
 	seedFlow(t, store, "target:movie:alien2", "Aliens", domain.FlowStateActive)
 	seedFlow(t, store, "target:movie:alien3", "Alien 3", domain.FlowStateActive)
 
-	h := NewHarness(store, "", "")
+	h := NewHarnessWithProvider(store, nil, "")
 	out, _, err := h.queryLibrary(context.Background(), "scooby", "both", "movie", 20)
 	if err != nil {
 		t.Fatalf("query library: %v", err)
@@ -631,7 +636,7 @@ func TestRequestReviewMovesFlowToPendingReview(t *testing.T) {
 	seedFlow(t, store, "target:movie:review-me", "Review Me", domain.FlowStateActive)
 
 	svc := app.NewService(store, nil, nil)
-	h := NewHarness(store, "", "")
+	h := NewHarnessWithProvider(store, nil, "")
 	h.SetDecisionService(svc)
 	threadID := "thread-review"
 

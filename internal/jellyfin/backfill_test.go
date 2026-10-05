@@ -17,37 +17,6 @@ import (
 	gen "jellyreaper/internal/jellyfin/gen"
 )
 
-func TestBackfillFetchPlaybackEventsSince(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/System/ActivityLog/Entries" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		res := gen.ActivityLogEntryQueryResult{Items: &[]gen.ActivityLogEntry{
-			{Type: strPtr("PlaybackStart"), ItemId: strPtr("item-1"), Name: strPtr("Movie A")},
-			{Type: strPtr("ItemAdded"), ItemId: strPtr("item-2"), Name: strPtr("Movie B")},
-		}}
-		_ = json.NewEncoder(w).Encode(res)
-	}))
-	defer server.Close()
-
-	b, err := NewBackfillService(server.URL, "token", server.Client())
-	if err != nil {
-		t.Fatalf("new backfill service: %v", err)
-	}
-
-	events, err := b.FetchPlaybackEventsSince(context.Background(), time.Now().Add(-time.Hour), 100)
-	if err != nil {
-		t.Fatalf("fetch playback events: %v", err)
-	}
-	if len(events) != 2 {
-		t.Fatalf("unexpected event count: %d", len(events))
-	}
-	if events[0].Type != "PlaybackStart" || events[0].ItemID != "item-1" {
-		t.Fatalf("unexpected first event: %#v", events[0])
-	}
-}
-
 func TestBackfillFetchChangedItemsSince(t *testing.T) {
 	id := uuid.New()
 	now := time.Now().UTC()
@@ -94,7 +63,7 @@ func TestBackfillFetchChangedItemsSince(t *testing.T) {
 		t.Fatalf("new backfill service: %v", err)
 	}
 
-	items, err := b.FetchChangedItemsSince(context.Background(), time.Now().Add(-24*time.Hour), 100)
+	items, err := fetchAllChangedItems(b, context.Background(), time.Now().Add(-24*time.Hour), 100)
 	if err != nil {
 		t.Fatalf("fetch changed items: %v", err)
 	}
@@ -158,7 +127,7 @@ func TestBackfillFetchChangedItemsSincePaginatesAllResults(t *testing.T) {
 		t.Fatalf("new backfill service: %v", err)
 	}
 
-	items, err := b.FetchChangedItemsSince(context.Background(), time.Now().Add(-24*time.Hour), 2)
+	items, err := fetchAllChangedItems(b, context.Background(), time.Now().Add(-24*time.Hour), 2)
 	if err != nil {
 		t.Fatalf("fetch changed items: %v", err)
 	}
@@ -213,7 +182,7 @@ func TestBackfillFetchChangedItemsSinceStopsWhenOlderThanSince(t *testing.T) {
 		t.Fatalf("new backfill service: %v", err)
 	}
 
-	items, err := b.FetchChangedItemsSince(context.Background(), since, 2)
+	items, err := fetchAllChangedItems(b, context.Background(), since, 2)
 	if err != nil {
 		t.Fatalf("fetch changed items: %v", err)
 	}
@@ -222,53 +191,6 @@ func TestBackfillFetchChangedItemsSinceStopsWhenOlderThanSince(t *testing.T) {
 	}
 	if itemsCalls != 2 {
 		t.Fatalf("expected two item page requests before stop, got %d", itemsCalls)
-	}
-}
-
-func TestBackfillFetchPlaybackEventsSincePaginatesAllResults(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/System/ActivityLog/Entries" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		start, _ := strconv.Atoi(r.URL.Query().Get("startIndex"))
-		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-		if limit <= 0 {
-			limit = 500
-		}
-
-		total := 5
-		if start >= total {
-			_ = json.NewEncoder(w).Encode(gen.ActivityLogEntryQueryResult{Items: &[]gen.ActivityLogEntry{}})
-			return
-		}
-		end := start + limit
-		if end > total {
-			end = total
-		}
-
-		out := make([]gen.ActivityLogEntry, 0, end-start)
-		for i := start; i < end; i++ {
-			typ := "PlaybackStart"
-			itemID := fmt.Sprintf("item-%d", i+1)
-			name := fmt.Sprintf("Item %d", i+1)
-			out = append(out, gen.ActivityLogEntry{Type: &typ, ItemId: &itemID, Name: &name})
-		}
-		_ = json.NewEncoder(w).Encode(gen.ActivityLogEntryQueryResult{Items: &out})
-	}))
-	defer server.Close()
-
-	b, err := NewBackfillService(server.URL, "token", server.Client())
-	if err != nil {
-		t.Fatalf("new backfill service: %v", err)
-	}
-
-	events, err := b.FetchPlaybackEventsSince(context.Background(), time.Now().Add(-time.Hour), 2)
-	if err != nil {
-		t.Fatalf("fetch playback events: %v", err)
-	}
-	if len(events) != 5 {
-		t.Fatalf("expected 5 events, got %d", len(events))
 	}
 }
 
@@ -298,7 +220,7 @@ func TestBackfillFetchChangedItemsSinceEnrichesPlaybackAcrossUsers(t *testing.T)
 		t.Fatalf("new backfill service: %v", err)
 	}
 
-	items, err := b.FetchChangedItemsSince(context.Background(), time.Now().Add(-24*time.Hour), 100)
+	items, err := fetchAllChangedItems(b, context.Background(), time.Now().Add(-24*time.Hour), 100)
 	if err != nil {
 		t.Fatalf("fetch changed items: %v", err)
 	}
@@ -338,10 +260,10 @@ func TestBackfillFetchChangedItemsSinceCachesUsersList(t *testing.T) {
 		t.Fatalf("new backfill service: %v", err)
 	}
 
-	if _, err := b.FetchChangedItemsSince(context.Background(), time.Now().Add(-24*time.Hour), 100); err != nil {
+	if _, err := fetchAllChangedItems(b, context.Background(), time.Now().Add(-24*time.Hour), 100); err != nil {
 		t.Fatalf("first fetch changed items: %v", err)
 	}
-	if _, err := b.FetchChangedItemsSince(context.Background(), time.Now().Add(-24*time.Hour), 100); err != nil {
+	if _, err := fetchAllChangedItems(b, context.Background(), time.Now().Add(-24*time.Hour), 100); err != nil {
 		t.Fatalf("second fetch changed items: %v", err)
 	}
 	if usersCalls != 1 {
@@ -424,7 +346,7 @@ func TestBackfillFetchChangedItemsSinceChunksUserItemsIdsToAvoidLongURLs(t *test
 		t.Fatalf("new backfill service: %v", err)
 	}
 
-	if _, err := b.FetchChangedItemsSince(context.Background(), time.Now().Add(-24*time.Hour), 500); err != nil {
+	if _, err := fetchAllChangedItems(b, context.Background(), time.Now().Add(-24*time.Hour), 500); err != nil {
 		t.Fatalf("fetch changed items: %v", err)
 	}
 	if requestCount < 2 {
@@ -461,7 +383,7 @@ func TestBackfillFetchChangedItemsSinceSurfacesEnrichmentWarnings(t *testing.T) 
 		}
 	})
 
-	if _, err := b.FetchChangedItemsSince(context.Background(), time.Now().Add(-24*time.Hour), 100); err == nil {
+	if _, err := fetchAllChangedItems(b, context.Background(), time.Now().Add(-24*time.Hour), 100); err == nil {
 		t.Fatal("expected fetch changed items to fail when enrichment fails")
 	}
 	if warnings == 0 {
@@ -522,7 +444,7 @@ func TestBackfillFetchChangedItemsSinceRealisticAnonymizedUserPlaybackPattern(t 
 
 	// Relative to the fixture, not wall clock: the window must keep holding
 	// recentMoviePlay as real time moves past it.
-	items, err := b.FetchChangedItemsSince(context.Background(), recentMoviePlay.Add(-90*24*time.Hour), 100)
+	items, err := fetchAllChangedItems(b, context.Background(), recentMoviePlay.Add(-90*24*time.Hour), 100)
 	if err != nil {
 		t.Fatalf("fetch changed items: %v", err)
 	}
@@ -544,5 +466,24 @@ func TestBackfillFetchChangedItemsSinceRealisticAnonymizedUserPlaybackPattern(t 
 	}
 	if movie.PlayCount != 4 {
 		t.Fatalf("expected aggregated movie playcount 4, got %d", movie.PlayCount)
+	}
+}
+
+// fetchAllChangedItems drains FetchChangedItemsPage the way the production
+// cursor loop in cmd/jellyreaper does, so these tests exercise the page API
+// production actually calls.
+func fetchAllChangedItems(b *BackfillService, ctx context.Context, since time.Time, limit int32) ([]ItemSnapshot, error) {
+	var out []ItemSnapshot
+	start := int32(0)
+	for {
+		page, err := b.FetchChangedItemsPage(ctx, since, start, limit)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, page.Items...)
+		if !page.HasMore || len(page.Items) == 0 {
+			return out, nil
+		}
+		start = page.NextStartIndex
 	}
 }

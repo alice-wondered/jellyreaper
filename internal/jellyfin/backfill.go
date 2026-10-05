@@ -29,7 +29,6 @@ type BackfillService struct {
 	baseURL       string
 	apiKey        string
 	httpClient    *http.Client
-	progressHook  func(FetchProgress)
 	warningHook   func(string, error)
 	usersMu       sync.Mutex
 	cachedUsers   []userSummary
@@ -42,35 +41,11 @@ const enrichmentRetryMaxAttempts = 4
 const enrichmentRetryBaseDelay = 200 * time.Millisecond
 const enrichmentRetryMaxDelay = 2 * time.Second
 
-type FetchProgress struct {
-	Stream           string
-	Page             int
-	Fetched          int
-	PageItems        int
-	TotalRecordCount int
-	Since            time.Time
-}
-
-type PlaybackPage struct {
-	Events           []PlaybackEvent
-	NextStartIndex   int32
-	HasMore          bool
-	TotalRecordCount int
-}
-
 type ItemPage struct {
 	Items            []ItemSnapshot
 	NextStartIndex   int32
 	HasMore          bool
 	TotalRecordCount int
-}
-
-type PlaybackEvent struct {
-	ItemID string
-	UserID string
-	Type   string
-	Name   string
-	Date   time.Time
 }
 
 type ItemSnapshot struct {
@@ -79,6 +54,7 @@ type ItemSnapshot struct {
 	ItemType           string
 	SeasonID           string
 	SeasonName         string
+	SeasonNumber       *int
 	SeriesID           string
 	SeriesName         string
 	Name               string
@@ -116,155 +92,8 @@ func NewBackfillService(baseURL, apiKey string, httpClient *http.Client) (*Backf
 	return &BackfillService{client: client, baseURL: strings.TrimRight(baseURL, "/"), apiKey: strings.TrimSpace(apiKey), httpClient: httpClient}, nil
 }
 
-func NewBackfillServiceWithClient(client BackfillClient) *BackfillService {
-	return &BackfillService{client: client}
-}
-
-func (s *BackfillService) SetProgressHook(hook func(FetchProgress)) {
-	s.progressHook = hook
-}
-
 func (s *BackfillService) SetWarningHook(hook func(string, error)) {
 	s.warningHook = hook
-}
-
-func (s *BackfillService) FetchPlaybackEventsSince(ctx context.Context, since time.Time, limit int32) ([]PlaybackEvent, error) {
-	pageSize := limit
-	if pageSize <= 0 {
-		pageSize = 500
-	}
-
-	out := make([]PlaybackEvent, 0, pageSize)
-	startIndex := int32(0)
-	page := 0
-
-	for {
-		pageData, err := s.FetchPlaybackEventsPage(ctx, since, startIndex, pageSize)
-		if err != nil {
-			return nil, err
-		}
-		if len(pageData.Events) == 0 {
-			break
-		}
-		page++
-
-		out = append(out, pageData.Events...)
-		s.emitProgress(FetchProgress{
-			Stream:           "playback",
-			Page:             page,
-			Fetched:          len(out),
-			PageItems:        len(pageData.Events),
-			TotalRecordCount: pageData.TotalRecordCount,
-			Since:            since,
-		})
-
-		if !pageData.HasMore {
-			break
-		}
-		startIndex = pageData.NextStartIndex
-	}
-
-	return out, nil
-}
-
-func (s *BackfillService) FetchPlaybackEventsPage(ctx context.Context, since time.Time, startIndex int32, limit int32) (PlaybackPage, error) {
-	pageSize := limit
-	if pageSize <= 0 {
-		pageSize = 500
-	}
-
-	params := &gen.GetLogEntriesParams{StartIndex: &startIndex, Limit: &pageSize}
-	if !since.IsZero() {
-		params.MinDate = &since
-	}
-
-	resp, err := s.client.GetLogEntriesWithResponse(ctx, params)
-	if err != nil {
-		return PlaybackPage{}, fmt.Errorf("fetch jellyfin activity log: %w", err)
-	}
-	if resp.StatusCode() != http.StatusOK {
-		return PlaybackPage{}, fmt.Errorf("activity log returned status %d", resp.StatusCode())
-	}
-
-	body := resp.JSON200
-	if body == nil {
-		body = resp.ApplicationjsonProfileCamelCase200
-	}
-	if body == nil {
-		body = resp.ApplicationjsonProfilePascalCase200
-	}
-	if body == nil && len(resp.Body) > 0 {
-		var parsed gen.ActivityLogEntryQueryResult
-		if err := json.Unmarshal(resp.Body, &parsed); err == nil {
-			body = &parsed
-		} else if looksLikeHTML(resp.Body) {
-			return PlaybackPage{}, htmlResponseError("activity log", resp.HTTPResponse, resp.Body)
-		}
-	}
-	if body == nil || body.Items == nil || len(*body.Items) == 0 {
-		return PlaybackPage{Events: []PlaybackEvent{}, NextStartIndex: startIndex, HasMore: false, TotalRecordCount: 0}, nil
-	}
-
-	events := make([]PlaybackEvent, 0, len(*body.Items))
-	for _, entry := range *body.Items {
-		t := safeString(entry.Type)
-		if t == "" {
-			continue
-		}
-		events = append(events, PlaybackEvent{
-			ItemID: safeString(entry.ItemId),
-			UserID: uuidString(entry.UserId),
-			Type:   t,
-			Name:   safeString(entry.Name),
-			Date:   safeTime(entry.Date),
-		})
-	}
-
-	return PlaybackPage{
-		Events:           events,
-		NextStartIndex:   startIndex + int32(len(*body.Items)),
-		HasMore:          int32(len(*body.Items)) >= pageSize,
-		TotalRecordCount: safeTotalCount(body.TotalRecordCount),
-	}, nil
-}
-
-func (s *BackfillService) FetchChangedItemsSince(ctx context.Context, since time.Time, limit int32) ([]ItemSnapshot, error) {
-	pageSize := limit
-	if pageSize <= 0 {
-		pageSize = 500
-	}
-
-	out := make([]ItemSnapshot, 0, pageSize)
-	startIndex := int32(0)
-	page := 0
-
-	for {
-		pageData, err := s.FetchChangedItemsPage(ctx, since, startIndex, pageSize)
-		if err != nil {
-			return nil, err
-		}
-		if len(pageData.Items) == 0 {
-			break
-		}
-		page++
-
-		out = append(out, pageData.Items...)
-		s.emitProgress(FetchProgress{
-			Stream:           "items",
-			Page:             page,
-			Fetched:          len(out),
-			PageItems:        len(pageData.Items),
-			TotalRecordCount: pageData.TotalRecordCount,
-			Since:            since,
-		})
-
-		if !pageData.HasMore {
-			break
-		}
-		startIndex = pageData.NextStartIndex
-	}
-
-	return out, nil
 }
 
 func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.Time, startIndex int32, limit int32) (ItemPage, error) {
@@ -343,6 +172,7 @@ func (s *BackfillService) FetchChangedItemsPage(ctx context.Context, since time.
 				ItemType:           itemType,
 				SeasonID:           domain.NormalizeID(uuidString(item.SeasonId)),
 				SeasonName:         safeString(item.SeasonName),
+				SeasonNumber:       intPtr(item.ParentIndexNumber),
 				SeriesID:           domain.NormalizeID(uuidString(item.SeriesId)),
 				SeriesName:         safeString(item.SeriesName),
 				Name:               safeString(item.Name),
@@ -774,12 +604,6 @@ func chunkItemIDs(ids []string, chunkSize int) [][]string {
 	return out
 }
 
-func (s *BackfillService) emitProgress(progress FetchProgress) {
-	if s.progressHook != nil {
-		s.progressHook(progress)
-	}
-}
-
 func (s *BackfillService) emitWarning(stage string, err error) {
 	if err == nil || s.warningHook == nil {
 		return
@@ -895,4 +719,12 @@ func safeNestedPlayCount(data *gen.UserItemDataDto) int32 {
 		return 0
 	}
 	return *data.PlayCount
+}
+
+func intPtr(v *int32) *int {
+	if v == nil {
+		return nil
+	}
+	n := int(*v)
+	return &n
 }

@@ -154,7 +154,7 @@ func TestExecuteDeleteHandlerMovieProjectionTriggersRadarrRemoval(t *testing.T) 
 		}, 0); err != nil {
 			return err
 		}
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+		return tx.CreateMedia(context.Background(), domain.MediaItem{
 			ItemID:      "mv-arr",
 			ItemType:    "Movie",
 			Name:        "Movie ARR",
@@ -218,10 +218,10 @@ func TestExecuteDeleteHandlerSeasonProjectionTriggersSonarrSeasonRemoval(t *test
 		}, 0); err != nil {
 			return err
 		}
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-arr-1", ItemType: "Episode", SeasonID: "season-arr", SeasonName: "Season 3", SeriesID: "series-arr", ProviderIDs: map[string]string{"imdb": "tt6503782", "tmdb": "5957143"}, UpdatedAt: now}); err != nil {
+		if err := tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: "ep-arr-1", ItemType: "Episode", SeasonID: "season-arr", SeasonName: "Season 3", SeriesID: "series-arr", ProviderIDs: map[string]string{"imdb": "tt6503782", "tmdb": "5957143"}, UpdatedAt: now, SeasonNumber: seasonNo(3)}); err != nil {
 			return err
 		}
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-arr-2", ItemType: "Episode", SeasonID: "season-arr", SeasonName: "Season 3", SeriesID: "series-arr", ProviderIDs: map[string]string{"imdb": "tt6503782", "tmdb": "5957143"}, UpdatedAt: now})
+		return tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: "ep-arr-2", ItemType: "Episode", SeasonID: "season-arr", SeasonName: "Season 3", SeriesID: "series-arr", ProviderIDs: map[string]string{"imdb": "tt6503782", "tmdb": "5957143"}, UpdatedAt: now, SeasonNumber: seasonNo(3)})
 	}); err != nil {
 		t.Fatalf("seed season state: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestExecuteDeleteHandlerMovieProjectionFallsBackToJellyfinWhenRadarrUnmanag
 		}, 0); err != nil {
 			return err
 		}
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "mv-unmanaged", ItemType: "Movie", UpdatedAt: now})
+		return tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: "mv-unmanaged", ItemType: "Movie", UpdatedAt: now})
 	}); err != nil {
 		t.Fatalf("seed state: %v", err)
 	}
@@ -330,10 +330,10 @@ func TestExecuteDeleteHandlerSeasonProjectionFallsBackToJellyfinWhenSonarrUnmana
 		}, 0); err != nil {
 			return err
 		}
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-unmanaged-1", ItemType: "Episode", SeasonID: "season-unmanaged", SeasonName: "Season 2", UpdatedAt: now}); err != nil {
+		if err := tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: "ep-unmanaged-1", ItemType: "Episode", SeasonID: "season-unmanaged", SeasonName: "Season 2", UpdatedAt: now, SeriesID: "series-fixture", SeasonNumber: seasonNo(2)}); err != nil {
 			return err
 		}
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "ep-unmanaged-2", ItemType: "Episode", SeasonID: "season-unmanaged", SeasonName: "Season 2", UpdatedAt: now})
+		return tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: "ep-unmanaged-2", ItemType: "Episode", SeasonID: "season-unmanaged", SeasonName: "Season 2", UpdatedAt: now, SeriesID: "series-fixture", SeasonNumber: seasonNo(2)})
 	}); err != nil {
 		t.Fatalf("seed season state: %v", err)
 	}
@@ -380,7 +380,7 @@ func TestExecuteDeleteHandlerMovieProjectionFallsBackToJellyfinWhenProviderIDsMi
 		}, 0); err != nil {
 			return err
 		}
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "mv-noids", ItemType: "Movie", UpdatedAt: now})
+		return tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: "mv-noids", ItemType: "Movie", UpdatedAt: now})
 	}); err != nil {
 		t.Fatalf("seed movie state: %v", err)
 	}
@@ -503,7 +503,7 @@ func TestMostRecentPlayForFlowFallsBackAcrossDashedAndNonDashedIDs(t *testing.T)
 	dashed := "1bb7dcaf-2c6e-04a7-5d91-c4f0ee6b3cfd"
 
 	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{
+		return tx.CreateMedia(context.Background(), domain.MediaItem{
 			ItemID:       nonDashed,
 			ItemType:     "Movie",
 			Name:         "Sample Movie",
@@ -537,7 +537,7 @@ func TestEvaluatePolicyFallsBackToCreatedAtWhenNeverPlayed(t *testing.T) {
 	createdAt := now.Add(-10 * 24 * time.Hour)
 
 	if err := store.WithTx(context.Background(), func(ctx context.Context, tx repo.TxRepository) error {
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{
+		if err := tx.CreateMedia(context.Background(), domain.MediaItem{
 			ItemID:    "movie-created-only",
 			Name:      "Created Only",
 			Title:     "Created Only",
@@ -600,7 +600,7 @@ func TestEvaluatePolicyUsesGlobalReviewDaysMetaLazily(t *testing.T) {
 		if err := tx.SetMeta(context.Background(), "settings.review_days", "60"); err != nil {
 			return err
 		}
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{
+		if err := tx.CreateMedia(context.Background(), domain.MediaItem{
 			ItemID:       "item-global-review",
 			ItemType:     "Movie",
 			LastPlayedAt: lastPlayed,
@@ -809,10 +809,10 @@ func TestExecuteDeleteHandlerDeletesChildrenForSeasonTarget(t *testing.T) {
 		}, 0); err != nil {
 			return err
 		}
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "s9e1", SeasonID: "season-9", UpdatedAt: now}); err != nil {
+		if err := tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: "s9e1", SeasonID: "season-9", UpdatedAt: now, ItemType: "Episode", SeriesID: "series-fixture", SeasonNumber: seasonNo(1)}); err != nil {
 			return err
 		}
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "s9e2", SeasonID: "season-9", UpdatedAt: now}); err != nil {
+		if err := tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: "s9e2", SeasonID: "season-9", UpdatedAt: now, ItemType: "Episode", SeriesID: "series-fixture", SeasonNumber: seasonNo(1)}); err != nil {
 			return err
 		}
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{FlowID: "flow:target:item:s9e1", ItemID: "target:item:s9e1", SubjectType: "item", State: domain.FlowStateActive, Version: 0, CreatedAt: now, UpdatedAt: now}, 0); err != nil {
@@ -892,7 +892,7 @@ func TestExecuteDeleteHandlerDeletesMovieProjectionAndSiblingFlows(t *testing.T)
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{FlowID: "flow:target:movie:mv-1", ItemID: "target:movie:mv-1", SubjectType: "movie", DisplayName: "Movie One", Discord: domain.DiscordContext{ChannelID: "ch-del", MessageID: "msg-del"}, State: domain.FlowStateDeleteQueued, Version: 0, CreatedAt: now, UpdatedAt: now}, 0); err != nil {
 			return err
 		}
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "mv-1", ItemType: "Movie", UpdatedAt: now}); err != nil {
+		if err := tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: "mv-1", ItemType: "Movie", UpdatedAt: now}); err != nil {
 			return err
 		}
 		if err := tx.UpsertFlowCAS(context.Background(), domain.Flow{FlowID: "flow:target:item:mv-1", ItemID: "target:item:mv-1", SubjectType: "item", State: domain.FlowStateActive, Version: 0, CreatedAt: now, UpdatedAt: now}, 0); err != nil {
@@ -976,7 +976,7 @@ func TestExecuteDeleteHandlerRetriesDeleteInProgressFlow(t *testing.T) {
 		}, 0); err != nil {
 			return err
 		}
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "mv-retry", ItemType: "Movie", UpdatedAt: now})
+		return tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: "mv-retry", ItemType: "Movie", UpdatedAt: now})
 	}); err != nil {
 		t.Fatalf("seed retrying delete flow: %v", err)
 	}
@@ -1137,7 +1137,7 @@ func TestSendHITLPromptHandlerIncludesLastPlayedStatusLine(t *testing.T) {
 		}, 0); err != nil {
 			return err
 		}
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "item-last-played", LastPlayedAt: now.Add(-6 * time.Hour), UpdatedAt: now})
+		return tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: "item-last-played", LastPlayedAt: now.Add(-6 * time.Hour), UpdatedAt: now, ItemType: "Movie"})
 	}); err != nil {
 		t.Fatalf("seed flow/media: %v", err)
 	}
@@ -1178,7 +1178,7 @@ func TestSendHITLPromptHandlerFallsBackToCreatedTimestampWhenNeverPlayed(t *test
 		}, 0); err != nil {
 			return err
 		}
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "item-never-played", CreatedAt: createdAt, UpdatedAt: now})
+		return tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: "item-never-played", CreatedAt: createdAt, UpdatedAt: now, ItemType: "Movie"})
 	}); err != nil {
 		t.Fatalf("seed flow/media: %v", err)
 	}
@@ -1506,7 +1506,7 @@ func TestExecuteDeleteHandlerForceDeletesDespiteVersionDrift(t *testing.T) {
 		}, 0); err != nil {
 			return err
 		}
-		return tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "force-delete", ItemType: "Movie", UpdatedAt: now})
+		return tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: "force-delete", ItemType: "Movie", UpdatedAt: now})
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -1556,7 +1556,7 @@ func TestExecuteDeleteHandlerPurgesSiblingJobs(t *testing.T) {
 		}, 0); err != nil {
 			return err
 		}
-		if err := tx.UpsertMedia(context.Background(), domain.MediaItem{ItemID: "purge-jobs", ItemType: "Movie", UpdatedAt: now}); err != nil {
+		if err := tx.CreateMedia(context.Background(), domain.MediaItem{ItemID: "purge-jobs", ItemType: "Movie", UpdatedAt: now}); err != nil {
 			return err
 		}
 		// Stale eval, prompt, and timeout records — all should be purged.

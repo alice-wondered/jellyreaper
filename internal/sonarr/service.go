@@ -55,7 +55,7 @@ func (s *Service) RemoveSeasonByProviderIDs(ctx context.Context, providerIDs map
 	if !s.Enabled() {
 		return nil
 	}
-	if seasonNumber <= 0 {
+	if seasonNumber < 0 { // 0 is Specials
 		return fmt.Errorf("invalid season number: %d", seasonNumber)
 	}
 	s.logger.Info("sonarr season delete start", "lex", "SONARR-DELETE", "season_number", seasonNumber, "tvdb", strings.TrimSpace(providerIDs["tvdb"]), "tmdb", strings.TrimSpace(providerIDs["tmdb"]), "imdb", strings.TrimSpace(providerIDs["imdb"]))
