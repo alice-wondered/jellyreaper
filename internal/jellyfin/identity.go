@@ -78,7 +78,7 @@ func (c *Client) identityPage(ctx context.Context, q url.Values) ([]identityDTO,
 	if err != nil {
 		return nil, fmt.Errorf("build jellyfin identity request: %w", err)
 	}
-	req.Header.Set("X-Emby-Token", c.apiKey)
+	SetAuth(req.Header, c.apiKey)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("perform jellyfin identity request: %w", err)

@@ -78,7 +78,7 @@ func NewBackfillService(baseURL, apiKey string, httpClient *http.Client) (*Backf
 
 	opts := []gen.ClientOption{
 		gen.WithRequestEditorFn(func(_ context.Context, req *http.Request) error {
-			req.Header.Set("X-Emby-Token", apiKey)
+			SetAuth(req.Header, apiKey)
 			return nil
 		}),
 	}
@@ -499,7 +499,7 @@ func (s *BackfillService) getJSONWithRetry(ctx context.Context, endpoint string,
 		if err != nil {
 			return err
 		}
-		req.Header.Set("X-Emby-Token", s.apiKey)
+		SetAuth(req.Header, s.apiKey)
 		resp, err := s.httpClient.Do(req)
 		if err == nil {
 			body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxRead))

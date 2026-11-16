@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
+
+	"jellyreaper/internal/jellyfin"
 )
 
 type InteractionCallback func(context.Context, IncomingInteraction) (*discordgo.InteractionResponse, error)
@@ -607,7 +609,7 @@ func (s *Service) fetchImage(ctx context.Context, imageURL string) ([]byte, stri
 		return nil, "", err
 	}
 	if s.jellyfinAPIKey != "" {
-		req.Header.Set("X-Emby-Token", s.jellyfinAPIKey)
+		jellyfin.SetAuth(req.Header, s.jellyfinAPIKey)
 	}
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
