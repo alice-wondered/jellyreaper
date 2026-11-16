@@ -70,7 +70,7 @@ func (c *Client) DeleteItem(ctx context.Context, itemID string) error {
 	if err != nil {
 		return fmt.Errorf("build jellyfin delete request: %w", err)
 	}
-	req.Header.Set("X-Emby-Token", c.apiKey)
+	SetAuth(req.Header, c.apiKey)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -96,7 +96,7 @@ func (c *Client) Ping(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("build jellyfin ping request: %w", err)
 	}
-	req.Header.Set("X-Emby-Token", c.apiKey)
+	SetAuth(req.Header, c.apiKey)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("perform jellyfin ping: %w", err)
@@ -129,7 +129,7 @@ func (c *Client) FetchProviderIDs(ctx context.Context, itemID string) (map[strin
 	if err != nil {
 		return nil, fmt.Errorf("build jellyfin provider ids request: %w", err)
 	}
-	req.Header.Set("X-Emby-Token", c.apiKey)
+	SetAuth(req.Header, c.apiKey)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -205,7 +205,7 @@ func (c *Client) CheckItemsExist(ctx context.Context, itemIDs []string) (map[str
 		if err != nil {
 			return nil, fmt.Errorf("build jellyfin items exist request: %w", err)
 		}
-		req.Header.Set("X-Emby-Token", c.apiKey)
+		SetAuth(req.Header, c.apiKey)
 
 		resp, err := c.http.Do(req)
 		if err != nil {
